@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="2369ea4f-15aa-4acd-be3d-b8482498fccb" name="Luckfox Board">
+        <fileTransfer accessType="SFTP" host="192.168.168.100" port="22" sshConfigId="e3db3e89-6aa9-414a-9607-5c3ffb2b6a64" sshConfig="root@192.168.168.100:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

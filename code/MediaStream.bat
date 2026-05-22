@@ -1,0 +1,1 @@
+ffplay -flags low_delay -max_delay 100000 -rtsp_transport tcp -x 800 -y 600 -an rtsp://192.168.168.100/live/0
