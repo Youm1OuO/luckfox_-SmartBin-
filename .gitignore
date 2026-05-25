@@ -33,8 +33,9 @@ cmake_install.cmake
 *.7z
 *.iso
 *.img
+*.whl
 
-# ========== 可执行 / 安装包（按需调整） ==========
+# ========== 可执行 / 安装包 ==========
 *.exe
 *.dll
 *.bin
@@ -47,6 +48,23 @@ code/c/test.exe
 # ========== 交叉编译工具链（解压后的目录） ==========
 tools/arm-rockchip830-linux-uclibcgnueabihf/
 luckfox-pico/tools/linux/toolchain/
+
+# ========== vendor 化的 yolov5：排除训练数据集 / 运行输出 / 模型权重 ==========
+tools/yolov5/datasets/
+tools/yolov5/runs/
+tools/yolov5/wandb/
+tools/yolov5/VOCdevkit/
+# best.onnx 与 best.onnx.data 用户说要换掉，先排除
+tools/yolov5/fridge_stage_b/best.onnx
+tools/yolov5/fridge_stage_b/best.onnx.data
+
+# ========== vendor 化的 rknn_model_zoo：排除预编译第三方库 ==========
+tools/rknn_model_zoo/3rdparty/
+
+# ========== vendor 化的 rknn-toolkit2：排除大示例资源 / 第三方 / Python whl ==========
+tools/rknn-toolkit2/rknpu2/examples/3rdparty/
+tools/rknn-toolkit2/autosparsity/examples/resnet50.onnx
+tools/rknn-toolkit2/rknn-toolkit2/examples/functions/**/*.onnx
 
 # ========== Python 缓存 ==========
 __pycache__/
@@ -73,3 +91,7 @@ desktop.ini
 # ========== 日志 ==========
 *.log
 logs/
+
+# ========== 单文件超大资源（按需添加） ==========
+tools/rknn-toolkit2/rknn-toolkit2/examples/functions/hybrid_quant/ssd_mobilenet_v2.pb
+*.pb

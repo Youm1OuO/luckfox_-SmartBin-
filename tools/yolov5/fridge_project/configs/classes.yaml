@@ -1,0 +1,284 @@
+# =============================================================================
+# 冰箱食材识别 — 类别真源 (Single Source of Truth)
+#
+# 本文件被以下脚本读取:
+#   - prepare_dataset.py     :合并公开数据集时,把外部标签映射到本表
+#   - build_data_yaml.py     :生成 YOLOv5 训练用的 data yaml
+#   - (未来) inference 后处理 :把 YOLO 输出的细类 ID 映射到粗类
+#
+# 修改本文件后,需要重新跑数据集合并脚本。
+# =============================================================================
+
+# ---- 1. 细粒度类别表(YOLO 训练直接使用)---------------------------------
+# 顺序就是 YOLO 类别 ID,不要随便调整顺序。
+# 新增类别 → 加到列表末尾,这样旧数据的 label id 不会失效。
+classes:
+  # --- 蔬果类 ---
+  - apple          # 0   苹果
+  - banana         # 1   香蕉
+  - orange         # 2   橙子
+  - tomato         # 3   番茄/西红柿
+  - lemon          # 4   柠檬(含青柠)
+  - pear           # 5   梨
+  - grape          # 6   葡萄
+  - strawberry     # 7   草莓
+  - watermelon     # 8   西瓜
+  - cantaloupe     # 9   哈密瓜/甜瓜
+  - papaya         # 10  木瓜
+  - avocado        # 11  牛油果/鳄梨
+  - cucumber       # 12  黄瓜
+  - carrot         # 13  胡萝卜
+  - potato         # 14  土豆/马铃薯
+  - onion          # 15  洋葱
+  - bell_pepper    # 16  彩椒/灯笼椒
+  - leafy_green    # 17  绿叶菜(白菜/青菜/生菜/花菜等)
+
+  # --- 肉蛋生鲜类 ---
+  - egg            # 18  鸡蛋
+  - meat_pack      # 19  包装肉(盒装/真空袋装)
+  - fish_pack      # 20  包装鱼/海鲜
+
+  # --- 饮料乳品类 ---
+  - milk_box       # 21  盒装牛奶(利乐包/方盒)
+  - milk_bottle    # 22  瓶装牛奶
+  - yogurt_cup     # 23  酸奶杯
+  - juice_bottle   # 24  果汁瓶
+  - soda_can       # 25  易拉罐(汽水/啤酒)
+  - water_bottle   # 26  矿泉水瓶/塑料饮料瓶
+
+  # --- 包装食品类 ---
+  - bagged_food    # 27  袋装食品(零食/速冻饺子/挂面等)
+  - boxed_food     # 28  盒装食品(便当/糕点/芝士片等)
+  - canned_food    # 29  金属罐头
+  - jar_food       # 30  玻璃罐(果酱/泡菜/调料)
+  - plastic_wrap   # 31  保鲜膜包裹的物品
+  - fresh_box      # 32  透明保鲜盒(内含未知物)
+
+  # --- 干扰类(必须独立训练,用于事件状态机过滤)---
+  - hand           # 33  手/手臂
+
+  # --- 后续追加的类(放最末尾,保证已有 ID 不变)---
+  - mushroom       # 34  蘑菇/菌菇
+  - pumpkin        # 35  南瓜
+  - garlic         # 36  大蒜
+  - ginger         # 37  姜
+  - radish         # 38  白萝卜
+  - sweet_potato   # 39  红薯/番薯
+  - walnut         # 40  核桃
+  - coriander      # 41  香菜/芫荽
+  - okra           # 42  秋葵
+
+# ---- 2. 粗粒度映射(推理后处理用,不参与训练)----------------------------
+# 这一段的目的:即使细类识别错了(比如把 apple 认成 pear),
+# 只要粗类对(都属于 fruit_veg),库存粗分类展示仍然正确。
+coarse_grained:
+  fruit_veg:                # 蔬果类
+    - apple
+    - banana
+    - orange
+    - tomato
+    - lemon
+    - pear
+    - grape
+    - strawberry
+    - watermelon
+    - cantaloupe
+    - papaya
+    - avocado
+    - cucumber
+    - carrot
+    - potato
+    - onion
+    - bell_pepper
+    - leafy_green
+    - mushroom
+    - pumpkin
+    - garlic
+    - ginger
+    - radish
+    - sweet_potato
+    - walnut
+    - coriander
+    - okra
+  meat_seafood:             # 肉蛋生鲜类
+    - egg
+    - meat_pack
+    - fish_pack
+  beverage_dairy:           # 饮料乳品类
+    - milk_box
+    - milk_bottle
+    - yogurt_cup
+    - juice_bottle
+    - soda_can
+    - water_bottle
+  packaged_food:            # 包装食品类
+    - bagged_food
+    - boxed_food
+    - canned_food
+    - jar_food
+    - plastic_wrap
+    - fresh_box
+  interference:             # 干扰类
+    - hand
+
+# ---- 3. 别名映射(数据集合并时用)----------------------------------------
+# 把外部数据集的标签名(左侧)映射到本表的标准名(右侧)。
+# 不在此表的外部标签会被丢弃(并在合并日志中报告)。
+#
+# 设计原则(重要!):
+#   1. 视觉特征清晰且确实属于该类才映射 — 不做"凑合归类"
+#   2. 中国家庭冰箱不常见的食材(尼泊尔/印度本土菜)宁可丢弃,不强行归类
+#   3. 标签污染比数据少更可怕 — 训练集质量 >> 训练集数量
+#   4. 被丢弃的标签 ≠ 整张图被丢弃,只要该图还有任一标签命中,该图仍被收入
+#
+# 关键字小写,合并脚本会做小写化与下划线归一。
+aliases:
+  # ===== COCO 通用标签(为以后扩展 COCO 用)=====
+  apple: apple                          # 苹果
+  banana: banana                        # 香蕉
+  orange: orange                        # 橙子
+  bottle: water_bottle                  # 瓶子(默认归矿泉水瓶)
+  carrot: carrot                        # 胡萝卜
+  broccoli: leafy_green                 # 西兰花 → 绿叶菜
+
+  # ===== Open Images 通用 =====
+  tomato: tomato                        # 番茄
+  lemon: lemon                          # 柠檬
+  pear: pear                            # 梨
+  grape: grape                          # 葡萄
+  strawberry: strawberry                # 草莓
+  watermelon: watermelon                # 西瓜
+  cantaloupe: cantaloupe                # 哈密瓜
+  "honeydew melon": cantaloupe          # 蜜瓜 → 哈密瓜
+  melon: cantaloupe                     # 通用甜瓜 → 哈密瓜
+  papaya: papaya                        # 木瓜
+  avocado: avocado                      # 牛油果
+  cucumber: cucumber                    # 黄瓜
+  potato: potato                        # 土豆
+  onion: onion                          # 洋葱
+  "bell pepper": bell_pepper            # 彩椒
+  bell_pepper: bell_pepper
+  cabbage: leafy_green                  # 卷心菜 → 绿叶菜
+  lettuce: leafy_green                  # 生菜 → 绿叶菜
+
+  egg: egg                              # 鸡蛋
+  "chicken egg": egg
+
+  milk: milk_box                        # 牛奶 → 默认盒装
+  "milk carton": milk_box               # 牛奶盒
+  "milk bottle": milk_bottle            # 牛奶瓶
+  yogurt: yogurt_cup                    # 酸奶
+  juice: juice_bottle                   # 果汁
+  "soft drink": soda_can                # 软饮 → 易拉罐
+  "soda can": soda_can                  # 易拉罐
+  can: soda_can
+  water: water_bottle                   # 水
+
+  # ===== FOOD-INGREDIENTS (Roboflow,尼泊尔菜系)=====
+  # 只保留中国冰箱常见 + 视觉确实匹配的类。
+  # 其他 80+ 个尼泊尔本土类故意不映射,自动丢弃。
+
+  # --- 蔬果(直接对应)---
+  "water melon": watermelon             # 西瓜(空格写法)
+  "lemon (nimbu)": lemon                # 柠檬(尼泊尔语)
+  "lime (kagati)": lemon                # 青柠(归柠檬)
+  cauliflower: leafy_green              # 花菜 → 绿叶菜
+
+  # --- 后续追加的 9 类(从 FOOD-INGREDIENTS 重新启用)---
+  mushroom: mushroom                    # 蘑菇
+  pumpkin: pumpkin                      # 南瓜
+  "pumpkin (farsi)": pumpkin            # 南瓜(尼泊尔语)
+  garlic: garlic                        # 大蒜
+  ginger: ginger                        # 姜
+  radish: radish                        # 白萝卜
+  "sweet potato": sweet_potato          # 红薯
+  "sweet potato (suthuni)": sweet_potato
+  walnut: walnut                        # 核桃
+  wallnut: walnut                       # FOOD-INGREDIENTS 数据集里拼错了
+  coriander: coriander                  # 香菜
+  "coriander (dhaniya)": coriander      # 香菜(尼泊尔语)
+  okra: okra                            # 秋葵
+  "okra (bhindi)": okra                 # 秋葵(印地语)
+
+  # --- 肉蛋类 → meat_pack / fish_pack ---
+  beef: meat_pack                       # 牛肉
+  chicken: meat_pack                    # 鸡肉
+  ham: meat_pack                        # 火腿
+  pork: meat_pack                       # 猪肉
+  bacon: meat_pack                      # 培根
+  sausage: meat_pack                    # 香肠
+  mutton: meat_pack                     # 羊肉
+  "minced meat": meat_pack              # 肉糜
+  fish: fish_pack                       # 鱼
+  "crab meat": fish_pack                # 蟹肉
+
+  # --- 包装食品(中国家庭冰箱也会放的)---
+  bread: bagged_food                    # 面包(切片)
+  cheese: boxed_food                    # 芝士片(盒装)
+  butter: boxed_food                    # 黄油块
+  tofu: fresh_box                       # 豆腐(保鲜盒装)
+  ketchup: jar_food                     # 番茄酱(瓶装)
+  mayonnaise: jar_food                  # 蛋黄酱
+  "soy sauce": jar_food                 # 酱油
+  kimchi: jar_food                      # 泡菜
+  noodle: bagged_food                   # 面条(袋装)
+  "chowmein noodles": bagged_food       # 炒面
+
+  # --- 已故意丢弃,不再映射的尼泊尔/印度类(留作注释提醒)---
+  # 这些不映射 = 训练时它们的 bbox 被忽略(但图片本身仍被使用)
+  #   Akabare Khursani(尼泊尔小辣椒)/ Gundruk(腌发酵蔬菜)
+  #   Bamboo Shoots(竹笋)/ Bethu ko Saag / Bitter Gourd(苦瓜)
+  #   Bottle Gourd(葫芦)/ Brinjal(茄子,印度版)/ Buff Meat(水牛肉)
+  #   Chayote(佛手瓜)/ Cassava(木薯)/ Chickpeas(鹰嘴豆)
+  #   Beans / Black/Red/Green/Yellow Lentils(各种小扁豆)
+  #   Fiddlehead Ferns(蕨菜)/ Garden cress / Green Brinjal
+  #   Jack Fruit(菠萝蜜)/ Lapsi / Long Beans(豇豆)
+  #   Masyaura / Moringa Leaves
+  #   Nutrela / Paneer(印度奶酪)
+  #   Pointed Gourd / Snake/Sponge Gourd
+  #   Stinging Nettle(荨麻)/ Taro(芋头)/ Thukpa Noodles
+  #   Turnip(芜菁)/ Beetroot(甜菜根)/ Capsicum
+  #   Mint(薄荷)/ Olive Oil(橄榄油)
+  #   Salt / Sugar / Cinnamon / Chili Powder
+  #   Wheat / Corn / Rice / Cornflakes / Seaweed / Soyabean / Pea / Ice
+
+  # ===== Beverage Containers (9 类通用容器)=====
+  # 这 9 类是"容器形态"层面的标签,虽然不知具体内容,
+  # 但形态对应关系清晰的值得保留。
+  "bottle-glass": milk_bottle           # 玻璃瓶 → 玻璃牛奶瓶
+  "bottle-plastic": water_bottle        # 塑料瓶 → 矿泉水/饮料瓶
+  "tin can": soda_can                   # 易拉罐
+  "tin-can": soda_can
+  "cup-disposable": yogurt_cup          # 一次性杯
+  "cup-handle": yogurt_cup              # 带把手杯
+  # 故意不映射(视觉与冰箱场景关系弱):
+  #   glass-mug    马克杯
+  #   glass-normal 普通玻璃杯
+  #   glass-wine   红酒杯
+  #   gym-bottle   健身水壶
+
+  # ===== Hand Detection (6 类手势) → 全部归 hand =====
+  "hand-zero": hand                     # 零(握拳)
+  "hand-one": hand                      # 一
+  "hand-two": hand                      # 二
+  "hand-three": hand                    # 三
+  "hand-four": hand                     # 四
+  "hand-five": hand                     # 五(摊开)
+
+  # ===== hand (石头剪刀布) → 全部归 hand =====
+  rock: hand                            # 石头
+  paper: hand                           # 布
+  scissors: hand                        # 剪刀
+  "3": hand                             # 该数据集里的"3"也是手势
+
+  # ===== 通用手部备用别名 =====
+  hand: hand                            # 手
+  hands: hand
+  fist: hand                            # 拳
+  palm: hand                            # 掌
+  arm: hand                             # 手臂(也归 hand)
+
+# ---- 4. 数据增强配置提示(供训练脚本参考)-------------------------------
+# 不直接被读取,作为人类备忘:
+#   - hand 类样本通常远多于其他类,训练时考虑 class_weights 或 image_weights
+#   - 冰箱场景:垂直翻转(flipud)有用;mosaic 增强建议保留
