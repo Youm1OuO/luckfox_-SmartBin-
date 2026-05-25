@@ -14,8 +14,9 @@ python convert.py /home/luckfox/tools/yolov5/yolov5s.onnx rv1106 i8
 
 
 // 交叉编译
-cd /home/luckfox/tools/luckfox_pico_rkmpi_example
+cd /workspace/tools/luckfox_pico_rkmpi_example
 ./build.sh rv1106
+
 
 //上传到开发板
 scp -r {path} root@192.168.168.100:/root/

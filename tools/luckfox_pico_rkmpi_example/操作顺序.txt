@@ -1,4 +1,3 @@
-
 # .pt → .ONNX (正常的训练与转模型, 在wls中)
 # export.py 在 yolov5 中
 python export.py \
@@ -10,27 +9,41 @@ python export.py \
 把 RK_anchors.txt、.onnx 、.onnx.data 拖到 docker 容器的文件夹中
 
 
+
+// 改矫正用的图片
+    cd fridge_project/scripts/
+    python build_calib_set.py --num 200
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
 
+在 PowerShell 中：
 
-# 进入 docker 容器
+# 0) 先看容器在不在跑  (在 PowerShell 中)
+docker ps -a | Select-String luckfox
+
+
+# 1) 进入 docker 容器 (在 PowerShell 中)
 docker exec -it luckfox /bin/bash
 
 docker 中的指令:
     ls -la
 
 
+
 // .onnx 转 .rknn (在docker中)
 cd /home/luckfox/tools/rknn_model_zoo/examples/yolov5/python
 python3 convert.py ../model/yolov5s.onnx rv1106 i8 ./yolov5.rknn
 python3 convert.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
+python3 convert_fridge.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
+
 
 
 // 交叉编译 (在docker中)
-cd /home/luckfox/tools/luckfox_pico_rkmpi_example
+cd /workspace/tools/luckfox_pico_rkmpi_example
 ./build.sh rv1106
+然后选: 1, 5
+
 
 
 //上传到开发板 (在docker中)

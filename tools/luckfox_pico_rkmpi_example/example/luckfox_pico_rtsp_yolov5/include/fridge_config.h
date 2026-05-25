@@ -17,7 +17,7 @@ namespace fridge {
 //  当前演示阶段：直接复用 COCO 80 类模型，把 person(cls_id=0) 当作 hand。
 //  后续训练自己的冰箱模型时，把 hand 训为第 0 类，其余类别为各种食材。
 // =========================================================================
-constexpr int CLASS_HAND = 0;          // 手所对应的 cls_id
+constexpr int CLASS_HAND = 33;          // 手所对应的 cls_id
 
 // 工具函数：判断一个 cls_id 是不是"手"
 inline bool is_hand(int cls_id) {
