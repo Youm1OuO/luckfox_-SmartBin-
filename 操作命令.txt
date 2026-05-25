@@ -12,15 +12,22 @@ cd /home/luckfox/tools/rknn_model_zoo/examples/yolov5/python
 //把他转化为开发板要求的格式 这一步要在rknn的环境下执行
 python convert.py /home/luckfox/tools/yolov5/yolov5s.onnx rv1106 i8
 
+
 // 交叉编译
-cd /home/luckfox/tools/luckfox_pico_rkmpi_example
+cd /workspace/tools/luckfox_pico_rkmpi_example
 ./build.sh rv1106
+
 
 //上传到开发板
 scp -r {path} root@192.168.168.100:/root/
+（即：scp -r install/uclibc/luckfox_pico_rtsp_yolov5_demo  root@192.168.168.100:/root/）
 
 cd /home/luckfox/tools/rknn_model_zoo/examples/yolov5/python
 python3 convert.py ../model/yolov5s.onnx rv1106 i8 ./yolov5.rknn
+
+
+//跑板子
+./luckfox_pico_rtsp_yolov5 model/yolov5.rknn
 
 
 
@@ -40,3 +47,9 @@ docker load -i ./luckfox_env.tar
 docker run -it --name luckfox_work -v D:\Luckfox_Project:/workspace luckfox_team_env:v1 /bin/bash
 
 yolov5s.pt -> yolov5s.onnx -> yolov5.rknn
+
+cd /workspace
+tar -zxvf Electronics_Competition_All.tar.gz
+
+// 转换好之后的模型放在这里
+C:\Users\Youm1OuO\Desktop\luckfox_demo\tools\rknn_model_zoo\examples\yolov5\model
