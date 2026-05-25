@@ -57,7 +57,11 @@ cv::Mat letterbox(cv::Mat input)
 
 	cv::Mat inputScale;
     cv::resize(input, inputScale, cv::Size(inputWidth,inputHeight), 0, 0, cv::INTER_LINEAR);	
-	cv::Mat letterboxImage(640, 640, CV_8UC3,cv::Scalar(0, 0, 0));
+	// 画布尺寸必须等于模型输入(model_width x model_height). 之前硬编码 640 是 bug:
+	// 当 model_width=320 时, memcpy 只会取画布左上 320x320 区域, 等于让模型只看到
+	// 摄像头画面缩到画布左上的一小块, 周围全是底色, 自然识别不出.
+	// padding 颜色也由原本的纯黑(0,0,0) 改回 yolov5 惯例的 (114,114,114).
+	cv::Mat letterboxImage(model_height, model_width, CV_8UC3, cv::Scalar(114, 114, 114));
     cv::Rect roi(leftPadding, topPadding, inputWidth, inputHeight);
     inputScale.copyTo(letterboxImage(roi));
 
@@ -68,8 +72,19 @@ void mapCoordinates(int *x, int *y) {
 	int mx = *x - leftPadding;
 	int my = *y - topPadding;
 
-    *x = (int)((float)mx / scale);
-    *y = (int)((float)my / scale);
+	int rx = (int)((float)mx / scale);
+	int ry = (int)((float)my / scale);
+
+	// 把映射后的坐标 clamp 到原图范围内.
+	// 没有 clamp 时, 落在 letterbox padding 区域里的检测框会得到负坐标
+	// 或超出 (width, height) 的坐标, 导致后续画框/库存匹配出现 (-119, -67) 这种异常值.
+	if (rx < 0)      rx = 0;
+	if (ry < 0)      ry = 0;
+	if (rx > width)  rx = width;
+	if (ry > height) ry = height;
+
+	*x = rx;
+	*y = ry;
 }
 
 
@@ -171,12 +186,12 @@ int main(int argc, char *argv[]) {
 		{
 			void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame.stVFrame.pMbBlk);	
 
+			// VI 给的是 YUV420SP, 直接转换到 frame 的 buffer (frame 已绑定到 data 上).
+			// 之前还多了一个临时 bgr Mat + resize 一次, 但 bgr 和 frame 实际是同一块
+			// 内存 + 同样尺寸, resize 是冗余且 src=dst 时 OpenCV 行为未定义, 现已去掉.
 			cv::Mat yuv420sp(height + height / 2, width, CV_8UC1, vi_data);
-			cv::Mat bgr(height, width, CV_8UC3, data);			
-			
-			cv::cvtColor(yuv420sp, bgr, cv::COLOR_YUV420sp2BGR);
-			cv::resize(bgr, frame, cv::Size(width ,height), 0, 0, cv::INTER_LINEAR);
-			
+			cv::cvtColor(yuv420sp, frame, cv::COLOR_YUV420sp2BGR);
+
 			//letterbox
 			cv::Mat letterboxImage = letterbox(frame);	
 			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data, model_width*model_height*3);		

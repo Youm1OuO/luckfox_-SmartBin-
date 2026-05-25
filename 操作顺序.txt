@@ -5,17 +5,18 @@ python export.py \
     --weight <.pt 的权重文件的路径名> \
     --imgsz 320
 
-
-把 RK_anchors.txt、.onnx 、.onnx.data 拖到 docker 容器的文件夹中
-
+# 产物: best.onnx 和 RK_anchors.txt
 
 
-// 改矫正用的图片
-    cd fridge_project/scripts/
+
+// 改矫正用的图片 (在wls中)
+    cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5/fridge_project/scripts/
     python build_calib_set.py --num 200
+
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
+
 
 在 PowerShell 中：
 
@@ -26,16 +27,39 @@ docker ps -a | Select-String luckfox
 # 1) 进入 docker 容器 (在 PowerShell 中)
 docker exec -it luckfox /bin/bash
 
+
+---------------------------------------------------------------------------------
+
+
+# 在 WSL 终端
+    docker ps -a
+
+看到 luckfox_work 状态是 Exited（停止）。然后：
+    docker start luckfox_work
+    docker exec -it luckfox_work /bin/bash
+或者一步到位：
+    docker start -ai luckfox_work
+
+---------------------------------------------------------------------------------
+
+
 docker 中的指令:
     ls -la
 
 
+// 转环境
+    conda activate rknn
 
 // .onnx 转 .rknn (在docker中)
-cd /home/luckfox/tools/rknn_model_zoo/examples/yolov5/python
+cd /workspace/tools/rknn_model_zoo/examples/yolov5/python
 python3 convert.py ../model/yolov5s.onnx rv1106 i8 ./yolov5.rknn
 python3 convert.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
 python3 convert_fridge.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
+即:
+python3 convert_fridge.py \
+    /workspace/tools/yolov5/runs/train/stage_b3/weights/best.onnx \
+    rv1106 i8 \
+    /workspace/tools/yolov5/runs/train/stage_b3/weights/best.rknn
 
 
 

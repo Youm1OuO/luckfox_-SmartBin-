@@ -45,24 +45,22 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 # 默认路径配置
 # -----------------------------------------------------------------------------
-# 脚本位置: <workspace>/yolov5/fridge_project/scripts/build_calib_set.py
+# 脚本位置: <repo>/tools/yolov5/fridge_project/scripts/build_calib_set.py
 # SCRIPT_DIR = scripts
 #   SCRIPT_DIR.parents[0] = fridge_project
 #   SCRIPT_DIR.parents[1] = yolov5            <- 数据集就在这下面
-#   SCRIPT_DIR.parents[2] = workspace         <- rknn_model_zoo 在这下面 (走 SmartBin)
+#   SCRIPT_DIR.parents[2] = tools             <- rknn_model_zoo 与 yolov5 同级
+#   SCRIPT_DIR.parents[3] = repo (luckfox_demo)
 SCRIPT_DIR = Path(__file__).resolve().parent
 YOLOV5_ROOT = SCRIPT_DIR.parents[1]
-WORKSPACE = SCRIPT_DIR.parents[2]
+TOOLS_ROOT = SCRIPT_DIR.parents[2]
 
-# WSL 当前布局: workspace/yolov5/datasets/<roboflow_dataset>/train/images
+# 当前布局: tools/yolov5/datasets/<roboflow_dataset>/train/images
 DEFAULT_DATASETS_ROOT = YOLOV5_ROOT / "datasets"
 
-# WSL 当前布局: workspace/SmartBin/luckfox_pico_rkmpi/tools/rknn_model_zoo/examples/yolov5
+# 当前布局: tools/rknn_model_zoo/examples/yolov5
 DEFAULT_RKNN_YOLOV5 = (
-    WORKSPACE
-    / "SmartBin"
-    / "luckfox_pico_rkmpi"
-    / "tools"
+    TOOLS_ROOT
     / "rknn_model_zoo"
     / "examples"
     / "yolov5"
@@ -73,6 +71,28 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 # Roboflow 风格的 split 子目录名 (按"应不应该用作校准"排序)
 SPLIT_DIRS_DEFAULT = ["train", "valid"]   # 默认含 train + valid
 SPLIT_DIR_TEST = "test"
+
+
+def sanitize_filename(name: str) -> str:
+    """
+    清洗文件名, 防止后续 RKNN 解析 dataset.txt 时崩溃.
+
+    问题:
+      RKNN 的 dataset.txt 是按空白字符分隔的, 一行里出现空格会被切成多张图,
+      导致 'Not support file_ext' 错误. 同时 ()[]{} 这些字符在某些 shell
+      / 路径处理里也会引发歧义. 所以一律换成下划线.
+    """
+    out = []
+    for ch in name:
+        if ch.isspace() or ch in '()[]{}<>"\'`|;&$':
+            out.append("_")
+        else:
+            out.append(ch)
+    # 多个连续下划线压成一个, 看着舒服
+    cleaned = "".join(out)
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned
 
 
 # -----------------------------------------------------------------------------
@@ -129,6 +149,8 @@ def discover_image_dirs(datasets_root: Path, splits, include_test: bool):
 def collect_labeled_images(images_dir: Path, labels_dir: Path):
     """
     扫描 images_dir, 返回 [image_path, ...]; 仅保留有非空 label 的图.
+    并且通过 magic bytes 检查文件确实是 JPEG/PNG/BMP, 排除 AVIF/WebP
+    等"扩展名说谎"的脏图(Roboflow 数据集里偶尔出现, RKNN 量化器读不了).
     """
     out = []
     for img_path in images_dir.iterdir():
@@ -144,6 +166,21 @@ def collect_labeled_images(images_dir: Path, labels_dir: Path):
         except Exception:
             continue
         if not content:
+            continue
+        # magic bytes 校验:
+        #   JPEG -> FF D8 FF
+        #   PNG  -> 89 50 4E 47
+        #   BMP  -> 42 4D
+        try:
+            with img_path.open("rb") as fp:
+                head = fp.read(8)
+        except Exception:
+            continue
+        if not (head.startswith(b"\xff\xd8\xff") or
+                head.startswith(b"\x89PNG\r\n\x1a\n") or
+                head.startswith(b"BM")):
+            # 静默跳过, 避免输出被刷屏; 真要排查可以打开下面这行
+            # print(f"   [skip non-real-image] {img_path.name}")
             continue
         out.append(img_path)
     return out
@@ -233,7 +270,8 @@ def main():
                         help="数据集根目录 (默认 tools/yolov5/datasets)")
     parser.add_argument("--rknn-yolov5", type=Path,
                         default=DEFAULT_RKNN_YOLOV5,
-                        help="rknn_model_zoo/examples/yolov5 目录")
+                        help="rknn_model_zoo/examples/yolov5 目录 "
+                             "(默认 tools/rknn_model_zoo/examples/yolov5)")
     parser.add_argument("--dry-run", action="store_true",
                         help="只打印分配, 不真复制")
     args = parser.parse_args()
@@ -285,11 +323,12 @@ def main():
             continue
         chosen = random.sample(imgs, q)
         for img_path in chosen:
-            base = f"{tag}_{img_path.name}"
+            safe_name = sanitize_filename(img_path.name)
+            base = f"{tag}_{safe_name}"
             final = base
             n = 1
             while final in used_names:
-                final = f"{tag}_{n}_{img_path.name}"
+                final = f"{tag}_{n}_{safe_name}"
                 n += 1
             used_names.add(final)
             sampled.append((img_path, final))
@@ -311,13 +350,8 @@ def main():
 
     # 清空旧的 calib_data 防止上次的图混进来
     if calib_dir.exists():
-        for old in calib_dir.iterdir():
-            try:
-                old.unlink()
-            except Exception:
-                pass
-    else:
-        calib_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(calib_dir, ignore_errors=True)
+    calib_dir.mkdir(parents=True, exist_ok=True)
 
     for src, dst in sampled:
         shutil.copy2(src, calib_dir / dst)
@@ -332,7 +366,7 @@ def main():
     print(f"\nOK!")
     print(f"  校准图: {len(sampled)} 张  -> {calib_dir}")
     print(f"  路径表: {dataset_txt}")
-    print(f"\n下一步 (容器内):")
+    print(f"\n下一步 (在 RKNN docker 容器内, 假设仓库挂载到 /workspace):")
     print(f"  cd /workspace/tools/rknn_model_zoo/examples/yolov5/python")
     print(f"  python3 convert_fridge.py <你的onnx路径> rv1106 i8")
 

@@ -9,7 +9,12 @@ convert_fridge.py
   - DATASET_PATH 指向 dataset_fridge.txt (你训练集分布的校准图)
   - 默认输出文件名 yolov5.rknn 一致, 编译流程不用改
 
-用法 (在 docker 容器内):
+使用前提:
+  先在宿主机跑过校准集生成脚本:
+    python3 tools/yolov5/fridge_project/scripts/build_calib_set.py
+  它会把图复制到 ../calib_data/ 并写出 ./dataset_fridge.txt
+
+用法 (在 RKNN docker 容器内, 假设仓库挂载到 /workspace):
   cd /workspace/tools/rknn_model_zoo/examples/yolov5/python
   python3 convert_fridge.py <onnx_path> rv1106 i8
 
@@ -17,6 +22,7 @@ convert_fridge.py
   python3 convert_fridge.py ../model/best.onnx rv1106 i8
 """
 
+import os
 import sys
 from rknn.api import RKNN
 
@@ -58,6 +64,21 @@ def parse_arg():
 
 if __name__ == '__main__':
     model_path, platform, do_quant, output_path = parse_arg()
+
+    # ------ 量化前先检查校准集是否就位 ------
+    if do_quant and not os.path.isfile(DATASET_PATH):
+        print('=' * 64)
+        print('ERROR: 找不到校准集索引: {}'.format(DATASET_PATH))
+        print('请先在宿主机生成校准集 (项目根目录下执行):')
+        print('  python3 tools/yolov5/fridge_project/scripts/build_calib_set.py')
+        print('再回到容器内 examples/yolov5/python 目录运行本脚本')
+        print('=' * 64)
+        exit(1)
+
+    # ------ ONNX 必须存在 ------
+    if not os.path.isfile(model_path):
+        print('ERROR: ONNX 模型不存在: {}'.format(model_path))
+        exit(1)
 
     rknn = RKNN(verbose=False)
 

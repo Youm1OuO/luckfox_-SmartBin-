@@ -61,6 +61,16 @@ tools/yolov5/fridge_stage_b/best.onnx.data
 # ========== vendor 化的 rknn_model_zoo：排除预编译第三方库 ==========
 tools/rknn_model_zoo/3rdparty/
 
+# ========== rknn 转换的本地产物(校准集 / 索引 / 临时文件) ==========
+# 这些都是每次跑 build_calib_set.py 自动重新生成, 不该进 git
+tools/rknn_model_zoo/examples/yolov5/calib_data/
+tools/rknn_model_zoo/examples/yolov5/python/dataset_fridge.txt
+tools/rknn_model_zoo/examples/yolov5/python/snapshot/
+tools/rknn_model_zoo/examples/yolov5/python/_npu_log*.txt
+
+# ========== Windows 文件系统的安全标签残留 ==========
+*:Zone.Identifier
+
 # ========== vendor 化的 rknn-toolkit2：排除大示例资源 / 第三方 / Python whl ==========
 tools/rknn-toolkit2/rknpu2/examples/3rdparty/
 tools/rknn-toolkit2/autosparsity/examples/resnet50.onnx

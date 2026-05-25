@@ -205,8 +205,8 @@ void HandStateManager::process_hand(HandLog& log,
             // 灰区 (LOW < v < HIGH)：不升级也不降级，直接维持
             else if (v >= HAND_OBJ_IOU_LOW) {
                 keep = true;          // 维持 SUS_HOLD 但不增加 counter
-                // 不增加 counter，等明确再说
-                break;                // 直接 return 这一帧
+                // 不增加 counter, 等明确再说
+                break;                // 跳出 switch (函数也随之结束), 这一帧保持原状态
             }
         }
 
