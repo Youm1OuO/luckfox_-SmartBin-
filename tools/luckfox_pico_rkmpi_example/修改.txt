@@ -1,0 +1,27 @@
+替换 .rknn 模型 (名字要保持 yolov5.rknn)
+
+
+
+mian.cc文件中
+图像尺寸 (要与 yolov5.rknn 的一致才行)
+    int model_width = 640;
+    int model_height = 640;	
+
+
+
+
+类别数要跟着改：
+路径：
+    C:\Users\Youm1OuO\Desktop\luckfox_demo\tools\luckfox_pico_rkmpi_example\include\rknn\postprocess.h
+这个文件中的
+    #define OBJ_CLASS_NUM 80
+    #define LABEL_NALE_TXT_PATH "./model/fridge_43_labels_list.txt"
+
+
+
+
+手类别 ID
+路径：
+    C:\Users\Youm1OuO\Desktop\luckfox_demo\tools\luckfox_pico_rkmpi_example\example\luckfox_pico_rtsp_yolov5\include\fridge_config.h
+这个文件中的    
+    constexpr int CLASS_HAND = 0;

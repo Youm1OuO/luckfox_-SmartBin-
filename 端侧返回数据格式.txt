@@ -1,0 +1,29 @@
+// 物品出入库事件
+不要实时传送json数据，要在S4差异对比”出明确结果时，才发送一次 JSON
+{
+  "device_id": "luckfox",             // 设备唯一标识
+  "timestamp": 1716466178000,         // 事件发生的时间戳（毫秒）
+  "event_type": "ITEM_IN",            // 明确事件类型：ITEM_IN (放入) / ITEM_OUT (取出) / ITEM_MOVED (挪位) [cite: 116]
+  "data": [
+    {
+      "local_track_id": 1002,         // 端侧追踪分配的临时ID（用于防抖去重）
+      "category": "fruit",            // 粗粒度分类（如：fruit, drink, meat） [cite: 11]
+      "confidence": 0.89,             // YOLO模型的识别置信度
+      "bbox": [120, 45, 60, 60],      // 物品边界框 [x, y, w, h]，方便后端在大屏上画框
+      "crop_image": "/9j/4AAQSk..."   // 仅传输该物品 BBox 区域的局部截图（Base64编码）。这对于后端 Agents 重新识别“拿出去放回来是不是同一个物品”
+    }
+  ]
+}
+
+//包装标签读取
+{
+  "device_id": "fridge_rv1106_01",
+  "timestamp": 1716466205000,
+  "event_type": "TRIGGER_OCR",        // 触发云端 VLM (视觉大模型) Agent
+  "data": [
+    {
+      "bbox": [200, 150, 100, 80],
+      "crop_image": "/9j/4AAQSk..."   // 传输悬停区域的高清局部截图，交给后端 Agent 去读保质期、品牌等标签信息 
+    }
+  ]
+}

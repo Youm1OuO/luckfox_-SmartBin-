@@ -1,0 +1,55 @@
+
+# .pt → .ONNX (正常的训练与转模型, 在wls中)
+# export.py 在 yolov5 中
+python export.py \
+    --rknpu \
+    --weight <.pt 的权重文件的路径名> \
+    --imgsz 320
+
+
+把 RK_anchors.txt、.onnx 、.onnx.data 拖到 docker 容器的文件夹中
+
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+
+
+# 进入 docker 容器
+docker exec -it luckfox /bin/bash
+
+docker 中的指令:
+    ls -la
+
+
+// .onnx 转 .rknn (在docker中)
+cd /home/luckfox/tools/rknn_model_zoo/examples/yolov5/python
+python3 convert.py ../model/yolov5s.onnx rv1106 i8 ./yolov5.rknn
+python3 convert.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
+
+
+// 交叉编译 (在docker中)
+cd /home/luckfox/tools/luckfox_pico_rkmpi_example
+./build.sh rv1106
+
+
+//上传到开发板 (在docker中)
+scp -r {path} root@192.168.168.100:/root/
+（即：scp -r install/uclibc/luckfox_pico_rtsp_yolov5_demo  root@192.168.168.100:/root/）
+
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+
+
+
+
+//跑板子 (在MobaXterm中)
+cd luckfox_pico_rtsp_yolov5_demo/
+./luckfox_pico_rtsp_yolov5 model/yolov5.rknn
+
+
+//打开摄像头
+C:\Users\Youm1OuO\Desktop\luckfox_demo\code
+MediaStream.bat

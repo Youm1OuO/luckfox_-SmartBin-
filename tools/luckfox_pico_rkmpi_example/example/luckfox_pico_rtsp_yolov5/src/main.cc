@@ -21,6 +21,13 @@
 #include "opencv2/highgui/highgui.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
 
+// ===== 冰箱视觉系统模块 =====
+#include "fridge_config.h"     // 全局配置（类别 id、阈值）
+#include "geometry.h"          // BBox 几何工具
+#include "tracker.h"           // ByteTrack-Lite 跟踪器
+#include "hand_state.h"        // 手部状态机 + 事件配对
+#include "inventory.h"         // 库存数据库
+
 #define DISP_WIDTH  720
 #define DISP_HEIGHT 480
 
@@ -145,7 +152,15 @@ int main(int argc, char *argv[]) {
 	venc_init(0, width, height, enCodecType);
 
 	printf("venc init success\n");	
-	
+
+	// ============================================================
+	//  冰箱视觉系统：初始化跟踪器、状态机、库存
+	// ============================================================
+	fridge::ByteTrackLite tracker;
+	fridge::HandStateManager hand_mgr;
+	fridge::InventoryDB inventory;
+	int g_frame_id = 0;
+
   	while(1)
 	{	
 		// get vi frame
@@ -167,30 +182,88 @@ int main(int argc, char *argv[]) {
 			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data, model_width*model_height*3);		
 			inference_yolov5_model(&rknn_app_ctx, &od_results);
 
-			for(int i = 0; i < od_results.count; i++)
-			{					
-				if(od_results.count >= 1)
-				{
-					object_detect_result *det_result = &(od_results.results[i]);
-	
-					sX = (int)(det_result->box.left   );	
-					sY = (int)(det_result->box.top 	  );	
-					eX = (int)(det_result->box.right  );	
-					eY = (int)(det_result->box.bottom );
-					mapCoordinates(&sX,&sY);
-					mapCoordinates(&eX,&eY);
-					
-					printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id),
-							 sX, sY, eX, eY, det_result->prop);
+			// ============================================================
+			//  Step A: 把 RKNN 的 detection 结果转成跟踪器需要的格式
+			//          同时把 letterbox 坐标映射回原图坐标
+			// ============================================================
+			std::vector<fridge::Detection> detections;
+			detections.reserve(od_results.count);
+			for (int i = 0; i < od_results.count; i++) {
+				const object_detect_result& r = od_results.results[i];
+				int x1 = r.box.left;
+				int y1 = r.box.top;
+				int x2 = r.box.right;
+				int y2 = r.box.bottom;
+				mapCoordinates(&x1, &y1);
+				mapCoordinates(&x2, &y2);
 
-					cv::rectangle(frame,cv::Point(sX ,sY),
-								        cv::Point(eX ,eY),
-										cv::Scalar(0,255,0),3);
-					sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-					cv::putText(frame,text,cv::Point(sX, sY - 8),
-										   cv::FONT_HERSHEY_SIMPLEX,1,
-										   cv::Scalar(0,255,0),2);
+				fridge::Detection d;
+				d.box = fridge::BBox((float)x1, (float)y1, (float)x2, (float)y2);
+				d.score = r.prop;
+				d.cls_id = r.cls_id;
+				detections.push_back(d);
+			}
+
+			// ============================================================
+			//  Step B: 跑 ByteTrack-Lite，得到带 track_id 的目标列表
+			// ============================================================
+			g_frame_id++;
+			const std::vector<fridge::Track>& tracks =
+				tracker.update(detections, g_frame_id);
+
+			// ============================================================
+			//  Step B+: 打印调试日志（每秒大约打印 1 次）
+			//   只要有 track 就打印当前帧的检测结果，方便观察
+			// ============================================================
+			if (g_frame_id % 10 == 0 && !tracks.empty()) {
+				printf("[FRAME %d] %zu tracks: ", g_frame_id, tracks.size());
+				for (const auto& t : tracks) {
+					printf("[#%d %s @(%.0f,%.0f)~(%.0f,%.0f) %.0f%%] ",
+					       t.track_id,
+					       coco_cls_to_name(t.cls_id),
+					       t.box.x1, t.box.y1, t.box.x2, t.box.y2,
+					       t.score * 100);
 				}
+				printf("\n");
+			}
+
+			// ============================================================
+			//  Step C: 跑手部状态机；任何完成结算的事件会被返回
+			// ============================================================
+			std::vector<fridge::FinalEvent> events =
+				hand_mgr.update(tracks, g_frame_id);
+
+			// ============================================================
+			//  Step D: 把事件应用到库存
+			// ============================================================
+			if (!events.empty()) {
+				inventory.apply_events(events);
+				inventory.print("  ");   // 调试用：打印当前库存
+			}
+
+			// ============================================================
+			//  Step E: 在画面上画 track（含 track_id），方便观察
+			// ============================================================
+			for (const auto& t : tracks) {
+				int x1 = (int)t.box.x1;
+				int y1 = (int)t.box.y1;
+				int x2 = (int)t.box.x2;
+				int y2 = (int)t.box.y2;
+
+				// 手用红框，物品用绿框
+				cv::Scalar color = fridge::is_hand(t.cls_id)
+					? cv::Scalar(0, 0, 255)      // BGR: 红
+					: cv::Scalar(0, 255, 0);     // BGR: 绿
+
+				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2),
+				              color, 2);
+
+				char text[64];
+				snprintf(text, sizeof(text), "#%d %s %.0f%%",
+				         t.track_id, coco_cls_to_name(t.cls_id),
+				         t.score * 100);
+				cv::putText(frame, text, cv::Point(x1, y1 - 6),
+				            cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
 			}
 
 		}
