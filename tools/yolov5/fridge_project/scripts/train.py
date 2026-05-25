@@ -21,6 +21,7 @@ train.py — 两阶段训练调度器(包装上层 yolov5/train.py)。
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -58,7 +59,12 @@ def run_train(args: list[str]):
     cmd = [sys.executable, str(TRAIN_PY), *args]
     print("\n$ " + " ".join(shlex.quote(c) for c in cmd))
     print(f"  (cwd = {YOLO_ROOT})\n")
-    res = subprocess.run(cmd, cwd=str(YOLO_ROOT))
+    # 屏蔽 PyTorch 2.x 的 FutureWarning(torch.cuda.amp.autocast / GradScaler 的弃用提示),
+    # 否则它每个 batch 打印一次,把 tqdm 进度条踢得不停换行。
+    # yolov5 自己的 corrupt JPEG 等 WARNING 是通过 logger 走的,不受影响。
+    env = os.environ.copy()
+    env["PYTHONWARNINGS"] = "ignore::FutureWarning"
+    res = subprocess.run(cmd, cwd=str(YOLO_ROOT), env=env)
     if res.returncode != 0:
         sys.exit(res.returncode)
 

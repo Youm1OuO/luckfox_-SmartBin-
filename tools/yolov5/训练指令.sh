@@ -1,0 +1,35 @@
+python fridge_project/scripts/train.py stage-b \
+    --data fridge_project/datasets/public_merged/public_merged.yaml \
+    --epochs 100 \
+    --batch-size 64 \
+    --imgsz 640 \
+    --workers 8 \
+    --cache ram
+
+
+python fridge_project/scripts/train.py stage-b \
+    --data fridge_project/datasets/public_merged/public_merged.yaml \
+    --epochs 100 \
+    --batch-size 64 \      ← 翻倍,显存够
+    --imgsz 640 \
+    --workers 8 \          ← 加倍,CPU 还有空闲
+    --cache ram            ← 关键!图全加载到内存,后续 epoch 不再读盘
+
+
+
+
+# -------------------------------------------------------------------------------
+
+
+# .pt → .ONNX
+python export.py \
+    --rknpu \
+    --weight runs/train/stage_b3/weights/best.pt \
+    --imgsz 320
+
+
+
+python export.py \
+    --rknpu \
+    --weight runs/train/stage_b/weights/best.pt \   ← 权重文件路径
+    --imgsz 320    ← 导出尺寸

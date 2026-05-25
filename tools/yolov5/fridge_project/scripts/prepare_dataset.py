@@ -178,24 +178,25 @@ def parse_yolo_source(root: Path, cmap: ClassMap, stats: Stats) -> Iterable[Anno
         print(f"  ! YOLO source {root} 缺少 data.yaml 或 classes.txt,跳过", file=sys.stderr)
         return
 
-    # 遍历图像
-    images_dir = root / "images"
-    if not images_dir.exists():
-        # 兼容把图片直接放 root 下的情况
-        images_dir = root
-    for img_path in images_dir.rglob("*"):
+    # 遍历图像。Roboflow 等导出格式可能是 root/images/、root/train/images/、
+    # root/data/train/images/ 等任意层级,统一用递归扫整个 root,然后通过把路径
+    # 里 "images" 段替换成 "labels" 来定位标注文件。
+    for img_path in root.rglob("*"):
         if img_path.suffix.lower() not in IMG_EXTS:
             continue
-        stats.images_in += 1
-        # 找对应 label:替换 images→labels,后缀改 .txt
+        # 只接受路径里包含 images 段的图片(避免扫到 README 旁边的图等)
         try:
             rel = img_path.relative_to(root)
-            parts = list(rel.parts)
-            if parts and parts[0] == "images":
-                parts[0] = "labels"
-            label_path = root.joinpath(*parts).with_suffix(".txt")
         except ValueError:
-            label_path = img_path.with_suffix(".txt")
+            continue
+        parts = list(rel.parts)
+        if "images" not in parts:
+            continue
+        stats.images_in += 1
+        # 找对应 label:把路径里(从右往左找,匹配最深的)"images" 段换成 "labels"
+        idx = len(parts) - 1 - parts[::-1].index("images")
+        label_parts = parts[:idx] + ["labels"] + parts[idx + 1:]
+        label_path = root.joinpath(*label_parts).with_suffix(".txt")
         if not label_path.exists():
             continue
 

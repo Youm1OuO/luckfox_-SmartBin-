@@ -45,12 +45,28 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 # 默认路径配置
 # -----------------------------------------------------------------------------
-# 脚本位置: <workspace>/tools/yolov5/fridge_project/scripts/build_calib_set.py
+# 脚本位置: <workspace>/yolov5/fridge_project/scripts/build_calib_set.py
+# SCRIPT_DIR = scripts
+#   SCRIPT_DIR.parents[0] = fridge_project
+#   SCRIPT_DIR.parents[1] = yolov5            <- 数据集就在这下面
+#   SCRIPT_DIR.parents[2] = workspace         <- rknn_model_zoo 在这下面 (走 SmartBin)
 SCRIPT_DIR = Path(__file__).resolve().parent
-WORKSPACE = SCRIPT_DIR.parents[3]   # 上推 4 层 = workspace 根
+YOLOV5_ROOT = SCRIPT_DIR.parents[1]
+WORKSPACE = SCRIPT_DIR.parents[2]
 
-DEFAULT_DATASETS_ROOT = WORKSPACE / "tools" / "yolov5" / "datasets"
-DEFAULT_RKNN_YOLOV5 = WORKSPACE / "tools" / "rknn_model_zoo" / "examples" / "yolov5"
+# WSL 当前布局: workspace/yolov5/datasets/<roboflow_dataset>/train/images
+DEFAULT_DATASETS_ROOT = YOLOV5_ROOT / "datasets"
+
+# WSL 当前布局: workspace/SmartBin/luckfox_pico_rkmpi/tools/rknn_model_zoo/examples/yolov5
+DEFAULT_RKNN_YOLOV5 = (
+    WORKSPACE
+    / "SmartBin"
+    / "luckfox_pico_rkmpi"
+    / "tools"
+    / "rknn_model_zoo"
+    / "examples"
+    / "yolov5"
+)
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
@@ -234,7 +250,10 @@ def main():
     pairs = discover_image_dirs(args.datasets_root, args.splits,
                                 args.include_test)
     if not pairs:
-        print("[ERROR] 未找到任何 'images' + 'labels' 配对; 检查 --datasets-root")
+        print(f"[ERROR] 在 {args.datasets_root} 下未找到任何 'images' + 'labels' 配对")
+        print(f"        - 该目录是否存在: {args.datasets_root.is_dir()}")
+        print(f"        - 期望布局: <root>/<dataset>/train/images + train/labels")
+        print(f"        - 用 --datasets-root 显式指定")
         sys.exit(1)
 
     # ------ 2. 列出每个子集的有效图 ------
