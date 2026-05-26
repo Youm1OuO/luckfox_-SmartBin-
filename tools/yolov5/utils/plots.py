@@ -88,7 +88,14 @@ class Annotator:
         if self.pil or not is_ascii(label):
             self.draw.rectangle(box, width=self.lw, outline=color)  # box
             if label:
-                w, h = self.font.getsize(label)  # text width, height
+                # === fridge_project patch (Pillow 10+ 兼容) ===
+                # 原代码 self.font.getsize(label) 在 Pillow 10+ 已被移除,
+                # 训练时会刷一堆 AttributeError: 'FreeTypeFont' object has no attribute 'getsize'
+                # 模型训练本身不受影响, 只是画 train_batch*.jpg / val_batch*_pred.jpg 失败.
+                # 这里改用 Pillow 8.0+ 都支持的 getbbox(), 跨版本兼容.
+                left, top, right, bottom = self.font.getbbox(label)
+                w, h = right - left, bottom - top
+                # === end patch ===
                 outside = box[1] - h >= 0  # label fits outside box
                 self.draw.rectangle(
                     (box[0], box[1] - h if outside else box[1], box[0] + w + 1,
@@ -167,7 +174,11 @@ class Annotator:
     def text(self, xy, text, txt_color=(255, 255, 255), anchor='top'):
         # Add text to image (PIL-only)
         if anchor == 'bottom':  # start y from font bottom
-            w, h = self.font.getsize(text)  # text width, height
+            # === fridge_project patch (Pillow 10+ 兼容) ===
+            # 同 box_label() 的修复, 把已被移除的 getsize() 换成 getbbox().
+            left, top, right, bottom = self.font.getbbox(text)
+            w, h = right - left, bottom - top
+            # === end patch ===
             xy[1] += 1 - h
         self.draw.text(xy, text, fill=txt_color, font=self.font)
 
