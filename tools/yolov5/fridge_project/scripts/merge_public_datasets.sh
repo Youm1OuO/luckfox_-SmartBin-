@@ -24,6 +24,14 @@ python fridge_project/scripts/prepare_dataset.py \
     --source-yolo "datasets/Beverage Containers.yolov5pytorch" \
     --source-yolo "datasets/Hand Detection.yolov5pytorch" \
     --source-yolo "datasets/hand.yolov5pytorch" \
+    --source-yolo "datasets/Vegetables.yolov5pytorch" \
+    --source-yolo "datasets/Fruits and Vegetables.yolov5pytorch" \
+    --source-yolo "datasets/fruit detection.yolov5pytorch" \
+    --source-yolo "datasets/Cantaloupe Detection.yolov5pytorch" \
+    --source-yolo "datasets/Watermelon.yolov5pytorch" \
+    --source-yolo "datasets/grape.yolov5pytorch" \
+    --source-yolo "datasets/Milk.yolov5pytorch" \
+    --source-yolo "datasets/papaya.yolov5pytorch" \
     --output      "fridge_project/datasets/public_merged" \
     --val-ratio   0.1
 

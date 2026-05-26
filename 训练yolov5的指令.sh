@@ -1,3 +1,6 @@
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+
+
 python fridge_project/scripts/train.py stage-b \
     --data fridge_project/datasets/public_merged/public_merged.yaml \
     --epochs 100 \
@@ -16,6 +19,17 @@ python fridge_project/scripts/train.py stage-b \
     --cache ram            ← 关键!图全加载到内存,后续 epoch 不再读盘
 
 
+
+
+
+python fridge_project/scripts/train.py stage-b \
+    --data fridge_project/datasets/public_merged/public_merged.yaml \
+    --epochs 200 \
+    --batch-size 32 \
+    --imgsz 640 \
+    --workers 8 \
+    --cache ram \
+    --name stage_b_640
 
 
 # -------------------------------------------------------------------------------

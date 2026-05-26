@@ -137,6 +137,8 @@ aliases:
   apple: apple                          # 苹果
   banana: banana                        # 香蕉
   orange: orange                        # 橙子
+  oren: orange                          # 橙子(马来语/印尼语,Fruits and Vegetables 数据集用)
+  podo: grape                           # 葡萄(韩语,grape.yolov5pytorch 数据集用)
   bottle: water_bottle                  # 瓶子(默认归矿泉水瓶)
   carrot: carrot                        # 胡萝卜
   broccoli: leafy_green                 # 西兰花 → 绿叶菜

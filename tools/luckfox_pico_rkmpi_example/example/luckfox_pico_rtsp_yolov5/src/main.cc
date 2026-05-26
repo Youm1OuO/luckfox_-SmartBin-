@@ -36,8 +36,8 @@ int width    = DISP_WIDTH;
 int height   = DISP_HEIGHT;
 
 // model size
-int model_width = 320;
-int model_height = 320;	
+int model_width = 640;
+int model_height = 640;	
 float scale ;
 int leftPadding ;
 int topPadding  ;
