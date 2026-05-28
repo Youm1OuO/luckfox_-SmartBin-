@@ -34,5 +34,5 @@ perspective: 0.0
 flipud: 0.5         # ← 冰箱顶视角:上下翻转合理
 fliplr: 0.5
 mosaic: 0.5         # ← 降低 mosaic,避免破坏冰箱场景的空间结构
-mixup: 0.0
-copy_paste: 0.0
+mixup: 0.10         # 
+copy_paste: 0.10    #

@@ -1,4 +1,5 @@
 cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+conda activate DL_env
 
 
 python fridge_project/scripts/train.py stage-b \
@@ -32,6 +33,16 @@ python fridge_project/scripts/train.py stage-b \
     --name stage_b_640
 
 
+
+python fridge_project/scripts/train.py stage-c \
+    --data    fridge_project/datasets/public_merged/public_merged.yaml \
+    --weights runs/train/stage_b_640/weights/best.pt \
+    --epochs  80 \
+    --batch-size 32 \
+    --imgsz 640 \
+    --workers 8 \
+    --cache ram \
+    --name stage_b_640_aug
 # -------------------------------------------------------------------------------
 
 
