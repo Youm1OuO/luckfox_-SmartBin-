@@ -45,6 +45,10 @@ docker save -o D:\Electronics_Competition\luckfox_env.tar luckfox_team_env:v1
 docker load -i ./luckfox_env.tar
 //启动容器
 docker run -it --name luckfox_work -v D:\Luckfox_Project:/workspace luckfox_team_env:v1 /bin/bash
+docker run -it --name luckfox_work \
+  -v /home/muyou/Projects/workspace/luckfox_demo:/workspace \
+  luckfox_team_env:v1 /bin/bash
+
 
 yolov5s.pt -> yolov5s.onnx -> yolov5.rknn
 

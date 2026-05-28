@@ -35,6 +35,9 @@ python fridge_project/scripts/train.py stage-b \
 # -------------------------------------------------------------------------------
 
 
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+
+
 # .pt → .ONNX
 python export.py \
     --rknpu \
@@ -47,3 +50,10 @@ python export.py \
     --rknpu \
     --weight runs/train/stage_b/weights/best.pt \   ← 权重文件路径
     --imgsz 320    ← 导出尺寸
+
+
+
+python export.py \
+    --rknpu \
+    --weight runs/train/stage_b_640/weights/best.pt \
+    --imgsz 640

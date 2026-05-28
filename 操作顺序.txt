@@ -57,16 +57,19 @@ python3 convert.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文�
 python3 convert_fridge.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
 即:
 python3 convert_fridge.py \
-    /workspace/tools/yolov5/runs/train/stage_b3/weights/best.onnx \
+    /workspace/tools/yolov5/runs/train/stage_b_640/weights/best.onnx \
     rv1106 i8 \
-    /workspace/tools/yolov5/runs/train/stage_b3/weights/best.rknn
+    /workspace/tools/yolov5/runs/train/stage_b_640/weights/best.rknn
 
 
 
 // 交叉编译 (在docker中)
+export LUCKFOX_SDK_PATH=/workspace/luckfox-pico
 cd /workspace/tools/luckfox_pico_rkmpi_example
 ./build.sh rv1106
 然后选: 1, 5
+改为：
+bash /workspace/build_in_docker.sh
 
 
 
