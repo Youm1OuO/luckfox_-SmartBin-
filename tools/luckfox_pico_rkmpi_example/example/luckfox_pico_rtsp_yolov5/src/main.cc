@@ -143,6 +143,15 @@ int main(int argc, char *argv[]) {
 	//hdr_mode = RK_AIQ_WORKING_MODE_ISP_HDR2;
 	SAMPLE_COMM_ISP_Init(0, hdr_mode, multi_sensor, iq_dir);
 	SAMPLE_COMM_ISP_Run(0);
+	// 摄像头物理倒装, 需要把画面旋转 180°.
+	//
+	// 之前用过 SAMPLE_COMM_ISP_SetMirrorFlip(0, 1, 1) 走 ISP/sensor 通路, 但是:
+	//   1. 不是所有 sensor 都开放 mirror/flip 寄存器, 调了不报错也不生效;
+	//   2. 即便生效, 也只是改 sensor 输出, 排查问题时不直观.
+	// 改成软件翻转最稳: 在拿到 BGR 帧后做 cv::flip(frame, frame, -1).
+	// 一帧 720x480 BGR 大约 1ms, 没什么开销, 而且 YOLO 推理跟显示用的是同一份
+	// 画面, 翻转一次全部生效 (因为 letterbox 输入也来自 frame).
+	// 实际翻转见下面 while 循环里 cv::cvtColor 之后那一行.
 
 	// rkmpi init
 	if (RK_MPI_SYS_Init() != RK_SUCCESS) {
@@ -191,6 +200,12 @@ int main(int argc, char *argv[]) {
 			// 内存 + 同样尺寸, resize 是冗余且 src=dst 时 OpenCV 行为未定义, 现已去掉.
 			cv::Mat yuv420sp(height + height / 2, width, CV_8UC1, vi_data);
 			cv::cvtColor(yuv420sp, frame, cv::COLOR_YUV420sp2BGR);
+
+			// 摄像头物理倒装, 这里直接对原图做 180° 旋转 (= 上下+左右各翻一次).
+			// flipCode = -1 表示同时翻 X 和 Y 轴.
+			// 必须在 letterbox/inference 之前做, 这样 YOLO 看到的是正向画面,
+			// 检测框坐标也就直接对齐到旋转后的 frame 上, 不需要再二次映射.
+			cv::flip(frame, frame, -1);
 
 			//letterbox
 			cv::Mat letterboxImage = letterbox(frame);	

@@ -96,8 +96,11 @@ int venc_init(int chnId, int width, int height, RK_CODEC_ID_E enType) {
 
 	if (enType == RK_VIDEO_ID_AVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H264CBR;
-		stAttr.stRcAttr.stH264Cbr.u32BitRate = 10 * 1024;
-		stAttr.stRcAttr.stH264Cbr.u32Gop = 1;
+		// 码率从 10M 降到 2M, 720x480 监控完全够用, 省带宽和 VENC 占用
+		// (码率不影响 YOLO, YOLO 看的是编码前的 BGR 帧)
+		stAttr.stRcAttr.stH264Cbr.u32BitRate = 2 * 1024;
+		// Gop 从 1 改成 30: 不再每帧都强制关键帧, 编码效率高, 延时降低
+		stAttr.stRcAttr.stH264Cbr.u32Gop = 30;
 	} else if (enType == RK_VIDEO_ID_HEVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
 		stAttr.stRcAttr.stH265Cbr.u32BitRate = 10 * 1024;
