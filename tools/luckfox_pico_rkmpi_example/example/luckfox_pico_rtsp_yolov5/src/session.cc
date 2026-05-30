@@ -101,12 +101,47 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
 
     // ================================================================
     //  Step 3: 刷新库存里"还能看到"的物品（按 track_id 匹配）
+    //          + 平滑移动整理检测（物品 track 没被手遮挡, 自己挪了位置）
     // ================================================================
     for (const Track* t : foods) {
         InventoryItem* item = inventory_.find_by_track(t->track_id);
-        if (item) {
-            inventory_.update_seen(item->item_id, t->track_id, t->box, t->score, frame_id);
+        if (!item) continue;
+
+        int iid = item->item_id;
+
+        // --- 平滑移动整理检测 ---
+        // 锚点不存在 → 用当前位置初始化锚点
+        if (item_anchor_.find(iid) == item_anchor_.end()) {
+            item_anchor_[iid] = item->box;
         }
+
+        // 判断物品这一帧是否"停下来了"（相对上一帧位移很小）
+        bool settled = true;
+        auto lb = item_last_box_.find(iid);
+        if (lb != item_last_box_.end()) {
+            settled = center_distance(item->box, lb->second) < SMOOTH_SETTLE_PIX;
+        } else {
+            settled = false;  // 还没有上一帧记录，先不判
+        }
+
+        // 物品停下来了 + 离锚点足够远 → 平滑移动整理
+        float move = center_distance(t->box, item_anchor_[iid]);
+        if (settled && move >= SMOOTH_RELOCATE_PIX) {
+            printf("\n\033[1;32m[EVENT]\033[0m 整理: item#%d %s (置信度 %.0f%%) "
+                   "从(%.0f,%.0f)~(%.0f,%.0f) → (%.0f,%.0f)~(%.0f,%.0f)\n",
+                   iid, coco_cls_to_name(item->cls_id), t->score * 100,
+                   item_anchor_[iid].x1, item_anchor_[iid].y1,
+                   item_anchor_[iid].x2, item_anchor_[iid].y2,
+                   t->box.x1, t->box.y1, t->box.x2, t->box.y2);
+            item_anchor_[iid] = t->box;   // 更新锚点到新位置
+            res.happened = true;
+        }
+
+        // 记录这一帧位置（给下一帧判 settled 用）
+        item_last_box_[iid] = t->box;
+
+        // 正常刷新库存（位置、状态、last_seen）
+        inventory_.update_seen(iid, t->track_id, t->box, t->score, frame_id);
     }
 
     // ================================================================
@@ -174,6 +209,9 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
             inventory_.relocate_item(item_id, putdown->track_id, putdown->box,
                                      putdown->score, frame_id);
             consumed_tids.insert(putdown->track_id);
+            // 同步平滑路径的锚点，避免下一帧重复报整理
+            item_anchor_[item_id] = putdown->box;
+            item_last_box_[item_id] = putdown->box;
             held_done.push_back(item_id);
             res.happened = true;
             continue;
@@ -319,6 +357,18 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
         }
     }
     for (int id : to_remove) inventory_.remove_item(id);
+
+    // ================================================================
+    //  Step 7.5: 清理已不在库存的 item 的锚点记录（防止 item_id 复用时残留）
+    // ================================================================
+    for (auto it = item_anchor_.begin(); it != item_anchor_.end(); ) {
+        if (inventory_.find_by_item(it->first) == nullptr) it = item_anchor_.erase(it);
+        else ++it;
+    }
+    for (auto it = item_last_box_.begin(); it != item_last_box_.end(); ) {
+        if (inventory_.find_by_item(it->first) == nullptr) it = item_last_box_.erase(it);
+        else ++it;
+    }
 
     // ================================================================
     //  Step 8: 有变化时打印库存

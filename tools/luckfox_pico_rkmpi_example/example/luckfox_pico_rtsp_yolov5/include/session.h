@@ -72,6 +72,13 @@ private:
     // 候选新物品 (key = track_id)
     std::map<int, PendingNew> pending_news_;
 
+    // ===== 平滑移动整理检测 =====
+    // item_id -> 上一次"稳定停留"的锚点位置。物品 track 没被手遮挡、
+    // 平滑移动到新位置停下时，跟锚点比对，距离够大就报整理。
+    std::map<int, BBox> item_anchor_;
+    // item_id -> 上一帧的位置（用于判断"是否停下来了"）
+    std::map<int, BBox> item_last_box_;
+
     // ===== 方案 B：手消失惯性 =====
     // 最后一次画面里有手的帧号。手消失后的 HAND_INERTIA_FRAMES 帧内
     // 仍然认为"可能有手"，物品不轻易判拿走（抗手识别不稳）
@@ -84,6 +91,10 @@ private:
     static constexpr float HAND_COVER_RATIO = 0.5f;
     // 手消失惯性：手 track 消失后多少帧内仍认为"可能有手"
     static constexpr int HAND_INERTIA_FRAMES = 10;
+    // 平滑移动整理：物品离锚点超过这个像素距离才算"挪过位"
+    static constexpr float SMOOTH_RELOCATE_PIX = 60.0f;
+    // 平滑移动整理：物品相邻两帧位移小于这个值才算"停下来了"
+    static constexpr float SMOOTH_SETTLE_PIX = 8.0f;
     // 画面尺寸（用于方案 A 手臂延伸到边缘的计算）
     static constexpr float FRAME_W = 720.0f;
     static constexpr float FRAME_H = 480.0f;
