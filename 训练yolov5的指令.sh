@@ -34,15 +34,30 @@ python fridge_project/scripts/train.py stage-b \
 
 
 
-python fridge_project/scripts/train.py stage-c \
-    --data    fridge_project/datasets/public_merged/public_merged.yaml \
-    --weights runs/train/stage_b_640/weights/best.pt \
-    --epochs  80 \
+python fridge_project/scripts/train.py stage-b \
+    --data fridge_project/datasets/public_merged/public_merged.yaml \
+    --hyp  fridge_project/configs/hyp_stage_b.yaml \
+    --weights runs/train/stage_b_640_aug/weights/best.pt \
+    --freeze 0 \
+    --epochs 300 \
     --batch-size 32 \
     --imgsz 640 \
     --workers 8 \
     --cache ram \
-    --name stage_b_640_aug
+    --name stage_b_640_v1
+
+
+python fridge_project/scripts/train.py stage-b \
+    --data fridge_project/datasets/public_merged/public_merged.yaml \
+    --hyp  fridge_project/configs/hyp_stage_b.yaml \
+    --weights runs/train/stage_b_640/weights/best.pt \
+    --freeze 0 \
+    --epochs 200 \
+    --batch-size 32 \
+    --imgsz 640 \
+    --workers 8 \
+    --cache ram \
+    --name stage_b_640_v3
 # -------------------------------------------------------------------------------
 
 
@@ -66,5 +81,5 @@ python export.py \
 
 python export.py \
     --rknpu \
-    --weight runs/train/stage_b_640/weights/best.pt \
+    --weight runs/train/stage_b_640_v3_b_clean/weights/best.pt \
     --imgsz 640

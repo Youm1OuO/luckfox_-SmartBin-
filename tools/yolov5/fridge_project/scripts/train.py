@@ -79,7 +79,7 @@ def stage_b(opt: argparse.Namespace):
         "--weights", str(opt.weights or DEFAULT_PRETRAIN),
         "--cfg",     opt.cfg,                       # yolov5n.yaml / yolov5s.yaml
         "--data",    str(Path(opt.data).resolve()),
-        "--hyp",     str(HYP_SCRATCH),
+        "--hyp",     str(Path(opt.hyp).resolve() if opt.hyp else HYP_SCRATCH),
         "--epochs",  str(opt.epochs),
         "--batch-size", str(opt.batch_size),
         "--imgsz",   str(opt.imgsz),
@@ -88,6 +88,10 @@ def stage_b(opt: argparse.Namespace):
         "--workers", str(opt.workers),
         "--cos-lr",                                  # 余弦学习率,微调更稳
     ]
+    # --freeze 默认 0(不冻结). 显式传 0 也无副作用,只是把"默认行为"写出来,
+    # 让后面看 log 的人一眼知道"这次没冻结".
+    if opt.freeze is not None:
+        args += ["--freeze", str(opt.freeze)]
     if opt.device:
         args += ["--device", opt.device]
     if opt.exist_ok:
@@ -186,6 +190,13 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--weights", default=None, help="起始权重(默认 yolov5n.pt)")
     sb.add_argument("--cfg", default="models/yolov5s.yaml",
                     help="模型结构 yaml,默认 yolov5s")
+    sb.add_argument("--hyp", default=None,
+                    help="超参 yaml(默认 yolov5/data/hyps/hyp.scratch-low.yaml;"
+                         "想用 fridge_project/configs/hyp_finetune.yaml 时手动传入)")
+    sb.add_argument("--freeze", type=int, default=None,
+                    help="冻结 backbone 前 N 层(默认 None=不冻结). "
+                         "stage-b 通常不冻结,留这个参数是为了支持'从已有权重接力 + "
+                         "只想训部分层'的边角场景")
     sb.set_defaults(func=stage_b)
 
     # stage-c

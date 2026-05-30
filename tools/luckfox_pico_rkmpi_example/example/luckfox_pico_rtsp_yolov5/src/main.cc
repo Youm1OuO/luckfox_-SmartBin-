@@ -25,8 +25,11 @@
 #include "fridge_config.h"     // 全局配置（类别 id、阈值）
 #include "geometry.h"          // BBox 几何工具
 #include "tracker.h"           // ByteTrack-Lite 跟踪器
-#include "hand_state.h"        // 手部状态机 + 事件配对
-#include "inventory.h"         // 库存数据库
+#include "snapshot.h"          // 稳态快照 + diff
+#include "stability.h"         // 稳态监控状态机
+#include "session.h"           // 会话管理器（编排 stability + diff + inventory）
+#include "inventory.h"         // 本地工作库存
+// hand_state.h 暂时保留备用（"主动确认/撤销"等扩展），当前业务路径不再调用
 
 #define DISP_WIDTH  720
 #define DISP_HEIGHT 480
@@ -178,12 +181,24 @@ int main(int argc, char *argv[]) {
 	printf("venc init success\n");	
 
 	// ============================================================
-	//  冰箱视觉系统：初始化跟踪器、状态机、库存
+	//  冰箱视觉系统：初始化跟踪器 + 会话管理器
+	//  会话管理器内部封装了：稳态监控 + 快照 diff + 工作库存
 	// ============================================================
 	fridge::ByteTrackLite tracker;
-	fridge::HandStateManager hand_mgr;
-	fridge::InventoryDB inventory;
+	fridge::SessionManager session;
 	int g_frame_id = 0;
+
+	// ============================================================
+	//  开关门检测（全局亮度阈值法）
+	//   冰箱关门 → 画面变黑 → 整帧平均灰度暴跌
+	//   平均灰度 < DOOR_DARK_THRESH 视为关门
+	//   关门瞬间把当前库存打包上传后台（这里先打印 JSON，后续接 HTTP/MQTT）
+	// ============================================================
+	bool door_open = true;        // 假设启动时门是开的
+	const double DOOR_DARK_THRESH = 50.0;   // 平均灰度阈值，按实际冰箱调
+	int dark_streak = 0;          // 连续多少帧暗
+	int bright_streak = 0;        // 连续多少帧亮
+	const int DOOR_CONFIRM = 5;   // 连续 5 帧确认开/关，防抖
 
   	while(1)
 	{	
@@ -200,6 +215,51 @@ int main(int argc, char *argv[]) {
 			// 内存 + 同样尺寸, resize 是冗余且 src=dst 时 OpenCV 行为未定义, 现已去掉.
 			cv::Mat yuv420sp(height + height / 2, width, CV_8UC1, vi_data);
 			cv::cvtColor(yuv420sp, frame, cv::COLOR_YUV420sp2BGR);
+
+			// ============================================================
+			//  开关门检测：YUV420SP 的前 width*height 字节就是 Y(亮度)分量
+			//  直接对 Y 求平均，零额外开销（不用转灰度）
+			// ============================================================
+			{
+				cv::Mat y_plane(height, width, CV_8UC1, vi_data);
+				double mean_y = cv::mean(y_plane)[0];
+
+				bool dark_now = (mean_y < DOOR_DARK_THRESH);
+				if (dark_now) { dark_streak++; bright_streak = 0; }
+				else          { bright_streak++; dark_streak = 0; }
+
+				if (door_open && dark_streak >= DOOR_CONFIRM) {
+					// 开 → 关
+					door_open = false;
+					printf("\n\033[1;33m[DOOR]\033[0m 关门 (亮度=%.0f), 上传库存:\n", mean_y);
+					RK_U64 ts = TEST_COMM_GetNowUs() / 1000;  // 毫秒
+					std::string json = session.inventory().to_json("luckfox", (long long)ts);
+					printf("%s\n", json.c_str());
+				} else if (!door_open && bright_streak >= DOOR_CONFIRM) {
+					// 关 → 开
+					door_open = true;
+					printf("\n\033[1;33m[DOOR]\033[0m 开门 (亮度=%.0f)\n", mean_y);
+				}
+			}
+
+			// 关门状态下，画面是黑的，不跑 YOLO（省算力，也避免黑画面误检）
+			if (!door_open) {
+				// 直接编码黑画面推流，跳过识别
+				memcpy(data, frame.data, width * height * 3);
+				RK_MPI_VENC_SendFrame(0, &h264_frame, -1);
+				s32Ret = RK_MPI_VENC_GetStream(0, &stFrame, -1);
+				if (s32Ret == RK_SUCCESS) {
+					if (g_rtsplive && g_rtsp_session) {
+						void *pData = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
+						rtsp_tx_video(g_rtsp_session, (uint8_t *)pData,
+						              stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS);
+						rtsp_do_event(g_rtsplive);
+					}
+					RK_MPI_VENC_ReleaseStream(0, &stFrame);
+				}
+				RK_MPI_VI_ReleaseChnFrame(0, 0, &stViFrame);
+				continue;   // 跳过本帧后续所有识别逻辑
+			}
 
 			// 摄像头物理倒装, 这里直接对原图做 180° 旋转 (= 上下+左右各翻一次).
 			// flipCode = -1 表示同时翻 X 和 Y 轴.
@@ -241,38 +301,26 @@ int main(int argc, char *argv[]) {
 			const std::vector<fridge::Track>& tracks =
 				tracker.update(detections, g_frame_id);
 
-			// ============================================================
-			//  Step B+: 打印调试日志（每秒大约打印 1 次）
-			//   只要有 track 就打印当前帧的检测结果，方便观察
-			// ============================================================
-			if (g_frame_id % 10 == 0 && !tracks.empty()) {
-				printf("[FRAME %d] %zu tracks: ", g_frame_id, tracks.size());
-				for (const auto& t : tracks) {
-					printf("[#%d %s @(%.0f,%.0f)~(%.0f,%.0f) %.0f%%] ",
-					       t.track_id,
-					       coco_cls_to_name(t.cls_id),
-					       t.box.x1, t.box.y1, t.box.x2, t.box.y2,
-					       t.score * 100);
-				}
-				printf("\n");
-			}
+			// 注: 之前这里有"每 10 帧打印一次 track 列表"的调试日志,
+			//     已删除. 检测框直接看 RTSP 视频画面更直观,
+			//     终端只保留 SESSION/EVENT/Inventory 这种业务输出, 信号噪声比更高.
 
 			// ============================================================
-			//  Step C: 跑手部状态机；任何完成结算的事件会被返回
+			//  Step C: 跑会话管理器
+			//   - 内部判稳/扰动；
+			//   - STABLE→DISTURBED 时冻结 before；
+			//   - DISTURBED→STABLE 时取 after，diff，应用到本地工作库存。
+			//   多数帧没有事件产生，只在稳态切换那一刻才有。
 			// ============================================================
-			std::vector<fridge::FinalEvent> events =
-				hand_mgr.update(tracks, g_frame_id);
+			fridge::SettlementResult settlement = session.update(tracks, g_frame_id);
+			(void)settlement;   // 当前还不用上报后台，先把变量留个口子
+			//  注意：库存的打印 / 事件的打印都已经在 session.cc / inventory.cc
+			//  内部完成（带 [SESSION] / [EVENT] / [Inventory] 前缀），这里
+			//  不再重复打印。
 
 			// ============================================================
-			//  Step D: 把事件应用到库存
-			// ============================================================
-			if (!events.empty()) {
-				inventory.apply_events(events);
-				inventory.print("  ");   // 调试用：打印当前库存
-			}
-
-			// ============================================================
-			//  Step E: 在画面上画 track（含 track_id），方便观察
+			//  Step D: 在画面上画 track（含 track_id），方便观察
+			//  外加一个右上角的"系统状态"指示（STABLE / DISTURBED）
 			// ============================================================
 			for (const auto& t : tracks) {
 				int x1 = (int)t.box.x1;
@@ -294,6 +342,28 @@ int main(int argc, char *argv[]) {
 				         t.score * 100);
 				cv::putText(frame, text, cv::Point(x1, y1 - 6),
 				            cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
+			}
+
+			// ============================================================
+			//  Step E: 屏幕左上角叠加系统状态指示
+			//   - STABLE   绿色 — 现在画面安静，库存可信
+			//   - DISTURBED 红色 — 用户正在操作，库存暂停更新
+			//  让答辩 / 调试时一眼能看出"现在系统觉得用户在不在动"
+			// ============================================================
+			{
+				fridge::SystemState ss = session.system_state();
+				bool stable = (ss == fridge::SystemState::STABLE);
+				cv::Scalar osd_color = stable
+					? cv::Scalar(0, 255, 0)
+					: cv::Scalar(0, 0, 255);
+				char osd[96];
+				snprintf(osd, sizeof(osd), "%s | inv=%zu(v=%zu/o=%zu)",
+				         fridge::system_state_to_str(ss),
+				         session.inventory().size(),
+				         session.inventory().count_visible(),
+				         session.inventory().count_occluded());
+				cv::putText(frame, osd, cv::Point(8, 22),
+				            cv::FONT_HERSHEY_SIMPLEX, 0.6, osd_color, 2);
 			}
 
 		}

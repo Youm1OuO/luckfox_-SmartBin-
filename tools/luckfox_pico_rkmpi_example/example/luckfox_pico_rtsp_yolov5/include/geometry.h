@@ -63,6 +63,30 @@ inline float center_distance(const BBox& a, const BBox& b) {
     return std::sqrt(dx * dx + dy * dy);
 }
 
+// 点 (px, py) 是否落在框 b 内
+inline bool point_in_box(float px, float py, const BBox& b) {
+    return px >= b.x1 && px <= b.x2 && py >= b.y1 && py <= b.y2;
+}
+
+// 交集面积占"较小框"的比例
+// 用途：判断"手是否盖住了物品"。
+//   IoU 在两个框大小悬殊时会失效（大手框盖住小物品框，IoU 很小），
+//   但 overlap_ratio_of_smaller 衡量的是"小框被覆盖了多少"，更鲁棒。
+//   手完全盖住物品时，这个值接近 1.0。
+inline float overlap_ratio_of_smaller(const BBox& a, const BBox& b) {
+    float ix1 = std::max(a.x1, b.x1);
+    float iy1 = std::max(a.y1, b.y1);
+    float ix2 = std::min(a.x2, b.x2);
+    float iy2 = std::min(a.y2, b.y2);
+    float iw = std::max(0.0f, ix2 - ix1);
+    float ih = std::max(0.0f, iy2 - iy1);
+    float inter = iw * ih;
+    if (inter <= 0.0f) return 0.0f;
+    float smaller = std::min(a.area(), b.area());
+    if (smaller <= 0.0f) return 0.0f;
+    return inter / smaller;
+}
+
 }  // namespace fridge
 
 #endif  // __FRIDGE_GEOMETRY_H

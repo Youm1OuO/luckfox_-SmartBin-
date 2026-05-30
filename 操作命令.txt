@@ -57,3 +57,7 @@ tar -zxvf Electronics_Competition_All.tar.gz
 
 // 转换好之后的模型放在这里
 C:\Users\Youm1OuO\Desktop\luckfox_demo\tools\rknn_model_zoo\examples\yolov5\model
+
+
+
+我又加了 N 个数据集，请帮我合并进来。

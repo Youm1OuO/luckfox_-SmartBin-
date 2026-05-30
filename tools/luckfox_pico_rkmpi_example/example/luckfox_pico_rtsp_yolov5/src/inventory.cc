@@ -1,103 +1,154 @@
 // ============================================================================
 //  inventory.cc
-//  库存数据库实现（内存版）
+//  本地工作库存实现 — item_id 身份版
 // ============================================================================
 #include "inventory.h"
 #include "fridge_config.h"
 
 #include <cstdio>
-#include <limits>
-
-// 用 coco_cls_to_name() 把 cls_id 转成可读名字。
-// 注意：这里要 include "yolov5.h" 而不是直接 include "postprocess.h"，
-// 因为 postprocess.h 里用到了 yolov5.h 中定义的 rknn_app_context_t 类型。
-#include "yolov5.h"
+#include <cstring>
+#include "yolov5.h"   // coco_cls_to_name()
 
 namespace fridge {
 
-int InventoryDB::find_closest(int cls_id, const BBox& query) const {
-    int best = -1;
-    float best_dist = std::numeric_limits<float>::max();
-    for (size_t i = 0; i < items_.size(); ++i) {
-        if (items_[i].cls_id != cls_id) continue;
-        float d = center_distance(items_[i].pos, query);
-        if (d < best_dist) {
-            best_dist = d;
-            best = (int)i;
-        }
+const char* item_status_to_str(ItemStatus s) {
+    switch (s) {
+        case ItemStatus::VISIBLE:  return "VISIBLE";
+        case ItemStatus::OCCLUDED: return "OCCLUDED";
+        case ItemStatus::GONE:     return "GONE";
     }
-    return best;
+    return "?";
 }
 
-int InventoryDB::handle_in(const FinalEvent& e) {
+int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
+                          float score, int frame_id) {
     InventoryItem it;
     it.item_id = next_item_id_++;
-    it.cls_id = e.cls_id;
-    it.pos = e.to_pos;
-    it.created_frame = e.frame_end;
-    it.updated_frame = e.frame_end;
-    items_.push_back(it);
+    it.track_id = track_id;
+    it.cls_id = cls_id;
+    it.box = box;
+    it.score = score;
+    it.status = ItemStatus::VISIBLE;
+    it.created_frame = frame_id;
+    it.updated_frame = frame_id;
+    it.last_seen_frame = frame_id;
+    items_[it.item_id] = it;
     return it.item_id;
 }
 
-int InventoryDB::handle_out(const FinalEvent& e) {
-    // 找位置最近的同类项删除
-    int idx = find_closest(e.cls_id, e.from_pos);
-    if (idx < 0) return -1;        // 库存里本来就没有，可能是误识别
-    int id = items_[idx].item_id;
-    items_.erase(items_.begin() + idx);
-    return id;
+InventoryItem* InventoryDB::find_by_track(int track_id) {
+    for (auto& kv : items_) {
+        if (kv.second.track_id == track_id) return &kv.second;
+    }
+    return nullptr;
 }
 
-int InventoryDB::handle_relocate(const FinalEvent& e) {
-    int idx = find_closest(e.cls_id, e.from_pos);
-    if (idx < 0) {
-        // 库存里没有这个物品的记录，但又发生了"整理"
-        // 退化策略：把它当作"新出现"，按 IN 处理
-        return handle_in(e);
+const InventoryItem* InventoryDB::find_by_track(int track_id) const {
+    for (const auto& kv : items_) {
+        if (kv.second.track_id == track_id) return &kv.second;
     }
-    items_[idx].pos = e.to_pos;
-    items_[idx].updated_frame = e.frame_end;
-    return items_[idx].item_id;
+    return nullptr;
 }
 
-std::vector<int> InventoryDB::apply_events(const std::vector<FinalEvent>& events) {
-    std::vector<int> affected;
-    for (const auto& e : events) {
-        int id = -1;
-        switch (e.type) {
-            case FinalEventType::IN:       id = handle_in(e);       break;
-            case FinalEventType::OUT:      id = handle_out(e);      break;
-            case FinalEventType::RELOCATE: id = handle_relocate(e); break;
-        }
-        if (id >= 0) affected.push_back(id);
+InventoryItem* InventoryDB::find_by_item(int item_id) {
+    auto it = items_.find(item_id);
+    return it == items_.end() ? nullptr : &it->second;
+}
 
-        // 这里也直接打日志（方便调试）
-        printf("[EVENT] %s cls=%d(%s) "
-               "from=(%.0f,%.0f)~(%.0f,%.0f) to=(%.0f,%.0f)~(%.0f,%.0f) "
-               "frame=%d~%d hand=#%d -> item_id=%d\n",
-               final_event_type_to_str(e.type),
-               e.cls_id,
-               coco_cls_to_name(e.cls_id),
-               e.from_pos.x1, e.from_pos.y1, e.from_pos.x2, e.from_pos.y2,
-               e.to_pos.x1, e.to_pos.y1, e.to_pos.x2, e.to_pos.y2,
-               e.frame_begin, e.frame_end,
-               e.hand_track_id,
-               id);
+void InventoryDB::update_seen(int item_id, int track_id, const BBox& box,
+                              float score, int frame_id) {
+    auto it = items_.find(item_id);
+    if (it == items_.end()) return;
+    it->second.track_id = track_id;
+    it->second.box = box;
+    it->second.score = score;
+    it->second.status = ItemStatus::VISIBLE;
+    it->second.updated_frame = frame_id;
+    it->second.last_seen_frame = frame_id;
+}
+
+void InventoryDB::mark_occluded(int item_id) {
+    auto it = items_.find(item_id);
+    if (it != items_.end() && it->second.status == ItemStatus::VISIBLE) {
+        it->second.status = ItemStatus::OCCLUDED;
     }
-    return affected;
+}
+
+void InventoryDB::relocate_item(int item_id, int new_track_id, const BBox& new_box,
+                                float score, int frame_id) {
+    auto it = items_.find(item_id);
+    if (it == items_.end()) return;
+    it->second.track_id = new_track_id;   // 重新绑定 track（身份 item_id 不变！）
+    it->second.box = new_box;
+    it->second.score = score;
+    it->second.status = ItemStatus::VISIBLE;
+    it->second.updated_frame = frame_id;
+    it->second.last_seen_frame = frame_id;
+}
+
+void InventoryDB::remove_item(int item_id) {
+    items_.erase(item_id);
+}
+
+size_t InventoryDB::count_visible() const {
+    size_t n = 0;
+    for (const auto& kv : items_) {
+        if (kv.second.status == ItemStatus::VISIBLE) n++;
+    }
+    return n;
+}
+
+size_t InventoryDB::count_occluded() const {
+    size_t n = 0;
+    for (const auto& kv : items_) {
+        if (kv.second.status == ItemStatus::OCCLUDED) n++;
+    }
+    return n;
 }
 
 void InventoryDB::print(const char* prefix) const {
-    printf("%s[Inventory] %zu items:\n", prefix, items_.size());
-    for (const auto& it : items_) {
-        printf("  - id=%d cls=%d(%s) pos=(%.0f,%.0f)~(%.0f,%.0f) "
-               "created@%d updated@%d\n",
-               it.item_id, it.cls_id,
-               coco_cls_to_name(it.cls_id),
-               it.pos.x1, it.pos.y1, it.pos.x2, it.pos.y2,
-               it.created_frame, it.updated_frame);
+    printf("%s[Inventory] %zu items (visible=%zu, occluded=%zu)\n",
+           prefix, items_.size(), count_visible(), count_occluded());
+    for (const auto& kv : items_) {
+        const auto& it = kv.second;
+        printf("%s  - item#%d cls=%d(%s) status=%s "
+               "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d seen@%d\n",
+               prefix,
+               it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
+               item_status_to_str(it.status),
+               it.box.x1, it.box.y1, it.box.x2, it.box.y2,
+               it.score, it.track_id, it.last_seen_frame);
     }
+}
+
+std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms) const {
+    // 手写 JSON（避免引入第三方库）。格式：
+    // {"device_id":"...","timestamp":...,"event_type":"DOOR_CLOSE","inventory":[...]}
+    std::string s;
+    char buf[512];
+
+    snprintf(buf, sizeof(buf),
+             "{\"device_id\":\"%s\",\"timestamp\":%lld,"
+             "\"event_type\":\"DOOR_CLOSE\",\"inventory\":[",
+             device_id, timestamp_ms);
+    s += buf;
+
+    bool first = true;
+    for (const auto& kv : items_) {
+        const auto& it = kv.second;
+        // 只上报还在库存里的（VISIBLE / OCCLUDED 都算"在冰箱里"）
+        snprintf(buf, sizeof(buf),
+                 "%s{\"item_id\":%d,\"category\":\"%s\",\"status\":\"%s\","
+                 "\"bbox\":[%.0f,%.0f,%.0f,%.0f]}",
+                 first ? "" : ",",
+                 it.item_id, coco_cls_to_name(it.cls_id),
+                 item_status_to_str(it.status),
+                 it.box.x1, it.box.y1, it.box.x2, it.box.y2);
+        s += buf;
+        first = false;
+    }
+    s += "]}";
+    return s;
 }
 
 }  // namespace fridge

@@ -253,6 +253,27 @@ aliases:
   "tin-can": soda_can
   "cup-disposable": yogurt_cup          # 一次性杯
   "cup-handle": yogurt_cup              # 带把手杯
+
+  # ===== detect can(2018 张,标签较脏的多类罐子数据集)=====
+  # 该数据集里只有"金属罐"系列标签是有效信号,其他都是垃圾分类标签,统一丢弃。
+  # 注意:'can' 这个标签前面 COCO 那段已经映射过 → soda_can,这里只补
+  # 这个数据集额外引入的几个金属罐别名。
+  "cans": soda_can                      # CAN 复数(归一化大小写后会匹配)
+  "metal": soda_can                     # 金属(罐)
+  # 故意不映射(=丢弃),这些都是垃圾分类标签,跟冰箱场景无关:
+  #   biodegradable / cardboard / distorted
+  #   '0' / '1' / '2'(数据集制作者用 ID 当类别名了,意义不明)
+
+  # ===== glass(1115 张,只有一个长版本号当类别名)=====
+  # 类别名是 'Glass Bottles - v2 2023-07-17 7:21pm',归一化后小写带连字符日期
+  # 实际意思就是"玻璃瓶",归到 milk_bottle(玻璃牛奶瓶)
+  "glass bottles - v2 2023-07-17 7:21pm": milk_bottle
+  "glass bottles": milk_bottle          # 兜底:如果你以后导出时换了版本号
+
+  # ===== Plastic Bottle 2.0(3759 张,塑料瓶)=====
+  "plastic-bottle": water_bottle
+  "plastic bottle": water_bottle
+
   # 故意不映射(视觉与冰箱场景关系弱):
   #   glass-mug    马克杯
   #   glass-normal 普通玻璃杯
