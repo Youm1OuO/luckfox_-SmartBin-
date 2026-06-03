@@ -105,3 +105,7 @@ logs/
 # ========== 单文件超大资源（按需添加） ==========
 tools/rknn-toolkit2/rknn-toolkit2/examples/functions/hybrid_quant/ssd_mobilenet_v2.pb
 *.pb
+
+
+
+captures

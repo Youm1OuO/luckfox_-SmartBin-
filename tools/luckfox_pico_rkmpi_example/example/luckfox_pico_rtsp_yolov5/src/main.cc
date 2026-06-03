@@ -29,16 +29,20 @@
 #include "stability.h"         // 稳态监控状态机
 #include "session.h"           // 会话管理器（编排 stability + diff + inventory）
 #include "inventory.h"         // 本地工作库存
+#include "cloud_uploader.h"    // 端云协同：异步上报上传器
 // hand_state.h 暂时保留备用（"主动确认/撤销"等扩展），当前业务路径不再调用
 
-#define DISP_WIDTH  720
-#define DISP_HEIGHT 480
+// 1280*720, 1920*1080 
+#define DISP_WIDTH  1280
+#define DISP_HEIGHT 720 
 
 // disp size
 int width    = DISP_WIDTH;
 int height   = DISP_HEIGHT;
 
 // model size
+// 注意：这两个值必须与 .rknn 模型的实际输入尺寸一致！
+// 640, 960
 int model_width = 640;
 int model_height = 640;	
 float scale ;
@@ -93,6 +97,7 @@ void mapCoordinates(int *x, int *y) {
 
 int main(int argc, char *argv[]) {
   system("RkLunch-stop.sh");
+  system("mkdir -p ./captures");   // 放入截图本地保存目录（无论云端通不通都存一份）
 	RK_S32 s32Ret = 0; 
 	int sX,sY,eX,eY; 
 		
@@ -189,6 +194,15 @@ int main(int argc, char *argv[]) {
 	int g_frame_id = 0;
 
 	// ============================================================
+	//  端云协同：异步上报上传器
+	//   出入库事件 ITEM_IN/OUT/MOVED → POST /events/item
+	//   放入(ITEM_IN) 带物品框内截图(crop_image)，交给后端决定要不要
+	//   跑云端 AI 读标签/重识别。上传走后台线程，不阻塞推理。
+	// ============================================================
+	fridge::CloudUploader cloud;
+	cloud.start();
+
+	// ============================================================
 	//  开关门检测（全局亮度阈值法）
 	//   冰箱关门 → 画面变黑 → 整帧平均灰度暴跌
 	//   平均灰度 < DOOR_DARK_THRESH 视为关门
@@ -269,6 +283,12 @@ int main(int argc, char *argv[]) {
 
 			//letterbox
 			cv::Mat letterboxImage = letterbox(frame);	
+			// 颜色顺序修正：rknn 模型(转换时 quant_img_RGB2BGR=False)期望 RGB，
+			// 而 frame 是 BGR。开关在 fridge_config.h::INFER_INPUT_BGR2RGB。
+			// 注意：只转送进模型的这份副本，不影响 frame 本身(推流/画框/截图仍用原 frame)。
+			if (fridge::INFER_INPUT_BGR2RGB) {
+				cv::cvtColor(letterboxImage, letterboxImage, cv::COLOR_BGR2RGB);
+			}
 			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data, model_width*model_height*3);		
 			inference_yolov5_model(&rknn_app_ctx, &od_results);
 
@@ -313,10 +333,85 @@ int main(int argc, char *argv[]) {
 			//   多数帧没有事件产生，只在稳态切换那一刻才有。
 			// ============================================================
 			fridge::SettlementResult settlement = session.update(tracks, g_frame_id);
-			(void)settlement;   // 当前还不用上报后台，先把变量留个口子
-			//  注意：库存的打印 / 事件的打印都已经在 session.cc / inventory.cc
-			//  内部完成（带 [SESSION] / [EVENT] / [Inventory] 前缀），这里
-			//  不再重复打印。
+
+			// ============================================================
+			//  Step C.5: 出入库事件上报 → POST /events/item
+			//   放入(ITEM_IN) 带物品框内截图(crop_image)，交给后端决定要不要
+			//   跑云端 AI 读标签/重识别；取出(ITEM_OUT)、整理(ITEM_MOVED) 不带图。
+			//   上报走后台线程异步发送，不阻塞推理。
+			//   注意：frame 此时已翻转过(正向)，bbox 坐标与之对齐，可直接裁剪。
+			//   bbox 统一转成《端侧返回数据格式.txt》要求的 [x, y, w, h]。
+			// ============================================================
+			auto crop_jpeg = [&](const fridge::BBox& b,
+			                     int& ox, int& oy, int& ow, int& oh,
+			                     std::vector<unsigned char>& out_jpeg) -> bool {
+				int rx1 = (int)b.x1 - 8, ry1 = (int)b.y1 - 8;
+				int rx2 = (int)b.x2 + 8, ry2 = (int)b.y2 + 8;
+				if (rx1 < 0) rx1 = 0;
+				if (ry1 < 0) ry1 = 0;
+				if (rx2 > width)  rx2 = width;
+				if (ry2 > height) ry2 = height;
+				ox = rx1; oy = ry1; ow = rx2 - rx1; oh = ry2 - ry1;
+				if (ow < 8 || oh < 8) return false;
+				cv::Rect roi(rx1, ry1, ow, oh);
+				cv::Mat crop = frame(roi).clone();   // clone：脱离主缓冲，安全交给上传线程
+				// 颜色修正：本项目里 frame 的通道顺序与编码链路"将错就错"地匹配
+				// (BGR 数据按 RGB 编码推流, 播放端又还原)。但 cv::imencode 严格
+				// 按 BGR 存 JPEG, 直接存会导致红蓝互换(可乐罐变蓝)。所以这里先把
+				// R/B 通道交换一次, 存出来的 JPEG 颜色才正常。
+				cv::cvtColor(crop, crop, cv::COLOR_BGR2RGB);
+				std::vector<int> enc_param = {cv::IMWRITE_JPEG_QUALITY, 80};
+				return cv::imencode(".jpg", crop, out_jpeg, enc_param);
+			};
+
+			long long now_ms = (long long)(TEST_COMM_GetNowUs() / 1000);
+
+			for (const auto& ev : settlement.events) {
+				fridge::UploadJob job;
+				switch (ev.kind) {
+					case fridge::EventKind::IN:    job.kind = fridge::UploadKind::ITEM_IN;    break;
+					case fridge::EventKind::OUT:   job.kind = fridge::UploadKind::ITEM_OUT;   break;
+					case fridge::EventKind::MOVED: job.kind = fridge::UploadKind::ITEM_MOVED; break;
+				}
+				job.local_track_id = ev.item_id;
+				job.category       = fridge::coarse_category(ev.cls_id);
+				job.confidence     = ev.score;
+				job.timestamp_ms   = now_ms;
+				// 只有放入(IN)带截图；取出/整理只给 bbox 不带图。
+				if (ev.kind == fridge::EventKind::IN && ev.crop_valid) {
+					if (crop_jpeg(ev.box, job.x, job.y, job.w, job.h, job.jpeg)) {
+						// 本地落盘一份，方便检查"截图到底截到没、截得对不对"。
+						// 无论云端通不通都会保存到 ./captures/ 下。
+						char fname[160];
+						snprintf(fname, sizeof(fname),
+						         "./captures/item%d_%s_%lld.jpg",
+						         ev.item_id, coco_cls_to_name(ev.cls_id),
+						         (long long)now_ms);
+						FILE* fp = fopen(fname, "wb");
+						if (fp) {
+							fwrite(job.jpeg.data(), 1, job.jpeg.size(), fp);
+							fclose(fp);
+							printf("\033[1;36m[CAPTURE]\033[0m 放入截图已保存: %s "
+							       "(%zu 字节, 区域 %dx%d)\n",
+							       fname, job.jpeg.size(), job.w, job.h);
+						} else {
+							printf("\033[1;31m[CAPTURE]\033[0m 保存失败(无法创建 %s, "
+							       "captures 目录存在吗?)\n", fname);
+						}
+					} else {
+						printf("\033[1;31m[CAPTURE]\033[0m 放入但裁图失败 "
+						       "(框太小? %.0f,%.0f~%.0f,%.0f)\n",
+						       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
+					}
+				} else {
+					// 不带图，仅给出 [x,y,w,h] 让后台知道位置
+					job.x = (int)ev.box.x1;
+					job.y = (int)ev.box.y1;
+					job.w = (int)(ev.box.x2 - ev.box.x1);
+					job.h = (int)(ev.box.y2 - ev.box.y1);
+				}
+				cloud.enqueue(job);
+			}
 
 			// ============================================================
 			//  Step D: 在画面上画 track（含 track_id），方便观察
@@ -365,7 +460,6 @@ int main(int argc, char *argv[]) {
 				cv::putText(frame, osd, cv::Point(8, 22),
 				            cv::FONT_HERSHEY_SIMPLEX, 0.6, osd_color, 2);
 			}
-
 		}
 		memcpy(data, frame.data, width * height * 3);					
 		
@@ -403,6 +497,9 @@ int main(int argc, char *argv[]) {
 	RK_MPI_MB_ReleaseMB(src_Blk);
 	// Destory Pool
 	RK_MPI_MB_DestroyPool(src_Pool);
+
+	// 停止端云协同上传线程
+	cloud.stop();
 	
 	RK_MPI_VI_DisableChn(0, 0);
 	RK_MPI_VI_DisableDev(0);

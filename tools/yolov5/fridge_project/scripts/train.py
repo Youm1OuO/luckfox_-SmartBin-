@@ -129,7 +129,7 @@ def stage_c(opt: argparse.Namespace):
         "--workers", str(opt.workers),
         "--freeze",  str(opt.freeze),                # 冻结前 N 层
         "--cos-lr",
-        "--patience", "20",                          # 微调早停
+        "--patience", "100",                         # 微调早停
     ]
     if opt.device:
         args += ["--device", opt.device]

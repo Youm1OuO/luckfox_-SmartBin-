@@ -135,6 +135,8 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
                    t->box.x1, t->box.y1, t->box.x2, t->box.y2);
             item_anchor_[iid] = t->box;   // 更新锚点到新位置
             res.happened = true;
+            res.events.push_back({EventKind::MOVED, iid, item->cls_id,
+                                  t->box, t->score, true});
         }
 
         // 记录这一帧位置（给下一帧判 settled 用）
@@ -214,6 +216,8 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
             item_last_box_[item_id] = putdown->box;
             held_done.push_back(item_id);
             res.happened = true;
+            res.events.push_back({EventKind::MOVED, item_id, hi.cls_id,
+                                  putdown->box, putdown->score, true});
             continue;
         }
 
@@ -245,6 +249,9 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
             inventory_.remove_item(item_id);
             held_done.push_back(item_id);
             res.happened = true;
+            // 取出：物品已离场，原位置无法再裁剪有效截图(crop_valid=false)
+            res.events.push_back({EventKind::OUT, item_id, hi.cls_id,
+                                  hi.original_pos, hi.score, false});
         }
     }
 
@@ -330,6 +337,11 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
                "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
                new_id, coco_cls_to_name(pn.cls_id), pn.score * 100,
                pn.box.x1, pn.box.y1, pn.box.x2, pn.box.y2);
+
+        // 放入事件（对外上报 ITEM_IN，crop 有效）
+        res.events.push_back({EventKind::IN, new_id, pn.cls_id,
+                              pn.box, pn.score, true});
+
         pending_news_.erase(tid);
         res.happened = true;
     }
@@ -354,6 +366,9 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
                    item.box.x1, item.box.y1, item.box.x2, item.box.y2);
             to_remove.push_back(item.item_id);
             res.happened = true;
+            // 超时取出：物已离场，无有效截图
+            res.events.push_back({EventKind::OUT, item.item_id, item.cls_id,
+                                  item.box, item.score, false});
         }
     }
     for (int id : to_remove) inventory_.remove_item(id);

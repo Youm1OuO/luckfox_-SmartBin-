@@ -25,8 +25,22 @@
 
 namespace fridge {
 
+// 出入库事件类型（对外上报用）
+enum class EventKind { IN, OUT, MOVED };
+
+// 一条出入库事件（由 session 产出，main 负责裁图 + 组装上报 JSON）
+struct InventoryEvent {
+    EventKind kind;
+    int       item_id;     // 端侧稳定身份(= local_track_id)
+    int       cls_id;
+    BBox      box;         // 事件相关位置：IN/MOVED=新位置，OUT=原位置
+    float     score;
+    bool      crop_valid;  // 该位置是否仍可裁剪（OUT 物已不在画面时为 false）
+};
+
 struct SettlementResult {
     bool happened = false;
+    std::vector<InventoryEvent> events;         // 本帧产生的 IN/OUT/MOVED 事件
 };
 
 // 被手拿着的物品（held）
@@ -96,8 +110,9 @@ private:
     // 平滑移动整理：物品相邻两帧位移小于这个值才算"停下来了"
     static constexpr float SMOOTH_SETTLE_PIX = 8.0f;
     // 画面尺寸（用于方案 A 手臂延伸到边缘的计算）
-    static constexpr float FRAME_W = 720.0f;
-    static constexpr float FRAME_H = 480.0f;
+    // 注意：必须与 main.cc 的 DISP_WIDTH/DISP_HEIGHT 保持一致！
+    static constexpr float FRAME_W = 1280.0f;
+    static constexpr float FRAME_H = 720.0f;
 };
 
 }  // namespace fridge

@@ -31,6 +31,90 @@ inline bool is_food(int cls_id) {
 }
 
 // =========================================================================
+//  粗粒度分类映射（对应 classes.yaml 的 coarse_grained）
+// -------------------------------------------------------------------------
+//  赛题要求至少输出粗类（蔬果 / 肉蛋生鲜 / 饮料乳品 / 包装食品）。
+//  这里把 43 个细类 ID 映射到 5 个粗类字符串，库存上报/展示用。
+//  细类 ID 必须与 model/labels_list.txt 的行号严格对应。
+// =========================================================================
+inline const char* coarse_category(int cls_id) {
+    switch (cls_id) {
+        // 蔬果类: apple..leafy_green(0..17) + mushroom..okra(34..42)
+        case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
+        case 8: case 9: case 10: case 11: case 12: case 13: case 14:
+        case 15: case 16: case 17:
+        case 34: case 35: case 36: case 37: case 38: case 39: case 40:
+        case 41: case 42:
+            return "fruit_veg";
+        // 肉蛋生鲜类: egg, meat_pack, fish_pack(18..20)
+        case 18: case 19: case 20:
+            return "meat_seafood";
+        // 饮料乳品类: milk_box..water_bottle(21..26)
+        case 21: case 22: case 23: case 24: case 25: case 26:
+            return "beverage_dairy";
+        // 包装食品类: bagged_food..fresh_box(27..32)
+        case 27: case 28: case 29: case 30: case 31: case 32:
+            return "packaged_food";
+        // 手
+        case CLASS_HAND:
+            return "interference";
+        default:
+            return "unknown";
+    }
+}
+
+// =========================================================================
+//  标签扫描 — 哪些类别"可能有包装标签值得扫"
+// -------------------------------------------------------------------------
+//  "内容不易直接辨识"的包装类食品(袋装/盒装/罐装/瓶装/保鲜盒)。
+//  当前业务路径不依赖它（所有放入物品都带截图给后端，由后端决定怎么处理），
+//  保留此函数供以后扩展使用（例如 UI 上标注"此物品可能有标签"）。
+// =========================================================================
+inline bool has_label(int cls_id) {
+    switch (cls_id) {
+        case 19: // meat_pack 包装肉
+        case 20: // fish_pack 包装鱼
+        case 21: // milk_box 盒装牛奶
+        case 24: // juice_bottle 果汁瓶
+        case 27: // bagged_food 袋装食品
+        case 28: // boxed_food 盒装食品
+        case 29: // canned_food 罐头
+        case 30: // jar_food 玻璃罐
+        case 31: // plastic_wrap 保鲜膜包裹
+        case 32: // fresh_box 保鲜盒
+            return true;
+        default:
+            return false;
+    }
+}
+
+// =========================================================================
+//  端云协同 — 云端服务默认配置（可被环境变量覆盖，见 cloud_uploader.cc）
+// -------------------------------------------------------------------------
+//  现场改 IP 不想重新编译时，直接设环境变量：
+//    export FRIDGE_CLOUD_HOST=192.168.168.1
+//    export FRIDGE_CLOUD_PORT=8000
+//  上报端点：POST /events/item（事件 ITEM_IN/OUT/MOVED）。
+//  放入(ITEM_IN) 带物品框内截图，后端拿到图后自行决定要不要跑云端 AI。
+// =========================================================================
+constexpr const char* CLOUD_HOST       = "192.168.168.1";   // 云端/网关主机
+constexpr int         CLOUD_PORT       = 8000;              // 端口
+constexpr const char* CLOUD_ITEM_PATH  = "/events/item";    // 出入库事件端点
+constexpr const char* CLOUD_DEVICE_ID  = "luckfox";         // 设备 ID
+
+// =========================================================================
+//  推理输入颜色顺序开关（已实测定论）
+// -------------------------------------------------------------------------
+//  结论：保持 BGR 直接喂模型是正确的。实测把输入转成 RGB(=true) 后，
+//  连苹果都识别不到，置信度全面下降 → 说明该 rknn 模型期望的就是 BGR 输入，
+//  原链路(frame 为 BGR 直接喂)没有红蓝反的问题。
+//    false = 保持 BGR 直接喂（正确，当前用这个）
+//    true  = 推理前 BGR→RGB（实测会让识别变差，勿用）
+//  保留此开关仅作记录，避免日后再次怀疑通道顺序。
+// =========================================================================
+constexpr bool INFER_INPUT_BGR2RGB = false;
+
+// =========================================================================
 //  ByteTrack-Lite 跟踪器参数
 // =========================================================================
 // 高分检测阈值。score >= HIGH_SCORE_THRESH 的 detection 进入第一轮匹配，

@@ -124,8 +124,9 @@ void InventoryDB::print(const char* prefix) const {
 std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms) const {
     // 手写 JSON（避免引入第三方库）。格式：
     // {"device_id":"...","timestamp":...,"event_type":"DOOR_CLOSE","inventory":[...]}
+    // 每个物品同时给出：细类(fine_class) + 粗类(category) + 标签(label)
     std::string s;
-    char buf[512];
+    char buf[768];
 
     snprintf(buf, sizeof(buf),
              "{\"device_id\":\"%s\",\"timestamp\":%lld,"
@@ -137,13 +138,17 @@ std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms) 
     for (const auto& kv : items_) {
         const auto& it = kv.second;
         // 只上报还在库存里的（VISIBLE / OCCLUDED 都算"在冰箱里"）
+        // bbox 统一为 [x, y, w, h]（与《端侧返回数据格式.txt》一致）
+        // 标签数据(品牌/保质期)由后端配对后存在后端，端侧不带。
+        float bw = it.box.x2 - it.box.x1;
+        float bh = it.box.y2 - it.box.y1;
         snprintf(buf, sizeof(buf),
-                 "%s{\"item_id\":%d,\"category\":\"%s\",\"status\":\"%s\","
-                 "\"bbox\":[%.0f,%.0f,%.0f,%.0f]}",
+                 "%s{\"local_track_id\":%d,\"category\":\"%s\",\"fine_class\":\"%s\","
+                 "\"status\":\"%s\",\"bbox\":[%.0f,%.0f,%.0f,%.0f]}",
                  first ? "" : ",",
-                 it.item_id, coco_cls_to_name(it.cls_id),
+                 it.item_id, coarse_category(it.cls_id), coco_cls_to_name(it.cls_id),
                  item_status_to_str(it.status),
-                 it.box.x1, it.box.y1, it.box.x2, it.box.y2);
+                 it.box.x1, it.box.y1, bw, bh);
         s += buf;
         first = false;
     }

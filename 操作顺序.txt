@@ -34,6 +34,9 @@ docker exec -it luckfox /bin/bash
 # 在 WSL 终端
     docker ps -a
 
+docker restart luckfox_work
+
+
 看到 luckfox_work 状态是 Exited（停止）。然后：
     docker start luckfox_work
     docker exec -it luckfox_work /bin/bash
@@ -79,6 +82,8 @@ python3 convert_fridge.py \
     （即：scp -r install/uclibc/luckfox_pico_rtsp_yolov5_demo  root@192.168.168.100:/root/）
 
 
+// 把图片保存到文件中
+    scp -r root@192.168.168.100:/root/luckfox_pico_rtsp_yolov5_demo/captures /workspace/captures
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
@@ -98,3 +103,90 @@ python3 convert_fridge.py \
 //打开摄像头
     C:\Users\Youm1OuO\Desktop\luckfox_demo\code
     MediaStream.bat
+
+
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+
+
+
+//获取训练数据图
+
+
+//在 Docker 交叉编译环境中：
+1.编译
+    cd /workspace/tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5
+    bash build_capture.sh
+
+2. 部署到板子
+    scp -r install/uclibc/capture_dataset_demo/capture_dataset  root@192.168.168.100:/root/
+
+3. 运行（板子上）
+    ./capture_dataset 2 100    # 每2秒截一张，共100张（两个数字可随意改）
+    - 图片保存在 ./dataset_raw/frame_0001.jpg ~ frame_0100.jpg
+    - 按 Ctrl+C 可随时提前退出
+    - 分多次采集不会覆盖，编号自动接续
+
+
+-----------------------------------------------------------------------------------
+
+
+制作冰箱的数据集（PC 端）
+
+
+4. 每次采完后拷回图片，放到不同编号目录
+# 第一次采完后:
+    scp -r root@192.168.168.100:/root/dataset_raw/ /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/1/
+# 第二次采完后:
+    scp -r root@192.168.168.100:/root/dataset_raw/ /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/2/
+# 第三次...
+    scp -r root@192.168.168.100:/root/dataset_raw/ /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/3/
+
+
+5. 整理成 YOLO 格式（指定多个目录一起合并）
+场景一：1/2/3 分目录存放 → 合并成 YOLO
+    python3 make_dataset.py --input dataset_raw/1/ dataset_raw/2/ dataset_raw/3/
+
+场景二：1 和 2 已经标注好了，现在多了 3 和 4
+    python3 make_dataset.py --input dataset_raw/3/ dataset_raw/4/ dataset/
+    
+- 自动收集所有图片，统一重命名，不会冲突
+- 已标注的数据也会自动保留
+后续多了新图片（如 dataset_raw/3/ 和 4/），要和之前已标注的合并
+    # 把新的原始图片 + 之前已生成好的 dataset 一起传进去
+    python3 make_dataset.py --input dataset_raw/3/ dataset_raw/4/ dataset/
+    - dataset/ 是之前已生成+标注好的 YOLO 数据集，脚本会识别它
+    - 已标注的 .txt 会自动一起合并过去，不会丢失
+    - 合并后需要重新跑一次 LabelImg 标注新增的图片
+
+
+
+6. 用 LabelImg 标注
+    pip install labelImg
+    labelImg dataset/images/train dataset/classes.txt
+    关键：打开 LabelImg 后, 点左侧 PascalVOC 按钮切换为 YOLO 格式, 否则标注格式不对
+
+
+
+
+-----------------------------------------------------------------------------------------------
+
+
+
+统计数据集各个类别的图片个数
+    fridge_project/scripts/stats_classes.py             Python 版（推荐，功能更全）
+    fridge_project/scripts/stats_classes.sh             Bash 版（无 Python 环境时备用）
+
+
+
+用法（在 WSL 里跑）
+    # 统计全部类别
+    python fridge_project/scripts/stats_classes.py
+
+    # 只统计你关心的演示类
+    python fridge_project/scripts/stats_classes.py 0 1 2 6 12 13 14 15 16 17 18 21 22 23 25
+
+    # 只看框数最多的前 10 类
+    python fridge_project/scripts/stats_classes.py --top 10

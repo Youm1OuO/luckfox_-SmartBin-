@@ -135,9 +135,11 @@ coarse_grained:
 aliases:
   # ===== COCO 通用标签(为以后扩展 COCO 用)=====
   apple: apple                          # 苹果
+  "damaged apple": apple                # 损伤苹果(仍归苹果,apples 数据集)
   banana: banana                        # 香蕉
   orange: orange                        # 橙子
   oren: orange                          # 橙子(马来语/印尼语,Fruits and Vegetables 数据集用)
+  "naranjas deteccion - v3 2023-11-26 7:35pm": orange  # 橙子(orange.yolov5pytorch 数据集的 Roboflow 版本号类名)
   podo: grape                           # 葡萄(韩语,grape.yolov5pytorch 数据集用)
   bottle: water_bottle                  # 瓶子(默认归矿泉水瓶)
   carrot: carrot                        # 胡萝卜
@@ -148,6 +150,9 @@ aliases:
   lemon: lemon                          # 柠檬
   pear: pear                            # 梨
   grape: grape                          # 葡萄
+  "green grape": grape                  # 绿葡萄(grape1/grape2 数据集)
+  grapes: grape                         # 葡萄复数(grapes-od 数据集)
+  nho: grape                            # 葡萄(越南语,grape3 数据集)
   strawberry: strawberry                # 草莓
   watermelon: watermelon                # 西瓜
   cantaloupe: cantaloupe                # 哈密瓜
@@ -162,6 +167,8 @@ aliases:
   bell_pepper: bell_pepper
   cabbage: leafy_green                  # 卷心菜 → 绿叶菜
   lettuce: leafy_green                  # 生菜 → 绿叶菜
+  "bayam merah": leafy_green            # 红苋菜(印尼语,vegetable 数据集)
+  "chinese lettuce": leafy_green        # 油麦菜/莴笋(vegetable 数据集)
 
   egg: egg                              # 鸡蛋
   "chicken egg": egg
@@ -169,6 +176,17 @@ aliases:
   milk: milk_box                        # 牛奶 → 默认盒装
   "milk carton": milk_box               # 牛奶盒
   "milk bottle": milk_bottle            # 牛奶瓶
+  # --- Milk.yolov5pytorch 的 10 个品牌名,全部归 milk_box ---
+  "id-01 pascual sin-lactosa violet": milk_box
+  "id-02-asturiana-desnatada-green": milk_box
+  "id-03-asturiana-semi-blue": milk_box
+  "id-04-bottle fresca": milk_box
+  "id-05-consum entera green": milk_box
+  "id-06-desnatada no-lactosa violet": milk_box
+  "id-07-montar blue": milk_box
+  "id-08-pascual entera blue": milk_box
+  "id-09-semi-desnatada green": milk_box
+  "id-10-smetana": milk_box
   yogurt: yogurt_cup                    # 酸奶
   juice: juice_bottle                   # 果汁
   "soft drink": soda_can                # 软饮 → 易拉罐
@@ -300,6 +318,129 @@ aliases:
   fist: hand                            # 拳
   palm: hand                            # 掌
   arm: hand                             # 手臂(也归 hand)
+
+  # ===== Sign Language.yolov5pytorch (120类手语) → 全部归 hand =====
+  # 字母
+  a: hand
+  b: hand
+  c: hand
+  d: hand
+  e: hand
+  f: hand
+  g: hand
+  h: hand
+  i: hand
+  j: hand
+  k: hand
+  l: hand
+  m: hand
+  n: hand
+  o: hand
+  p: hand
+  q: hand
+  r: hand
+  s: hand
+  t: hand
+  u: hand
+  v: hand
+  w: hand
+  x: hand
+  y: hand
+  z: hand
+  # 手语单词（全是手部动作）
+  additional: hand
+  alcohol: hand
+  allergy: hand
+  bacon: hand
+  bad: hand
+  bag: hand
+  barbecue: hand
+  bill: hand
+  biscuit: hand
+  bitter: hand
+  bread: hand
+  burger: hand
+  bye: hand
+  cake: hand
+  cash: hand
+  cheese: hand
+  chicken: hand
+  coke: hand
+  cold: hand
+  correct: hand
+  cost: hand
+  coupon: hand
+  "credit card": hand
+  cup: hand
+  dessert: hand
+  "don't want": hand
+  drink: hand
+  drive: hand
+  eat: hand
+  eggs: hand
+  enjoy: hand
+  fine: hand
+  forget: hand
+  fork: hand
+  "french fries": hand
+  fresh: hand
+  go: hand
+  hello: hand
+  help: hand
+  hot: hand
+  icecream: hand
+  ingredients: hand
+  juicy: hand
+  ketchup: hand
+  lactose: hand
+  lettuce: hand
+  lid: hand
+  like: hand
+  manager: hand
+  menu: hand
+  more: hand
+  mustard: hand
+  napkin: hand
+  need: hand
+  no: hand
+  not: hand
+  order: hand
+  pepper: hand
+  pickle: hand
+  pizza: hand
+  please: hand
+  ready: hand
+  receipt: hand
+  refill: hand
+  repeat: hand
+  safe: hand
+  salt: hand
+  sandwich: hand
+  sauce: hand
+  small: hand
+  soda: hand
+  sorry: hand
+  spicy: hand
+  spoon: hand
+  straw: hand
+  sugar: hand
+  sweet: hand
+  "thank-you": hand
+  tissues: hand
+  tomato: hand
+  total: hand
+  urgent: hand
+  vegetables: hand
+  wait: hand
+  want: hand
+  warm: hand
+  water: hand
+  what: hand
+  would: hand
+  wrong: hand
+  yes: hand
+  yoghurt: hand
+  your: hand
 
 # ---- 4. 数据增强配置提示(供训练脚本参考)-------------------------------
 # 不直接被读取,作为人类备忘:

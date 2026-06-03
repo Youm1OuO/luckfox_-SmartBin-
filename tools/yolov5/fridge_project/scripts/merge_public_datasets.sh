@@ -50,6 +50,17 @@ python fridge_project/scripts/prepare_dataset.py \
     --source-yolo "datasets/detect can.yolov5pytorch" \
     --source-yolo "datasets/glass.yolov5pytorch" \
     --source-yolo "datasets/Plastic Bottle 2.0.yolov5pytorch" \
+    --source-yolo "datasets/Sign Language.yolov5pytorch" \
+    --source-yolo "datasets/apples.yolov5pytorch" \
+    --source-yolo "datasets/Egg.yolov5pytorch" \
+    --source-yolo "datasets/egg detection final.yolov5pytorch" \
+    --source-yolo "datasets/grape1.yolov5pytorch" \
+    --source-yolo "datasets/grape2.yolov5pytorch" \
+    --source-yolo "datasets/grape3.yolov5pytorch" \
+    --source-yolo "datasets/grape4.yolov5pytorch" \
+    --source-yolo "datasets/grapes-od.yolov5pytorch" \
+    --source-yolo "datasets/orange.yolov5pytorch" \
+    --source-yolo "datasets/vegetable.yolov5pytorch" \
     --output      "$OUT_DIR" \
     --val-ratio   0.1
 

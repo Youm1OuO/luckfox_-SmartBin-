@@ -34,6 +34,8 @@ struct InventoryItem {
     int created_frame;     // 入库帧号
     int updated_frame;     // 最近更新帧号
     int last_seen_frame;   // 最近一次被 YOLO 看到的帧号（抗抖动/超时用）
+    // 注：包装标签(品牌/保质期)不在端侧存储。用户扫标签 → 端侧发 label_scan →
+    //     后端用"时间窗 + 同设备"把标签配对到对应物品，标签数据存在后端 inventory。
 };
 
 class InventoryDB {
