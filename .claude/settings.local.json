@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(codegraph init *)",
+      "Bash(codegraph index *)",
+      "Bash(codegraph sync *)",
+      "Bash(python3 *)"
+    ]
+  }
+}

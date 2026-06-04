@@ -61,9 +61,9 @@ python3 convert.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文�
 python3 convert_fridge.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
 即:
 python3 convert_fridge.py \
-    /workspace/tools/yolov5/runs/train/stage_b_640_v3_b_clean/weights/best.onnx \
+    /workspace/tools/yolov5/runs/train/hand_plus_v1/weights/best.onnx \
     rv1106 i8 \
-    /workspace/tools/yolov5/runs/train/stage_b_640_v3_b_clean/weights/best.rknn
+    /workspace/tools/yolov5/runs/train/hand_plus_v1/weights/best.rknn
 
 
 

@@ -464,6 +464,11 @@ int post_process(rknn_app_context_t *app_ctx, void *outputs,  float conf_thresho
         int id = classId[n];
         float obj_conf = objProbs[i];
 
+        // 按类别区分置信度阈值：手的阈值更低（0.10），其他类别用标准阈值（0.20）
+        // 原因：手拿着东西时置信度会下降，需要更宽松的阈值才能检测到
+        float class_thresh = (id == 33) ? 0.01f : conf_threshold;
+        if (obj_conf < class_thresh) continue;
+
         od_results->results[last_count].box.left =      (int)(clamp(x1, 0, model_in_w));
         od_results->results[last_count].box.top =       (int)(clamp(y1, 0, model_in_h));
         od_results->results[last_count].box.right =     (int)(clamp(x2, 0, model_in_w));

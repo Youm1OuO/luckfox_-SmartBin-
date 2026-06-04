@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <vector>
+#include <thread>
 
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
@@ -96,7 +97,15 @@ void mapCoordinates(int *x, int *y) {
 
 
 int main(int argc, char *argv[]) {
+  // 抑制 Rockchip MPP 硬件编码器的调试日志
+  setenv("MPP_LOG_LEVEL", "1", 1);
+  setenv("mpi_debug", "0", 1);
+  // 如果环境变量不生效，直接把 stderr 重定向到 /dev/null
+  // 我们的 printf 走 stdout 不受影响，只有 MPP 等库的 fprintf(stderr) 被静默
+  freopen("/dev/null", "w", stderr);
+
   system("RkLunch-stop.sh");
+  system("rm -rf ./captures/*");   // 清空上次的截图，避免调试时越积越多
   system("mkdir -p ./captures");   // 放入截图本地保存目录（无论云端通不通都存一份）
 	RK_S32 s32Ret = 0; 
 	int sX,sY,eX,eY; 
@@ -253,6 +262,13 @@ int main(int argc, char *argv[]) {
 					// 关 → 开
 					door_open = true;
 					printf("\n\033[1;33m[DOOR]\033[0m 开门 (亮度=%.0f)\n", mean_y);
+					// 新业务流程3：开门时从后台获取库存并初始化
+					// TODO: 替换为实际的 HTTP API 调用获取后台库存
+					// 目前传空 vector，走兜底 baseline 逻辑
+					if (!session.has_backend()) {
+						std::vector<fridge::InventoryItem> backend_items;
+						session.init_from_backend(backend_items, frame);
+					}
 				}
 			}
 
@@ -332,7 +348,8 @@ int main(int argc, char *argv[]) {
 			//   - DISTURBED→STABLE 时取 after，diff，应用到本地工作库存。
 			//   多数帧没有事件产生，只在稳态切换那一刻才有。
 			// ============================================================
-			fridge::SettlementResult settlement = session.update(tracks, g_frame_id);
+			long long now_ms = (long long)(TEST_COMM_GetNowUs() / 1000);
+			fridge::SettlementResult settlement = session.update(tracks, g_frame_id, frame, now_ms);
 
 			// ============================================================
 			//  Step C.5: 出入库事件上报 → POST /events/item
@@ -364,20 +381,65 @@ int main(int argc, char *argv[]) {
 				return cv::imencode(".jpg", crop, out_jpeg, enc_param);
 			};
 
-			long long now_ms = (long long)(TEST_COMM_GetNowUs() / 1000);
-
 			for (const auto& ev : settlement.events) {
 				fridge::UploadJob job;
 				switch (ev.kind) {
-					case fridge::EventKind::IN:    job.kind = fridge::UploadKind::ITEM_IN;    break;
-					case fridge::EventKind::OUT:   job.kind = fridge::UploadKind::ITEM_OUT;   break;
-					case fridge::EventKind::MOVED: job.kind = fridge::UploadKind::ITEM_MOVED; break;
+					case fridge::EventKind::IN:           job.kind = fridge::UploadKind::ITEM_IN;    break;
+					case fridge::EventKind::OUT:          job.kind = fridge::UploadKind::ITEM_OUT;   break;
+					case fridge::EventKind::MOVED:        job.kind = fridge::UploadKind::ITEM_MOVED; break;
+					case fridge::EventKind::IMAGE_UPDATE: job.kind = fridge::UploadKind::ITEM_IN;    break;
 				}
 				job.local_track_id = ev.item_id;
 				job.category       = fridge::coarse_category(ev.cls_id);
 				job.confidence     = ev.score;
 				job.timestamp_ms   = now_ms;
-				// 只有放入(IN)带截图；取出/整理只给 bbox 不带图。
+				// IMAGE_UPDATE：异步线程截取稳定截图（不阻塞主循环）
+				if (ev.kind == fridge::EventKind::IMAGE_UPDATE && ev.crop_valid) {
+					// 主线程：clone ROI（极快，小区域内存拷贝）
+					int rx1 = std::max(0, (int)ev.box.x1 - 8);
+					int ry1 = std::max(0, (int)ev.box.y1 - 8);
+					int rx2 = std::min(width, (int)ev.box.x2 + 8);
+					int ry2 = std::min(height, (int)ev.box.y2 + 8);
+					if (rx2 > rx1 && ry2 > ry1) {
+						cv::Mat crop_clone = frame(cv::Rect(rx1, ry1, rx2 - rx1, ry2 - ry1)).clone();
+						int item_id = ev.item_id;
+						int cls_id = ev.cls_id;
+						// detached 线程：编码 + 保存 + 入队（不阻塞主循环）
+						std::thread([crop_clone, item_id, cls_id, &cloud, now_ms, rx1, ry1, rx2, ry2]() {
+							cv::cvtColor(crop_clone, crop_clone, cv::COLOR_BGR2RGB);
+							std::vector<unsigned char> jpeg;
+							std::vector<int> param = {cv::IMWRITE_JPEG_QUALITY, 80};
+							cv::imencode(".jpg", crop_clone, jpeg, param);
+
+							char fname[160];
+							snprintf(fname, sizeof(fname),
+							         "./captures/item%d_%s_stable.jpg",
+							         item_id, coco_cls_to_name(cls_id));
+							FILE* fp = fopen(fname, "wb");
+							if (fp) {
+								fwrite(jpeg.data(), 1, jpeg.size(), fp);
+								fclose(fp);
+								printf("\033[1;36m[CAPTURE]\033[0m 稳定截图已保存: %s "
+								       "(%zu 字节)\n", fname, jpeg.size());
+							}
+
+							fridge::UploadJob job2;
+							job2.kind = fridge::UploadKind::ITEM_IN;
+							job2.local_track_id = item_id;
+							job2.category = fridge::coarse_category(cls_id);
+							job2.confidence = 0;
+							job2.x = rx1; job2.y = ry1;
+							job2.w = rx2 - rx1; job2.h = ry2 - ry1;
+							job2.timestamp_ms = now_ms;
+							job2.jpeg = std::move(jpeg);
+							cloud.enqueue(job2);
+						}).detach();
+					}
+					// 主线程不等，继续处理下一个事件
+					continue;
+				}
+
+				// 放入(IN) 带截图（同步，和之前一样）
 				if (ev.kind == fridge::EventKind::IN && ev.crop_valid) {
 					if (crop_jpeg(ev.box, job.x, job.y, job.w, job.h, job.jpeg)) {
 						// 本地落盘一份，方便检查"截图到底截到没、截得对不对"。
@@ -452,11 +514,10 @@ int main(int argc, char *argv[]) {
 					? cv::Scalar(0, 255, 0)
 					: cv::Scalar(0, 0, 255);
 				char osd[96];
-				snprintf(osd, sizeof(osd), "%s | inv=%zu(v=%zu/o=%zu)",
+				snprintf(osd, sizeof(osd), "%s | inv=%zu(taken=%zu)",
 				         fridge::system_state_to_str(ss),
 				         session.inventory().size(),
-				         session.inventory().count_visible(),
-				         session.inventory().count_occluded());
+				         session.inventory().count_by_status(fridge::ItemStatus::TAKEN));
 				cv::putText(frame, osd, cv::Point(8, 22),
 				            cv::FONT_HERSHEY_SIMPLEX, 0.6, osd_color, 2);
 			}

@@ -1,23 +1,20 @@
 // ============================================================================
 //  session.h
-//  会话管理器 — item_id 身份追踪 + 抗抖动 + 整理识别
+//  会话管理器 — 新业务流程4：时间段快照对比
 //
-//  核心目标（按优先级）：
-//    1) 关门时库存准确（抗 YOLO 抖动、抗手遮挡）
-//    2) 整理时追踪"是哪个 item 动了，从哪到哪"（item_id 身份保持）
-//    3) 过程中实时显示 IN/OUT/RELOCATE（给人看，可以不完美）
-//
-//  关键策略：
-//    - 物品消失不立刻删：有手→不删；没手但短暂消失→不删（抖动）；
-//      没手且长时间消失→才删（OUT）
-//    - 整理：物品被手盖住→记为 held，手移动放下→把同一个 item_id
-//      重新绑定到新 track + 新位置（身份不变）
+//  核心思路：
+//    - 用"时间段"（无手的连续 10 帧）作为一个快照，替代逐帧判断
+//    - 对比相邻两个时间段的快照 → 判断放入/拿走
+//    - 手在画面时用 HELD 状态机处理整理操作
+//    - 不需要【被遮挡】状态：物品只要在库存中且未被确认拿走，就算在库
 // ============================================================================
 #ifndef __FRIDGE_SESSION_H
 #define __FRIDGE_SESSION_H
 
 #include <vector>
 #include <map>
+#include <set>
+#include <opencv2/core.hpp>
 #include "tracker.h"
 #include "snapshot.h"
 #include "stability.h"
@@ -25,50 +22,75 @@
 
 namespace fridge {
 
-// 出入库事件类型（对外上报用）
-enum class EventKind { IN, OUT, MOVED };
+// 出入库事件类型
+enum class EventKind { IN, OUT, MOVED, IMAGE_UPDATE };
 
-// 一条出入库事件（由 session 产出，main 负责裁图 + 组装上报 JSON）
+// 一条出入库事件
 struct InventoryEvent {
     EventKind kind;
-    int       item_id;     // 端侧稳定身份(= local_track_id)
+    int       item_id;
     int       cls_id;
-    BBox      box;         // 事件相关位置：IN/MOVED=新位置，OUT=原位置
+    BBox      box;
     float     score;
-    bool      crop_valid;  // 该位置是否仍可裁剪（OUT 物已不在画面时为 false）
+    bool      crop_valid;
 };
 
 struct SettlementResult {
     bool happened = false;
-    std::vector<InventoryEvent> events;         // 本帧产生的 IN/OUT/MOVED 事件
+    std::vector<InventoryEvent> events;
 };
 
-// 被手拿着的物品（held）
+// 被手拿着的物品
 struct HeldItem {
-    int item_id;            // 库存里的稳定身份
+    int item_id;
     int cls_id;
-    BBox original_pos;      // 被拿起前的位置
+    BBox original_pos;
     float score;
-    int hand_track_id;      // 哪只手拿的
-    int pickup_frame;       // 被拿起的帧号
+    int hand_track_id;
+    int pickup_frame;
 };
 
-// 候选新物品（连续几帧稳定出现才确认为 IN，抗抖动）
-struct PendingNew {
+// 时间段内聚合的一个物品快照
+struct SegmentItem {
     int track_id;
     int cls_id;
-    BBox box;
-    float score;
-    int first_seen_frame;
-    int seen_count;
+    BBox box;           // 最佳位置（取 score 最高的那帧）
+    float best_score;
+    int seen_frames;    // 该时间段内被检测到的帧数
+};
+
+// 时间段快照
+struct TimeSegment {
+    int start_frame;
+    int end_frame;
+    std::map<int, SegmentItem> items;  // track_id -> 聚合结果
+    bool valid;
+};
+
+// 会话管理器状态
+enum class SessionPhase {
+    IDLE,           // 等待第一次无手段（开门初始化）
+    COLLECTING,     // 正在收集无手时间段的快照
+    HAND_ACTIVE,    // 手在画面中（HELD + 整理）
+    COMPARING,      // 手刚离开，收集新时间段后对比
 };
 
 class SessionManager {
 public:
-    explicit SessionManager(int occluded_grace_frames = 30);
+    explicit SessionManager(int segment_frames = 10);
 
+    // 旧接口（无 frame，走兜底逻辑）
     SettlementResult update(const std::vector<Track>& tracks, int frame_id);
 
+    // 新接口（带 frame + 时间戳）
+    SettlementResult update(const std::vector<Track>& tracks, int frame_id,
+                            const cv::Mat& frame, long long time_ms);
+
+    // 开门时用后台库存初始化
+    void init_from_backend(const std::vector<InventoryItem>& backend_items,
+                           const cv::Mat& frame);
+
+    bool has_backend() const { return backend_initialized_; }
     SystemState system_state() const { return current_state_; }
     bool has_baseline() const { return baseline_initialized_; }
     const InventoryDB& inventory() const { return inventory_; }
@@ -77,42 +99,59 @@ public:
 private:
     InventoryDB inventory_;
     bool baseline_initialized_;
-    int occluded_grace_frames_;     // 物品消失多少帧后才判 OUT（无手时）
     SystemState current_state_;
+    bool backend_initialized_;
+    std::vector<InventoryItem> backend_inventory_;
 
-    // 被手拿着的物品 (key = item_id)
+    // ===== 时间段快照 =====
+    SessionPhase phase_;
+    TimeSegment current_segment_;
+    TimeSegment prev_snapshot_;
+    bool has_prev_snapshot_;
+    int no_hand_streak_;
+    int segment_frames_;
+
+    // ===== HELD 状态机（手在时） =====
     std::map<int, HeldItem> held_items_;
-
-    // 候选新物品 (key = track_id)
-    std::map<int, PendingNew> pending_news_;
-
-    // ===== 平滑移动整理检测 =====
-    // item_id -> 上一次"稳定停留"的锚点位置。物品 track 没被手遮挡、
-    // 平滑移动到新位置停下时，跟锚点比对，距离够大就报整理。
-    std::map<int, BBox> item_anchor_;
-    // item_id -> 上一帧的位置（用于判断"是否停下来了"）
-    std::map<int, BBox> item_last_box_;
-
-    // ===== 方案 B：手消失惯性 =====
-    // 最后一次画面里有手的帧号。手消失后的 HAND_INERTIA_FRAMES 帧内
-    // 仍然认为"可能有手"，物品不轻易判拿走（抗手识别不稳）
     int last_hand_frame_;
 
+    // ===== 图片更新 =====
+    std::set<int> image_updated_;
+    long long current_time_ms_;
+    std::map<int, BBox> item_last_box_;  // 上一帧位置（用于图片更新的稳定检测）
+
+    // ===== 辅助函数 =====
+    static float color_diff_crop(const cv::Mat& frame, const BBox& a, const BBox& b);
+    static bool is_same_item_strict(const BBox& box_a, int cls_a,
+                                     const BBox& box_b, int cls_b,
+                                     const cv::Mat& frame);
+
+    // 将当前帧的检测结果聚合到时间段中
+    void aggregate_to_segment(const std::vector<const Track*>& foods, int frame_id);
+
+    // 检测新 HELD 物品（手盖住了哪些库存物品）
+    void detect_held_items(const std::vector<const Track*>& hands,
+                           const std::vector<const Track*>& foods,
+                           int frame_id);
+
+    // 处理 held 物品（手在时的逻辑：整理 + 取出确认）
+    SettlementResult process_held_items(const std::vector<const Track*>& hands,
+                                         const std::vector<const Track*>& foods,
+                                         bool hand_effective,
+                                         int frame_id,
+                                         const cv::Mat& frame);
+
+    // 打印库存状态
+    void print_inventory();
+
     // ===== 可调参数 =====
-    // 新物品要连续稳定出现多少帧才确认为 IN（抗抖动）
-    static constexpr int NEW_CONFIRM_FRAMES = 3;
-    // 手盖住物品的判定：物品被手覆盖比例阈值
     static constexpr float HAND_COVER_RATIO = 0.5f;
-    // 手消失惯性：手 track 消失后多少帧内仍认为"可能有手"
     static constexpr int HAND_INERTIA_FRAMES = 10;
-    // 平滑移动整理：物品离锚点超过这个像素距离才算"挪过位"
     static constexpr float SMOOTH_RELOCATE_PIX = 60.0f;
-    // 平滑移动整理：物品相邻两帧位移小于这个值才算"停下来了"
     static constexpr float SMOOTH_SETTLE_PIX = 8.0f;
-    // 画面尺寸（用于方案 A 手臂延伸到边缘的计算）
-    // 注意：必须与 main.cc 的 DISP_WIDTH/DISP_HEIGHT 保持一致！
     static constexpr float FRAME_W = 1280.0f;
     static constexpr float FRAME_H = 720.0f;
+    static constexpr int IMAGE_UPDATE_DELAY_FRAMES = 5;
 };
 
 }  // namespace fridge

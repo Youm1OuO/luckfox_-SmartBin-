@@ -186,7 +186,8 @@ int inference_yolov5_model(rknn_app_context_t *app_ctx,  object_detect_result_li
 {
     int ret;
     const float nms_threshold = NMS_THRESH;      // 默认的NMS阈值
-    const float box_conf_threshold = BOX_THRESH; // 默认的置信度阈值
+    const float box_conf_threshold = 0.01f;      // 手的单独的初始阈值, 降低能令手(score>=0.10)能通过
+    // 注意：postprocess.cc 输出阶段会按类别区分阈值（手>=0.10, 其他>=0.20）
    
     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
     if (ret < 0) {

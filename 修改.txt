@@ -53,9 +53,37 @@ mian.cc文件中
 
 
 ------------------------------------------------------------------------
+
+
+
+fridge_config.h — 新增阈值常量
+
+  - IDENTITY_CENTER_DIST = 15.0f — 身份匹配中心距离阈值
+  - IDENTITY_IOU_THRESH = 0.7f — 身份匹配 IoU 阈值
+  - IDENTITY_COLOR_DIFF = 20.0f — 身份匹配颜色差异阈值
+  - OCCLUDE_OVERLAP_THRESH = 0.3f — 遮挡检测空间重叠阈值
+  - OCCLUDED_GRACE_MULTIPLIER = 5 — 遮挡物品超时倍数
+------------------------------------------------------------------------
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
 
+
+路径：
+    tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/src/postprocess.cc
+内容：
+    float class_thresh = (id == 33) ? 0.10f : conf_threshold;
+
+
+
+路径：
+    tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/src/yolov5.cc
+内容：
+    const float box_conf_threshold = 0.10f;
+
+
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 person
 bicycle

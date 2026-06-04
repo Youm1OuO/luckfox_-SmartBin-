@@ -87,6 +87,14 @@ inline float overlap_ratio_of_smaller(const BBox& a, const BBox& b) {
     return inter / smaller;
 }
 
+// 身份匹配（严格）：中心距离近 + IoU 高 = 大概率是同一个物品
+// 用途：判断"新检测到的东西是不是库存里那个旧东西"
+inline bool is_same_position(const BBox& a, const BBox& b,
+                             float dist_thresh = 15.0f,
+                             float iou_thresh = 0.7f) {
+    return center_distance(a, b) < dist_thresh && iou(a, b) > iou_thresh;
+}
+
 }  // namespace fridge
 
 #endif  // __FRIDGE_GEOMETRY_H
