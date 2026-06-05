@@ -136,57 +136,361 @@ python3 convert_fridge.py \
 制作冰箱的数据集（PC 端）
 
 
-4. 每次采完后拷回图片，放到不同编号目录
+# ===========================================================================
+# 步骤 4: 每次采完后拷回图片，放到不同编号目录 (在 WSL 终端)
+# ===========================================================================
+
 # 第一次采完后:
     scp -r root@192.168.168.100:/root/dataset_raw/ /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/1/
+
 # 第二次采完后:
     scp -r root@192.168.168.100:/root/dataset_raw/ /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/2/
+
 # 第三次...
     scp -r root@192.168.168.100:/root/dataset_raw/ /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/3/
 
-
-5. 整理成 YOLO 格式（指定多个目录一起合并）
-场景一：1/2/3 分目录存放 → 合并成 YOLO
-    python3 make_dataset.py --input dataset_raw/1/ dataset_raw/2/ dataset_raw/3/
-
-场景二：1 和 2 已经标注好了，现在多了 3 和 4
-    python3 make_dataset.py --input dataset_raw/3/ dataset_raw/4/ dataset/
-    
-- 自动收集所有图片，统一重命名，不会冲突
-- 已标注的数据也会自动保留
-后续多了新图片（如 dataset_raw/3/ 和 4/），要和之前已标注的合并
-    # 把新的原始图片 + 之前已生成好的 dataset 一起传进去
-    python3 make_dataset.py --input dataset_raw/3/ dataset_raw/4/ dataset/
-    - dataset/ 是之前已生成+标注好的 YOLO 数据集，脚本会识别它
-    - 已标注的 .txt 会自动一起合并过去，不会丢失
-    - 合并后需要重新跑一次 LabelImg 标注新增的图片
+# 拷完后可以清理板子上的图片 (可选, 腾空间):
+# ssh root@192.168.168.100 "rm -rf /root/dataset_raw/"
 
 
+# ===========================================================================
+# 步骤 5: 整理成 YOLO 格式 (在 WSL 终端)
+# ===========================================================================
 
-6. 用 LabelImg 标注
+# 5-1. 进入脚本所在目录
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/tools/
+
+# 5-2. 运行整理脚本
+
+# ── 场景 A: 第一次整理 (只有原始截图, 还没标注过) ──
+#     把所有批次一起传入, 自动合并
+python3 make_dataset.py \
+    --input /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/1/ \
+            /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/2/ \
+            /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/3/ \
+    --output /home/muyou/Projects/workspace/luckfox_demo/dataset/ \
+    --split 0.2
+
+# ── 场景 B: 之前已标注过 (dataset/ 里有标注), 现在新增了 3 和 4 ──
+#     把新批次 + 已有的 dataset/ 一起传入
+#     已有的 .txt 标注会自动保留, 新图片会被追加
+python3 make_dataset.py \
+    --input /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/3/ \
+            /home/muyou/Projects/workspace/luckfox_demo/dataset_raw/4/ \
+            /home/muyou/Projects/workspace/luckfox_demo/dataset/ \
+    --output /home/muyou/Projects/workspace/luckfox_demo/dataset/ \
+    --split 0.2
+
+#     参数说明:
+#       --input     输入目录 (可指定多个, 用空格分隔)
+#                   支持两种目录:
+#                     1) 原始截图目录 (直接含 .jpg 的目录)
+#                     2) 已有的 YOLO 数据集 (含 images/train/ 子目录, 会自动识别)
+#       --output    输出目录 (默认 dataset/)
+#       --split     验证集比例 (默认 0.2 = 20%%, 建议 0.15~0.2)
+#       --seed      随机种子 (默认 42, 保证每次运行结果一样)
+
+# 5-3. ★重要★ 检查输出
+#     脚本运行完后, 请确认输出中显示:
+#       "已生成 dataset/classes.txt (43 个类别)"
+#     如果显示 "(0 个类别)", 说明没找到类别文件 → 参见附录故障排除
+
+# 5-4. 输出目录结构
+#     dataset/
+#     ├── images/
+#     │   ├── train/        ← 训练图片 (000001.jpg, 000002.jpg, ...)
+#     │   └── val/          ← 验证图片
+#     ├── labels/
+#     │   ├── train/        ← 标注文件 (初始为空, LabelImg 标注后填入 .txt)
+#     │   └── val/          ← 验证标注
+#     ├── classes.txt       ← 43 个类别名 (LabelImg 用)
+#     └── data.yaml         ← YOLO 训练配置
+
+
+# ===========================================================================
+# 步骤 6: 用 LabelImg 标注
+# ===========================================================================
+
+# 6-0. 安装 (如果还没装过)
     pip install labelImg
-    labelImg dataset/images/train dataset/classes.txt
-    关键：打开 LabelImg 后, 点左侧 PascalVOC 按钮切换为 YOLO 格式, 否则标注格式不对
+
+# 6-1. 启动 LabelImg, 打开训练图片目录和类别文件
+    labelImg /home/muyou/Projects/workspace/luckfox_demo/dataset/images/train \
+             /home/muyou/Projects/workspace/luckfox_demo/dataset/classes.txt
+
+# 6-2. ★★★ LabelImg 内必做设置 ★★★
+#     (a) 看左侧面板底部, 有个按钮显示 "PascalVOC"
+#         → 点击它切换为 "YOLO" 格式 (不切换则标注格式错, YOLO 训练会报错!)
+#     (b) 确认 Save Dir 指向正确:
+#         菜单 → View → Change Save Dir
+#         设为: /home/muyou/Projects/workspace/luckfox_demo/dataset/labels/train/
+#     (c) 建议打开 Auto Save mode:
+#         菜单 → View → Auto Save mode ✓
+
+# 6-3. 标注操作流程
+#     (a) 按 W 键 (或点左侧 Create RectBox) → 画框
+#     (b) 框选物体后弹出类别选择框 → 选正确的类别名
+#         (如果类别列表不对, 说明 classes.txt 没加载好, 回去检查步骤 5)
+#     (c) 框要紧贴物体边缘, 不要留太大空隙, 也不要框到背景
+#     (d) 按 D 键 → 跳到下一张图 (自动保存当前图)
+#     (e) 按 A 键 → 跳到上一张图
+
+# 6-4. 标注技巧
+#     - 每个类别至少标 100~200 张, 效果才好
+#     - 同一物体尽量覆盖: 不同角度 / 不同光照 / 有无遮挡
+#     - 一张图里可以有多个物体, 每个都画框
+#     - 看不清的、太模糊的, 可以跳过不标
+
+# 6-5. 训练集标完后, 再标验证集
+    labelImg /home/muyou/Projects/workspace/luckfox_demo/dataset/images/val \
+             /home/muyou/Projects/workspace/luckfox_demo/dataset/classes.txt
+#     同样: 切换为 YOLO 格式, Save Dir 指向 labels/val/
 
 
+================================================================================
 
 
------------------------------------------------------------------------------------------------
+# ===========================================================================
+# 步骤 7: 检查自采数据标注是否合法 (在 WSL 终端)
+# ===========================================================================
+
+cd /home/muyou/Projects/workspace/luckfox_demo
+
+python tools/yolov5/fridge_project/scripts/build_data_yaml.py \
+    --dataset-root /home/muyou/Projects/workspace/luckfox_demo/dataset/ \
+    --output       /home/muyou/Projects/workspace/luckfox_demo/dataset/data.yaml
+
+#     参数说明:
+#       --dataset-root  数据集根目录 (必须包含 images/{train,val} 和 labels/{train,val})
+#       --output        输出的 data.yaml 路径
+#
+#     脚本会:
+#       1) 扫描所有 .txt 标注, 统计每个类别的出现次数
+#       2) 检查是否有超出 0~42 范围的类别 ID (有的话会报错退出)
+#       3) 打印每个类别的 train/val 分布
+#       4) 生成 data.yaml 供 YOLOv5 训练使用
+#
+#     如果报错 "发现越界类别 ID":
+#       → 说明 labels 里有超过 42 的类别编号
+#       → 确保 dataset/classes.txt 里的类别列表和 model/labels_list.txt 一致 (43类)
+#       → 参见附录故障排除
 
 
-
-统计数据集各个类别的图片个数
-    fridge_project/scripts/stats_classes.py             Python 版（推荐，功能更全）
-    fridge_project/scripts/stats_classes.sh             Bash 版（无 Python 环境时备用）
+================================================================================
 
 
+# ===========================================================================
+# 步骤 8 (可选): 合并公开数据集 (在 WSL 终端)
+# ===========================================================================
+#     只有当你要用 26 个 Roboflow 公开数据集做 Stage B 预训练时才需要
+#     如果只用自采数据训练, 跳过这步
 
-用法（在 WSL 里跑）
-    # 统计全部类别
-    python fridge_project/scripts/stats_classes.py
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
 
-    # 只统计你关心的演示类
-    python fridge_project/scripts/stats_classes.py 0 1 2 6 12 13 14 15 16 17 18 21 22 23 25
+bash fridge_project/scripts/merge_public_datasets.sh
 
-    # 只看框数最多的前 10 类
-    python fridge_project/scripts/stats_classes.py --top 10
+#     输出: fridge_project/datasets/public_merged/
+#     yaml: fridge_project/datasets/public_merged/public_merged.yaml
+#
+#     脚本会:
+#       1) 先清空旧的 public_merged/images/ 和 labels/ (避免残留文件导致错配)
+#       2) 读取 configs/classes.yaml 的 43 个类别 + 别名映射
+#       3) 遍历 26 个公开数据源, 按别名映射统一类别 ID
+#       4) 未识别的标签会被丢弃 (日志中会报告哪些被丢了多少)
+#       5) 随机 90/10 切分 train/val, 输出 public_merged.yaml
+
+
+================================================================================
+
+
+# ===========================================================================
+# 步骤 9: 统计数据集各个类别的分布 (在 WSL 终端)
+# ===========================================================================
+
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+
+# 统计全部 43 个类别
+python fridge_project/scripts/stats_classes.py
+
+# 只看框数最多的前 10 类
+python fridge_project/scripts/stats_classes.py --top 10
+
+# 只统计指定的类别 ID (例如: 0=苹果, 1=香蕉, 6=葡萄, 33=手)
+python fridge_project/scripts/stats_classes.py 0 1 6 33
+
+#     参数说明:
+#       无参数        显示全部 43 类
+#       ID ID ...     只显示指定的类别 ID
+#       --top N       只显示框数最多的前 N 类
+
+# 诊断别名映射 (当新增了公开数据集但不确定标签是否正确映射时):
+python fridge_project/scripts/_diagnose_aliases.py
+#     输出: 每个数据集的命中/未命中标签, 并给出模糊匹配建议
+
+
+================================================================================
+
+
+# ===========================================================================
+# 步骤 10: 训练 (在 WSL 终端)
+# ===========================================================================
+
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+
+# ── 用自采数据训练 (Stage C 微调, 冻结前10层backbone) ──
+python fridge_project/scripts/train.py \
+    --data    /home/muyou/Projects/workspace/luckfox_demo/dataset/data.yaml \
+    --weights yolov5s.pt \
+    --epochs  100 \
+    --stage   C
+
+# ── 用公开数据集预训练 (Stage B) ──
+python fridge_project/scripts/train.py \
+    --data    fridge_project/datasets/public_merged/public_merged.yaml \
+    --weights yolov5s.pt \
+    --epochs  100 \
+    --stage   B
+
+#     train.py 参数说明:
+#       --data      data.yaml 的路径 (告诉 YOLO 数据在哪里、有哪些类别)
+#       --weights   预训练权重 (yolov5s.pt 会自动下载)
+#       --epochs    训练轮数 (Stage B 建议 100, Stage C 建议 50~100)
+#       --stage     B = 公开数据集预训练 (lr=0.01, mosaic=1.0)
+#                   C = 自采数据微调 (lr=0.001, 冻结前10层, focal loss)
+
+#     推荐训练顺序:
+#       1) 先跑 Stage B 预训练 → 得到 public 模型
+#       2) 再跑 Stage C 微调 → 用 public 模型的权重做 --weights
+#       3) 训练结果在: runs/train/<实验名>/weights/best.pt
+
+
+================================================================================
+
+
+# ===========================================================================
+# 步骤 11: 导出 ONNX (在 WSL 终端)
+# ===========================================================================
+
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+
+python export.py \
+    --rknpu \
+    --weight runs/train/<你的训练结果文件夹>/weights/best.pt \
+    --imgsz 320
+
+#     参数说明:
+#       --rknpu     导出 RKNN 专用的 ONNX 格式
+#       --weight    训练好的 .pt 权重文件路径
+#       --imgsz     输入尺寸 (320 或 640, 要和训练时一致)
+#
+#     产物: best.onnx 和 RK_anchors.txt (在同一目录下)
+
+
+================================================================================
+
+
+# ===========================================================================
+# 步骤 12: 生成校准集 (在 WSL 终端, 用于 RKNN INT8 量化)
+# ===========================================================================
+
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5/fridge_project/scripts
+
+python build_calib_set.py --num 200
+
+#     参数说明:
+#       --num N            校准图总张数 (默认 100, 推荐 100~200)
+#       --seed N           随机种子 (默认 42, 保证可复现)
+#       --splits S ...     用哪些 split 抽样 (默认: train valid)
+#       --include-test     也把 test 集算上 (不推荐, test 留作真正测试)
+#       --dry-run          只打印分配方案, 不真正复制文件
+#       --datasets-root    数据集根目录 (默认自动找到 tools/yolov5/datasets/)
+#
+#     脚本会:
+#       1) 自动扫描 datasets/ 下所有 Roboflow 风格目录
+#       2) 只收录有非空标注的图 (空标注对量化无价值)
+#       3) 通过 magic bytes 排除 AVIF/WebP 等"扩展名说谎"的脏图
+#       4) 按各子集图片数做分层抽样, 防止某个大集独占名额
+#       5) 清空旧的 calib_data/ 后复制新图片
+#
+#     输出:
+#       校准图片 → tools/rknn_model_zoo/examples/yolov5/calib_data/
+#       路径列表 → tools/rknn_model_zoo/examples/yolov5/python/dataset_fridge.txt
+
+
+================================================================================
+
+
+# ===========================================================================
+# 步骤 13: ONNX 转 RKNN (在 Docker 容器中)
+# ===========================================================================
+
+docker start luckfox_work
+docker exec -it luckfox_work /bin/bash
+
+cd /workspace/tools/rknn_model_zoo/examples/yolov5/python
+
+# 使用冰箱专用转换脚本 (内置校准集路径)
+python3 convert_fridge.py \
+    <onnx文件的绝对路径> \
+    rv1106 i8 \
+    <输出rknn文件的绝对路径>
+
+# 实际示例:
+python3 convert_fridge.py \
+    /workspace/tools/yolov5/runs/train/stage_c/weights/best.onnx \
+    rv1106 i8 \
+    /workspace/tools/yolov5/runs/train/stage_c/weights/best.rknn
+
+#     参数说明:
+#       第1个参数  输入的 .onnx 文件路径
+#       rv1106     芯片型号 (LuckFox Pico 用 rv1106)
+#       i8         INT8 量化 (需要校准集, 就是步骤 12 生成的)
+#       第4个参数  输出的 .rknn 文件路径
+#
+#     与 convert.py 的区别:
+#       convert_fridge.py  → 读 dataset_fridge.txt (冰箱数据集校准)
+#       convert.py         → 读默认 coco 校准集 (不适合冰箱场景)
+
+
+================================================================================
+
+
+附录: 故障排除
+
+
+Q: make_dataset.py 显示 "(0 个类别)" ?
+A: 手动复制类别文件:
+cp /home/muyou/Projects/workspace/luckfox_demo/tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/model/labels_list.txt /home/muyou/Projects/workspace/luckfox_demo/dataset/classes.txt
+
+
+Q: LabelImg 标注后 labels/ 里没有 .txt 文件 ?
+A: 检查两点:
+    1. LabelImg 左下角按钮是否已切到 "YOLO" (不是 "PascalVOC")
+    2. 菜单 → View → Change Save Dir 是否指向了 labels/train/ 或 labels/val/
+
+
+Q: build_data_yaml.py 报错 "发现越界类别 ID" ?
+A: 说明 labels 里有超过 42 的类别编号, 检查:
+    1. dataset/classes.txt 是否和 model/labels_list.txt 一致 (43类)
+    2. LabelImg 是否在 "YOLO" 模式下标注的
+    3. 如果是合并旧数据, 可能旧数据用了不同的类别表, 需要重新标注
+
+
+Q: build_capture.sh 报错 "请先设置 LUCKFOX_SDK_PATH" ?
+A: 在 Docker 内执行:
+export LUCKFOX_SDK_PATH=/workspace/luckfox-pico
+
+
+Q: 板子上报错 "ISP Init 失败" ?
+A: 确保没有其他程序在占用摄像头:
+RkLunch-stop.sh
+./capture_dataset 2 100
+
+
+Q: 想新增一个类别怎么办 ?
+A: 在 configs/classes.yaml 的 classes 列表末尾追加 (不要插中间, 否则旧标注的 ID 全部错位)
+    然后重新运行 build_data_yaml.py 和 merge_public_datasets.sh
+
+
+Q: scp 传图很慢 ?
+A: 板子上图片是 1920x1080 高清 JPEG, 单张约 300KB~1MB, 100张约 30~100MB, 耐心等
