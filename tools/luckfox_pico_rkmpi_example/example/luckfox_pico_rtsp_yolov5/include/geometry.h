@@ -95,6 +95,20 @@ inline bool is_same_position(const BBox& a, const BBox& b,
     return center_distance(a, b) < dist_thresh && iou(a, b) > iou_thresh;
 }
 
+// 面积比：两个框面积的接近程度，返回较小/较大（0~1，1=完全相等）
+// 用途：严格身份匹配中的"框的面积"条件
+inline float area_ratio(const BBox& a, const BBox& b) {
+    float aa = a.area(), ab = b.area();
+    if (aa <= 0 || ab <= 0) return 0.0f;
+    return std::min(aa, ab) / std::max(aa, ab);
+}
+
+// BBox 对角线长度
+// 用途：计算宽松匹配的距离阈值（基于物体大小）
+inline float bbox_diagonal(const BBox& box) {
+    return std::sqrt(box.w() * box.w() + box.h() * box.h());
+}
+
 }  // namespace fridge
 
 #endif  // __FRIDGE_GEOMETRY_H

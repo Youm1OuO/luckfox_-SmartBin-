@@ -1,6 +1,7 @@
 // ============================================================================
 //  inventory.cc
-//  本地工作库存实现 — v4 简化版（无【被遮挡】状态）
+//  本地工作库存实现 — 新业务流程4-1
+//    - 物品状态：VISIBLE（可见）、OCCLUDED（遮挡）、TAKEN（拿走）
 // ============================================================================
 #include "inventory.h"
 #include "fridge_config.h"
@@ -13,9 +14,9 @@ namespace fridge {
 
 const char* item_status_to_str(ItemStatus s) {
     switch (s) {
-        case ItemStatus::INVENTORY: return "在库";
-        case ItemStatus::TAKEN:     return "被拿走";
-        case ItemStatus::HELD:      return "遮挡";
+        case ItemStatus::VISIBLE:  return "可见";
+        case ItemStatus::OCCLUDED: return "遮挡";
+        case ItemStatus::TAKEN:    return "拿走";
     }
     return "?";
 }
@@ -28,7 +29,7 @@ int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
     it.cls_id = cls_id;
     it.box = box;
     it.score = score;
-    it.status = ItemStatus::INVENTORY;  // 新入库默认"在库"
+    it.status = ItemStatus::VISIBLE;  // 新入库默认"可见"
     it.created_frame = frame_id;
     it.updated_frame = frame_id;
     it.last_seen_frame = frame_id;
@@ -116,18 +117,19 @@ size_t InventoryDB::count_by_status(ItemStatus s) const {
 }
 
 void InventoryDB::print(const char* prefix) const {
-    // 先打印在库物品（非 TAKEN/HELD）
+    // 先打印可见物品
     for (const auto& kv : items_) {
         const auto& it = kv.second;
-        if (it.status == ItemStatus::TAKEN || it.status == ItemStatus::HELD) continue;
-        printf("%s  - item#%d cls=%d(%s) [在库] "
+        if (it.status == ItemStatus::TAKEN) continue;
+        const char* st = (it.status == ItemStatus::VISIBLE) ? "可见" : "遮挡";
+        printf("%s  - item#%d cls=%d(%s) [%s] "
                "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d seen@%d\n",
                prefix,
-               it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
+               it.item_id, it.cls_id, coco_cls_to_name(it.cls_id), st,
                it.box.x1, it.box.y1, it.box.x2, it.box.y2,
                it.score, it.track_id, it.last_seen_frame);
     }
-    // 再打印 TAKEN 的物品（用空行隔开）
+    // 再打印 TAKEN 的物品
     bool has_taken = false;
     for (const auto& kv : items_) {
         if (kv.second.status == ItemStatus::TAKEN) { has_taken = true; break; }
@@ -137,7 +139,7 @@ void InventoryDB::print(const char* prefix) const {
         for (const auto& kv : items_) {
             const auto& it = kv.second;
             if (it.status != ItemStatus::TAKEN) continue;
-            printf("%s  - item#%d cls=%d(%s) [被拿走] "
+            printf("%s  - item#%d cls=%d(%s) [拿走] "
                    "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d seen@%d\n",
                    prefix,
                    it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
@@ -160,8 +162,8 @@ std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms) 
     bool first = true;
     for (const auto& kv : items_) {
         const auto& it = kv.second;
-        // 排除 TAKEN/HELD，只上报真正"在库"的物品
-        if (it.status == ItemStatus::TAKEN || it.status == ItemStatus::HELD) continue;
+        // 排除 TAKEN，只上报 VISIBLE 和 OCCLUDED 的物品
+        if (it.status == ItemStatus::TAKEN) continue;
         float bw = it.box.x2 - it.box.x1;
         float bh = it.box.y2 - it.box.y1;
         snprintf(buf, sizeof(buf),

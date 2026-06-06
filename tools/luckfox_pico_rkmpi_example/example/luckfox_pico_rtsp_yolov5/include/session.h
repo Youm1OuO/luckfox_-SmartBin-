@@ -1,12 +1,14 @@
 // ============================================================================
 //  session.h
-//  会话管理器 — 新业务流程4：时间段快照对比
+//  会话管理器 — 新业务流程5：纯快照对比
 //
 //  核心思路：
-//    - 用"时间段"（无手的连续 10 帧）作为一个快照，替代逐帧判断
-//    - 对比相邻两个时间段的快照 → 判断放入/拿走
-//    - 手在画面时用 HELD 状态机处理整理操作
-//    - 不需要【被遮挡】状态：物品只要在库存中且未被确认拿走，就算在库
+//    - 时间段划分只靠快照对比（不依赖手识别）
+//    - 手识别保留用于 HELD 和整理（手快就用，手慢不影响主流程）
+//    - 对比相邻两个时间段的快照 → 判断放入/拿走/遮挡
+//    - 物品状态：VISIBLE（可见）、OCCLUDED（被其他物品遮挡）、TAKEN（被拿走）
+//    - 身份匹配分两种：严格（5条件，状态变更用）和宽松（2条件，N帧计数用）
+//    - 一个时间段至少维持 MIN_SEGMENT_SNAPSHOTS 个微快照（防止过度分割）
 // ============================================================================
 #ifndef __FRIDGE_SESSION_H
 #define __FRIDGE_SESSION_H
@@ -69,10 +71,9 @@ struct TimeSegment {
 
 // 会话管理器状态
 enum class SessionPhase {
-    IDLE,           // 等待第一次无手段（开门初始化）
-    COLLECTING,     // 正在收集无手时间段的快照
-    HAND_ACTIVE,    // 手在画面中（HELD + 整理）
-    COMPARING,      // 手刚离开，收集新时间段后对比
+    IDLE,           // 开机初始化（收集初始快照）
+    COLLECTING,     // 正在收集时间段快照（手在时也继续收集，HELD在内部处理）
+    COMPARING,      // 时间段结束，做快照对比
 };
 
 class SessionManager {
@@ -110,6 +111,7 @@ private:
     bool has_prev_snapshot_;
     int no_hand_streak_;
     int segment_frames_;
+    int snapshot_count_;    // 当前时间段内已收集的微快照数（用于最小持续时间判断）
 
     // ===== HELD 状态机（手在时） =====
     std::map<int, HeldItem> held_items_;
@@ -120,11 +122,24 @@ private:
     long long current_time_ms_;
     std::map<int, BBox> item_last_box_;  // 上一帧位置（用于图片更新的稳定检测）
 
+    // ===== N帧微快照（方法B用） =====
+    int n_frame_counter_;                   // 当前N帧内已处理的帧数
+    std::vector<SegmentItem> n_frame_items_;// 当前N帧内的候选物品（用宽松匹配聚合）
+    TimeSegment last_n_snapshot_;            // 上一个N帧微快照
+    bool has_last_n_snapshot_;
+
     // ===== 辅助函数 =====
     static float color_diff_crop(const cv::Mat& frame, const BBox& a, const BBox& b);
     static bool is_same_item_strict(const BBox& box_a, int cls_a,
                                      const BBox& box_b, int cls_b,
                                      const cv::Mat& frame);
+
+    // 宽松匹配：只需类别相同 + 位置大致相同（基于bbox对角线）
+    static bool is_same_item_loose(const BBox& box_a, int cls_a,
+                                    const BBox& box_b, int cls_b);
+
+    // 计算宽松匹配的距离阈值（bbox对角线 * IDENTITY_LOOSE_DIAG_RATIO）
+    static float loose_dist_thresh(const BBox& box);
 
     // 将当前帧的检测结果聚合到时间段中
     void aggregate_to_segment(const std::vector<const Track*>& foods, int frame_id);
@@ -140,6 +155,18 @@ private:
                                          bool hand_effective,
                                          int frame_id,
                                          const cv::Mat& frame);
+
+    // 三步处理：时间段快照对比（先减后加 + 例行检查）
+    SettlementResult process_segment_comparison(
+        const TimeSegment& new_seg,
+        int frame_id, const cv::Mat& frame);
+
+    // 方法B：检查N帧微快照是否触发时间段边界
+    bool check_method_b_boundary(const std::vector<const Track*>& foods,
+                                  int frame_id);
+
+    // 过滤时间段快照中低于N帧阈值的物品
+    void filter_segment_by_threshold(TimeSegment& seg);
 
     // 打印库存状态
     void print_inventory();

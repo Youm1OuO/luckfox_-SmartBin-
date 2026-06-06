@@ -1,11 +1,12 @@
 // ============================================================================
 //  inventory.h
-//  本地工作库存 — 以 item_id 为稳定身份（v4 简化版）
+//  本地工作库存 — 以 item_id 为稳定身份（新业务流程4-1）
 //
 //  设计要点:
-//    - v4 不需要【被遮挡】状态：物品只要在库存中且未被确认拿走，就算"在库"
-//    - 物品状态只有：INVENTORY（在库，含新放入和遮挡的）、TAKEN（被拿走，临时）、HELD（被手遮挡，临时）
-//    - 关门时上传库存：所有物品（排除 TAKEN/HELD）
+//    - 物品状态：VISIBLE（可见，在冰箱中）、OCCLUDED（被其他物品遮挡）、TAKEN（被拿走，临时）
+//    - VISIBLE 和 OCCLUDED 都被认为是在冰箱库存中
+//    - 手遮挡通过 HELD 机制处理（held_items_），不改变物品的 VISIBLE/OCCLUDED 状态
+//    - 关门时上传库存：所有物品（排除 TAKEN）
 // ============================================================================
 #ifndef __FRIDGE_INVENTORY_H
 #define __FRIDGE_INVENTORY_H
@@ -19,9 +20,9 @@
 namespace fridge {
 
 enum class ItemStatus {
-    INVENTORY,  // 在库中（正常状态，含新放入的和遮挡的）
-    TAKEN,      // 被拿走（临时保留，关门时不上传后台）
-    HELD,       // 被手遮挡/拿着（临时状态，手离开后恢复为 INVENTORY）
+    VISIBLE,    // 【可见】— 物品在冰箱中，可见（含新放入的、遮挡恢复的）
+    OCCLUDED,   // 【遮挡】— 被其他物品物理遮挡（在库但不可见）
+    TAKEN,      // 【拿走】— 确认被取出（临时保留，关门时不上传后台）
 };
 
 struct InventoryItem {
@@ -76,7 +77,7 @@ public:
     // 调试打印
     void print(const char* prefix = "") const;
 
-    // 关门时上传后台用：把库存导出成 JSON 字符串（排除 TAKEN/HELD）
+    // 关门时上传后台用：把库存导出成 JSON 字符串（排除 TAKEN）
     std::string to_json(const char* device_id, long long timestamp_ms) const;
 
 private:
