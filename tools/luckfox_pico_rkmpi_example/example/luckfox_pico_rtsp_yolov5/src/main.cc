@@ -43,9 +43,9 @@ int height   = DISP_HEIGHT;
 
 // model size
 // 注意：这两个值必须与 .rknn 模型的实际输入尺寸一致！
-// 640, 960
-int model_width = 640;
-int model_height = 640;	
+// 640, 704, 960
+int model_width = 704;
+int model_height = 704;	
 float scale ;
 int leftPadding ;
 int topPadding  ;
