@@ -1,11 +1,12 @@
 // ============================================================================
 //  inventory.h
-//  本地工作库存 — 以 item_id 为稳定身份（v4 简化版）
+//  本地工作库存 — 以 item_id 为稳定身份（v5：逐帧对比）
 //
 //  设计要点:
-//    - v4 不需要【被遮挡】状态：物品只要在库存中且未被确认拿走，就算"在库"
-//    - 物品状态只有：INVENTORY（在库，含新放入和遮挡的）、TAKEN（被拿走，临时）、HELD（被手遮挡，临时）
-//    - 关门时上传库存：所有物品（排除 TAKEN/HELD）
+//    - 物品状态：INVENTORY（在库，YOLO 可见）、OCCLUDED（被遮挡，YOLO 看不到，等待恢复）
+//               TAKEN（被拿走，临时）、HELD（被手拿着，临时）
+//    - OCCLUDED 不直接转为 TAKEN，需等 YOLO 重新检测到后恢复为 INVENTORY
+//    - 关门时上传库存：所有物品（排除 TAKEN/HELD，OCCLUDED 算在库）
 // ============================================================================
 #ifndef __FRIDGE_INVENTORY_H
 #define __FRIDGE_INVENTORY_H
@@ -19,9 +20,10 @@
 namespace fridge {
 
 enum class ItemStatus {
-    INVENTORY,  // 在库中（正常状态，含新放入的和遮挡的）
+    INVENTORY,  // 在库（YOLO 可见，正常状态）
+    OCCLUDED,   // 被遮挡（YOLO 看不到，等待重新检测后恢复为 INVENTORY）
     TAKEN,      // 被拿走（临时保留，关门时不上传后台）
-    HELD,       // 被手遮挡/拿着（临时状态，手离开后恢复为 INVENTORY）
+    HELD,       // 被手拿着（临时状态，手离开后处理：原位恢复/远处 MOVED）
 };
 
 struct InventoryItem {
@@ -70,6 +72,7 @@ public:
     void remove_item(int item_id);
 
     const std::map<int, InventoryItem>& items() const { return items_; }
+    std::map<int, InventoryItem>& items() { return items_; }
     size_t size() const { return items_.size(); }
     size_t count_by_status(ItemStatus s) const;
 

@@ -1,0 +1,5 @@
+新开一个终端:
+ssh @ssh xiaoyu@172.22.0.138       password:xiaoyu123
+cd ~/python_files/temp
+scp -r luckfox_demo/ xiaoyu@172.22.0.138:~/python_files/temp
+conda activate env1

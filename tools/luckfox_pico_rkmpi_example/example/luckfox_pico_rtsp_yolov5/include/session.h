@@ -1,12 +1,12 @@
 // ============================================================================
 //  session.h
-//  会话管理器 — 新业务流程4：时间段快照对比
+//  会话管理器 — 新业务流程5：逐帧对比库存（track_id 优先匹配）
 //
 //  核心思路：
-//    - 用"时间段"（无手的连续 10 帧）作为一个快照，替代逐帧判断
-//    - 对比相邻两个时间段的快照 → 判断放入/拿走
-//    - 手在画面时用 HELD 状态机处理整理操作
-//    - 不需要【被遮挡】状态：物品只要在库存中且未被确认拿走，就算在库
+//    - ByteTrack 的 track_id 是最可靠的匹配信号（同一 track_id = 同一物体）
+//    - track_id 匹配不到时，用放宽的几何匹配兜底
+//    - 先减后加：先处理消失的物品，再处理新出现的物品
+//    - 整理检测：HELD（手拿着）+ 平滑移动（不依赖手）两种方式并行
 // ============================================================================
 #ifndef __FRIDGE_SESSION_H
 #define __FRIDGE_SESSION_H
@@ -16,16 +16,13 @@
 #include <set>
 #include <opencv2/core.hpp>
 #include "tracker.h"
-#include "snapshot.h"
 #include "stability.h"
 #include "inventory.h"
 
 namespace fridge {
 
-// 出入库事件类型
 enum class EventKind { IN, OUT, MOVED, IMAGE_UPDATE };
 
-// 一条出入库事件
 struct InventoryEvent {
     EventKind kind;
     int       item_id;
@@ -40,7 +37,6 @@ struct SettlementResult {
     std::vector<InventoryEvent> events;
 };
 
-// 被手拿着的物品
 struct HeldItem {
     int item_id;
     int cls_id;
@@ -50,43 +46,20 @@ struct HeldItem {
     int pickup_frame;
 };
 
-// 时间段内聚合的一个物品快照
-struct SegmentItem {
-    int track_id;
-    int cls_id;
-    BBox box;           // 最佳位置（取 score 最高的那帧）
-    float best_score;
-    int seen_frames;    // 该时间段内被检测到的帧数
-};
-
-// 时间段快照
-struct TimeSegment {
-    int start_frame;
-    int end_frame;
-    std::map<int, SegmentItem> items;  // track_id -> 聚合结果
-    bool valid;
-};
-
-// 会话管理器状态
 enum class SessionPhase {
-    IDLE,           // 等待第一次无手段（开门初始化）
-    COLLECTING,     // 正在收集无手时间段的快照
-    HAND_ACTIVE,    // 手在画面中（HELD + 整理）
-    COMPARING,      // 手刚离开，收集新时间段后对比
+    IDLE,           // 开机初始化（等待手首次出现）
+    ACTIVE,         // 正常运行（无手，逐帧对比库存）
+    HAND_ACTIVE,    // 手在画面中
 };
 
 class SessionManager {
 public:
-    explicit SessionManager(int segment_frames = 10);
+    explicit SessionManager(int stable_frames = 10);
 
-    // 旧接口（无 frame，走兜底逻辑）
     SettlementResult update(const std::vector<Track>& tracks, int frame_id);
-
-    // 新接口（带 frame + 时间戳）
     SettlementResult update(const std::vector<Track>& tracks, int frame_id,
                             const cv::Mat& frame, long long time_ms);
 
-    // 开门时用后台库存初始化
     void init_from_backend(const std::vector<InventoryItem>& backend_items,
                            const cv::Mat& frame);
 
@@ -103,22 +76,24 @@ private:
     bool backend_initialized_;
     std::vector<InventoryItem> backend_inventory_;
 
-    // ===== 时间段快照 =====
+    // ===== 阶段管理 =====
     SessionPhase phase_;
-    TimeSegment current_segment_;
-    TimeSegment prev_snapshot_;
-    bool has_prev_snapshot_;
-    int no_hand_streak_;
-    int segment_frames_;
+    int stable_streak_;
+    int stable_frames_;
+    int current_frame_id_;
 
-    // ===== HELD 状态机（手在时） =====
+    // ===== HELD 状态机 =====
     std::map<int, HeldItem> held_items_;
     int last_hand_frame_;
+    static constexpr int HAND_CONFIRM_LEAVE = 3;
+
+    // ===== 平滑移动整理检测 =====
+    std::map<int, BBox> item_anchor_;
+    std::map<int, BBox> item_last_box_;
 
     // ===== 图片更新 =====
     std::set<int> image_updated_;
     long long current_time_ms_;
-    std::map<int, BBox> item_last_box_;  // 上一帧位置（用于图片更新的稳定检测）
 
     // ===== 辅助函数 =====
     static float color_diff_crop(const cv::Mat& frame, const BBox& a, const BBox& b);
@@ -126,22 +101,33 @@ private:
                                      const BBox& box_b, int cls_b,
                                      const cv::Mat& frame);
 
-    // 将当前帧的检测结果聚合到时间段中
-    void aggregate_to_segment(const std::vector<const Track*>& foods, int frame_id);
+    // 核心：逐帧对比库存（先减后加 + 恢复检查）
+    SettlementResult compare_frame_to_inventory(const std::vector<const Track*>& foods,
+                                                 const std::vector<const Track*>& hands,
+                                                 const cv::Mat& frame,
+                                                 int frame_id);
 
-    // 检测新 HELD 物品（手盖住了哪些库存物品）
+    // 遮挡恢复检查：OCCLUDED 物品被 YOLO 重新检测到 → 恢复 INVENTORY
+    void occlusion_check(const std::vector<const Track*>& foods,
+                          const cv::Mat& frame,
+                          int frame_id);
+
+    // HELD 机制
     void detect_held_items(const std::vector<const Track*>& hands,
                            const std::vector<const Track*>& foods,
                            int frame_id);
-
-    // 处理 held 物品（手在时的逻辑：整理 + 取出确认）
     SettlementResult process_held_items(const std::vector<const Track*>& hands,
                                          const std::vector<const Track*>& foods,
                                          bool hand_effective,
                                          int frame_id,
                                          const cv::Mat& frame);
 
-    // 打印库存状态
+    // 平滑移动整理检测
+    void detect_smooth_relocate(const std::vector<const Track*>& foods,
+                                int frame_id,
+                                const cv::Mat& frame,
+                                SettlementResult& res);
+
     void print_inventory();
 
     // ===== 可调参数 =====
@@ -152,6 +138,11 @@ private:
     static constexpr float FRAME_W = 1280.0f;
     static constexpr float FRAME_H = 720.0f;
     static constexpr int IMAGE_UPDATE_DELAY_FRAMES = 5;
+    // TAKEN 恢复窗口：物品被标为 TAKEN 后，在多少帧内仍允许通过宽松匹配恢复
+    static constexpr int TAKEN_RECOVERY_FRAMES = 5;
+    // 帧跳过：每隔几帧做一次对比（1=每帧，3=每3帧）
+    static constexpr int COMPARE_INTERVAL = 3;
+    int compare_counter_ = 0;
 };
 
 }  // namespace fridge

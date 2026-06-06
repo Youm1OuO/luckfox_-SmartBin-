@@ -1,9 +1,11 @@
 // ============================================================================
 //  session.cc
-//  会话管理器 — 新业务流程4：时间段快照对比
-//    - 不需要【被遮挡】状态：物品只要在库存中且未被确认拿走，就算在库
-//    - 先减后加：先处理消失的物品（拿走），再处理新增的物品（放入）
-//    - HELD 优先：手在时先处理 HELD，手离开后再做快照对比
+//  会话管理器 — 新业务流程5：逐帧对比库存（track_id 优先匹配）
+//
+//  匹配策略：
+//    1. track_id 匹配（ByteTrack 保证同一物体同一 id）→ 最可靠
+//    2. 宽松几何匹配（类别 + 中心距离 < 30px）→ track_id 变了时兜底
+//    3. 严格匹配（5 条件全满足）→ 仅用于 TAKEN 恢复等高置信场景
 // ============================================================================
 #include "session.h"
 #include "fridge_config.h"
@@ -17,19 +19,16 @@
 
 namespace fridge {
 
-SessionManager::SessionManager(int segment_frames)
+SessionManager::SessionManager(int stable_frames)
     : baseline_initialized_(false),
       current_state_(SystemState::STABLE),
       backend_initialized_(false),
       phase_(SessionPhase::IDLE),
-      has_prev_snapshot_(false),
-      no_hand_streak_(0),
-      segment_frames_(segment_frames),
+      stable_streak_(0),
+      stable_frames_(stable_frames),
+      current_frame_id_(0),
       last_hand_frame_(-1000),
-      current_time_ms_(0) {
-    current_segment_ = {0, 0, {}, false};
-    prev_snapshot_ = {0, 0, {}, false};
-}
+      current_time_ms_(0) {}
 
 void SessionManager::init_from_backend(const std::vector<InventoryItem>& backend_items,
                                         const cv::Mat& frame) {
@@ -82,7 +81,6 @@ bool SessionManager::is_same_item_strict(const BBox& box_a, int cls_a,
     if (cls_a != cls_b) return false;
     if (center_distance(box_a, box_b) >= IDENTITY_CENTER_DIST) return false;
     if (iou(box_a, box_b) < IDENTITY_IOU_THRESH) return false;
-    // 面积比较（面积比在 0.8~1.2 之间）
     float area_a = box_a.area(), area_b = box_b.area();
     if (area_a > 0 && area_b > 0) {
         float ratio = area_a / area_b;
@@ -92,34 +90,362 @@ bool SessionManager::is_same_item_strict(const BBox& box_a, int cls_a,
     return true;
 }
 
+// 宽松几何匹配：类别 + 中心距离（用于移动物品的兜底匹配）
+static bool is_same_item_relaxed(const BBox& box_a, int cls_a,
+                                  const BBox& box_b, int cls_b) {
+    if (cls_a != cls_b) return false;
+    return center_distance(box_a, box_b) < 30.0f;
+}
+
 
 // ============================================================================
-//  时间段聚合
+//  核心：逐帧对比库存（先减后加 + 恢复检查）
+//  匹配策略：track_id 优先 → 宽松几何 → 严格匹配
 // ============================================================================
-void SessionManager::aggregate_to_segment(const std::vector<const Track*>& foods, int frame_id) {
-    if (!current_segment_.valid) {
-        current_segment_.start_frame = frame_id;
-        current_segment_.valid = true;
-    }
-    current_segment_.end_frame = frame_id;
+SettlementResult SessionManager::compare_frame_to_inventory(
+        const std::vector<const Track*>& foods,
+        const std::vector<const Track*>& hands,
+        const cv::Mat& frame,
+        int frame_id) {
+    SettlementResult res;
+    bool has_frame = !frame.empty();
 
-    for (const Track* t : foods) {
-        auto it = current_segment_.items.find(t->track_id);
-        if (it == current_segment_.items.end()) {
-            SegmentItem si;
-            si.track_id = t->track_id;
-            si.cls_id = t->cls_id;
-            si.box = t->box;
-            si.best_score = t->score;
-            si.seen_frames = 1;
-            current_segment_.items[t->track_id] = si;
-        } else {
-            it->second.seen_frames++;
-            if (t->score > it->second.best_score) {
-                it->second.best_score = t->score;
-                it->second.box = t->box;
+    // 建立 track_id → Track* 的查找表
+    std::map<int, const Track*> track_map;
+    for (const Track* t : foods) track_map[t->track_id] = t;
+
+    // 记录已被匹配的 track_id（防止同一 track 被匹配多次）
+    std::set<int> consumed_tids;
+
+    // ==== 第一步：减少（消失的物品 → 拿走 或 遮挡）====
+    for (auto& kv : inventory_.items()) {
+        InventoryItem& item = kv.second;
+        if (item.status == ItemStatus::TAKEN || item.status == ItemStatus::HELD) continue;
+        if (item.status == ItemStatus::OCCLUDED) continue;
+
+        // 优先：track_id 匹配
+        auto it = track_map.find(item.track_id);
+        if (it != track_map.end() && !consumed_tids.count(item.track_id)) {
+            // track 还在 → 物品还在，更新位置
+            const Track* t = it->second;
+            item.last_bbox = item.box;
+            item.box = t->box;
+            item.score = t->score;
+            item.last_seen_frame = frame_id;
+            item.stable_frames++;
+            consumed_tids.insert(item.track_id);
+            continue;
+        }
+
+        // track_id 匹配不上 → 尝试宽松几何匹配（track_id 可能变了）
+        bool found = false;
+        for (const Track* t : foods) {
+            if (consumed_tids.count(t->track_id)) continue;
+            if (is_same_item_relaxed(t->box, t->cls_id, item.box, item.cls_id)) {
+                // 匹配上 → track_id 变了，更新绑定
+                item.last_bbox = item.box;
+                item.track_id = t->track_id;
+                item.box = t->box;
+                item.score = t->score;
+                item.last_seen_frame = frame_id;
+                item.stable_frames++;
+                consumed_tids.insert(t->track_id);
+                found = true;
+                break;
             }
         }
+        if (found) continue;
+
+        // 消失了 → 检查是否被其他物品遮挡
+        bool covered = false;
+        for (const Track* t : foods) {
+            float cov = 0.0f;
+            float a_area = item.box.area();
+            if (a_area > 0) {
+                float ix1 = std::max(item.box.x1, t->box.x1);
+                float iy1 = std::max(item.box.y1, t->box.y1);
+                float ix2 = std::min(item.box.x2, t->box.x2);
+                float iy2 = std::min(item.box.y2, t->box.y2);
+                float iw = std::max(0.0f, ix2 - ix1);
+                float ih = std::max(0.0f, iy2 - iy1);
+                cov = (iw * ih) / a_area;
+            }
+            float dist = center_distance(item.box, t->box);
+            if (cov > OCCLUDE_OVERLAP_THRESH || dist < OCCLUDE_CENTER_DIST_THRESH) {
+                covered = true;
+                printf("\033[1;33m[DBG]\033[0m item#%d (%s) 被遮挡 "
+                       "(cov=%.2f, dist=%.0f) → OCCLUDED\n",
+                       kv.first, coco_cls_to_name(item.cls_id), cov, dist);
+                break;
+            }
+        }
+        if (covered) {
+            inventory_.set_status(kv.first, ItemStatus::OCCLUDED);
+        } else if (!hands.empty()) {
+            // 手在画面中 → 检查是否被手拿着
+            // 先用严格检查（手框覆盖物品），再用宽松检查（手在物品附近）
+            bool hand_near = false;
+            for (const Track* h : hands) {
+                if (hand_covers(h, item.box, FRAME_W, FRAME_H)) {
+                    hand_near = true;
+                    break;
+                }
+            }
+            // 宽松检查：手中心离物品中心 < 150px（手移动过程中位置会变）
+            if (!hand_near) {
+                for (const Track* h : hands) {
+                    if (center_distance(h->box, item.box) < 150.0f) {
+                        hand_near = true;
+                        break;
+                    }
+                }
+            }
+            if (hand_near) {
+                HeldItem hi;
+                hi.item_id = kv.first;
+                hi.cls_id = item.cls_id;
+                hi.original_pos = item.box;
+                hi.score = item.score;
+                hi.hand_track_id = hands[0]->track_id;
+                hi.pickup_frame = frame_id;
+                held_items_[kv.first] = hi;
+                inventory_.set_status(kv.first, ItemStatus::HELD);
+                printf("\033[1;33m[DBG]\033[0m item#%d (%s) 消失但被手遮挡 → HELD\n",
+                       kv.first, coco_cls_to_name(item.cls_id));
+            } else {
+                printf("\n\033[1;32m[EVENT]\033[0m 取出: item#%d %s (置信度 %.0f%%) "
+                       "原位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+                       kv.first, coco_cls_to_name(item.cls_id),
+                       item.score * 100,
+                       item.box.x1, item.box.y1, item.box.x2, item.box.y2);
+                inventory_.set_status(kv.first, ItemStatus::TAKEN);
+                item.updated_frame = frame_id;  // 记录 TAKEN 时间
+                res.events.push_back({EventKind::OUT, kv.first,
+                                     item.cls_id, item.box, item.score, false});
+                res.happened = true;
+            }
+        } else {
+            printf("\n\033[1;32m[EVENT]\033[0m 取出: item#%d %s (置信度 %.0f%%) "
+                   "原位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+                   kv.first, coco_cls_to_name(item.cls_id),
+                   item.score * 100,
+                   item.box.x1, item.box.y1, item.box.x2, item.box.y2);
+            inventory_.set_status(kv.first, ItemStatus::TAKEN);
+            item.updated_frame = frame_id;
+            res.events.push_back({EventKind::OUT, kv.first,
+                                 item.cls_id, item.box, item.score, false});
+            res.happened = true;
+        }
+    }
+
+    // ==== 第二步：增加（新出现的物品）====
+    for (const Track* t : foods) {
+        if (consumed_tids.count(t->track_id)) continue;
+
+        // 优先：track_id 匹配库存
+        InventoryItem* by_track = inventory_.find_by_track(t->track_id);
+        if (by_track && by_track->status != ItemStatus::TAKEN
+                     && by_track->status != ItemStatus::HELD) {
+            by_track->last_bbox = by_track->box;
+            by_track->box = t->box;
+            by_track->score = t->score;
+            by_track->last_seen_frame = frame_id;
+            by_track->stable_frames++;
+            consumed_tids.insert(t->track_id);
+            continue;
+        }
+
+        // 尝试匹配 TAKEN 物品（严格匹配 → 高置信恢复）
+        bool matched_taken = false;
+        for (auto& kv : inventory_.items()) {
+            if (kv.second.status != ItemStatus::TAKEN) continue;
+            // 恢复窗口内才尝试恢复
+            if (frame_id - kv.second.updated_frame > TAKEN_RECOVERY_FRAMES) continue;
+            if (has_frame) {
+                if (!is_same_item_strict(t->box, t->cls_id,
+                                         kv.second.last_bbox, kv.second.cls_id, frame))
+                    continue;
+            } else {
+                if (!is_same_position(t->box, kv.second.last_bbox,
+                                      IDENTITY_CENTER_DIST, IDENTITY_IOU_THRESH))
+                    continue;
+            }
+            // 匹配上 → 误判恢复
+            inventory_.relocate_item(kv.first, t->track_id, t->box, t->score, frame_id);
+            inventory_.set_status(kv.first, ItemStatus::INVENTORY);
+            consumed_tids.insert(t->track_id);
+            printf("\033[1;33m[DBG]\033[0m item#%d TAKEN 恢复 → 在库\n", kv.first);
+            matched_taken = true;
+            res.happened = true;
+            break;
+        }
+        if (matched_taken) continue;
+
+        // 尝试匹配 TAKEN 物品（宽松匹配 → 移动物品恢复）
+        for (auto& kv : inventory_.items()) {
+            if (kv.second.status != ItemStatus::TAKEN) continue;
+            if (frame_id - kv.second.updated_frame > TAKEN_RECOVERY_FRAMES) continue;
+            if (is_same_item_relaxed(t->box, t->cls_id, kv.second.last_bbox, kv.second.cls_id)) {
+                inventory_.relocate_item(kv.first, t->track_id, t->box, t->score, frame_id);
+                inventory_.set_status(kv.first, ItemStatus::INVENTORY);
+                consumed_tids.insert(t->track_id);
+                printf("\033[1;33m[DBG]\033[0m item#%d TAKEN 恢复(宽松) → 在库 "
+                       "(移动物品恢复)\n", kv.first);
+                matched_taken = true;
+                res.happened = true;
+                break;
+            }
+        }
+        if (matched_taken) continue;
+
+        // 尝试匹配现有库存（宽松匹配 → 防止重复添加）
+        bool matched_inv = false;
+        for (auto& kv : inventory_.items()) {
+            if (kv.second.status == ItemStatus::TAKEN || kv.second.status == ItemStatus::HELD) continue;
+            const BBox& ref_box = (kv.second.status == ItemStatus::OCCLUDED)
+                                   ? kv.second.last_bbox : kv.second.box;
+            if (!is_same_item_relaxed(t->box, t->cls_id, ref_box, kv.second.cls_id))
+                continue;
+            inventory_.relocate_item(kv.first, t->track_id, t->box, t->score, frame_id);
+            inventory_.set_status(kv.first, ItemStatus::INVENTORY);
+            consumed_tids.insert(t->track_id);
+            matched_inv = true;
+            break;
+        }
+        if (matched_inv) continue;
+
+        // 都没匹配上 → 新物品，入库
+        int new_id = inventory_.add_item(t->track_id, t->cls_id, t->box, t->score,
+                                          frame_id, current_time_ms_);
+        item_anchor_[new_id] = t->box;
+        item_last_box_[new_id] = t->box;
+        consumed_tids.insert(t->track_id);
+        printf("\n\033[1;32m[EVENT]\033[0m 放入: item#%d %s (置信度 %.0f%%) "
+               "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+               new_id, coco_cls_to_name(t->cls_id), t->score * 100,
+               t->box.x1, t->box.y1, t->box.x2, t->box.y2);
+        res.events.push_back({EventKind::IN, new_id, t->cls_id,
+                             t->box, t->score, true});
+        res.happened = true;
+    }
+
+    // ==== 第三步：TAKEN 恢复检查（对当前帧所有物品再扫一遍）====
+    for (const Track* t : foods) {
+        for (auto& kv : inventory_.items()) {
+            if (kv.second.status != ItemStatus::TAKEN) continue;
+            if (frame_id - kv.second.updated_frame > TAKEN_RECOVERY_FRAMES) continue;
+            if (is_same_item_relaxed(t->box, t->cls_id, kv.second.last_bbox, kv.second.cls_id)) {
+                inventory_.relocate_item(kv.first, t->track_id, t->box, t->score, frame_id);
+                inventory_.set_status(kv.first, ItemStatus::INVENTORY);
+                printf("\033[1;33m[DBG]\033[0m item#%d TAKEN 恢复(恢复检查) → 在库\n", kv.first);
+                res.happened = true;
+                break;
+            }
+        }
+    }
+
+    return res;
+}
+
+
+// ============================================================================
+//  遮挡恢复检查
+//  1. YOLO 重新检测到 OCCLUDED 物品 → 恢复 INVENTORY
+//  2. OCCLUDED 物品附近没有遮挡物了 → 恢复 INVENTORY
+// ============================================================================
+void SessionManager::occlusion_check(const std::vector<const Track*>& foods,
+                                      const cv::Mat& frame,
+                                      int frame_id) {
+    // 先收集需要恢复的 item_id（不能在遍历中直接修改 status）
+    std::vector<int> to_restore;
+
+    for (auto& kv : inventory_.items()) {
+        if (kv.second.status != ItemStatus::OCCLUDED) continue;
+
+        // ---- 检查 1：YOLO 重新检测到 ----
+        bool redetected = false;
+        for (const Track* t : foods) {
+            if (t->track_id == kv.second.track_id) {
+                inventory_.relocate_item(kv.first, t->track_id, t->box, t->score, frame_id);
+                item_anchor_[kv.first] = t->box;
+                item_last_box_[kv.first] = t->box;
+                printf("\033[1;36m[DBG]\033[0m item#%d (%s) 遮挡恢复(track_id) → 在库\n",
+                       kv.first, coco_cls_to_name(kv.second.cls_id));
+                redetected = true;
+                break;
+            }
+            if (is_same_item_relaxed(t->box, t->cls_id, kv.second.last_bbox, kv.second.cls_id)) {
+                inventory_.relocate_item(kv.first, t->track_id, t->box, t->score, frame_id);
+                item_anchor_[kv.first] = t->box;
+                item_last_box_[kv.first] = t->box;
+                printf("\033[1;36m[DBG]\033[0m item#%d (%s) 遮挡恢复(几何) → 在库\n",
+                       kv.first, coco_cls_to_name(kv.second.cls_id));
+                redetected = true;
+                break;
+            }
+        }
+        if (redetected) {
+            inventory_.set_status(kv.first, ItemStatus::INVENTORY);
+            continue;
+        }
+
+        // ---- 检查 2：遮挡物是否还在 ----
+        // 先查当前帧中的物品（YOLO 能看到的）
+        bool still_covered = false;
+        for (const Track* t : foods) {
+            if (t->track_id == kv.second.track_id) continue;  // 跳过自己
+            float cov = 0.0f;
+            float a_area = kv.second.last_bbox.area();
+            if (a_area > 0) {
+                float ix1 = std::max(kv.second.last_bbox.x1, t->box.x1);
+                float iy1 = std::max(kv.second.last_bbox.y1, t->box.y1);
+                float ix2 = std::min(kv.second.last_bbox.x2, t->box.x2);
+                float iy2 = std::min(kv.second.last_bbox.y2, t->box.y2);
+                float iw = std::max(0.0f, ix2 - ix1);
+                float ih = std::max(0.0f, iy2 - iy1);
+                cov = (iw * ih) / a_area;
+            }
+            float dist = center_distance(kv.second.last_bbox, t->box);
+            if (cov > OCCLUDE_OVERLAP_THRESH || dist < OCCLUDE_CENTER_DIST_THRESH) {
+                still_covered = true;
+                break;
+            }
+        }
+        // 再查库存中但不在当前帧的物品（覆盖物可能自己也被遮挡了）
+        if (!still_covered) {
+            for (const auto& kv2 : inventory_.items()) {
+                if (kv2.first == kv.first) continue;
+                if (kv2.second.status == ItemStatus::TAKEN || kv2.second.status == ItemStatus::HELD) continue;
+                float cov = 0.0f;
+                float a_area = kv.second.last_bbox.area();
+                if (a_area > 0) {
+                    float ix1 = std::max(kv.second.last_bbox.x1, kv2.second.box.x1);
+                    float iy1 = std::max(kv.second.last_bbox.y1, kv2.second.box.y1);
+                    float ix2 = std::min(kv.second.last_bbox.x2, kv2.second.box.x2);
+                    float iy2 = std::min(kv.second.last_bbox.y2, kv2.second.box.y2);
+                    float iw = std::max(0.0f, ix2 - ix1);
+                    float ih = std::max(0.0f, iy2 - iy1);
+                    cov = (iw * ih) / a_area;
+                }
+                float dist = center_distance(kv.second.last_bbox, kv2.second.box);
+                if (cov > OCCLUDE_OVERLAP_THRESH || dist < OCCLUDE_CENTER_DIST_THRESH) {
+                    still_covered = true;
+                    break;
+                }
+            }
+        }
+
+        if (!still_covered) {
+            // 遮挡物不在了 → 恢复在库
+            to_restore.push_back(kv.first);
+            printf("\033[1;36m[DBG]\033[0m item#%d (%s) 遮挡物移走 → 恢复在库\n",
+                   kv.first, coco_cls_to_name(kv.second.cls_id));
+        }
+    }
+
+    // 批量恢复
+    for (int iid : to_restore) {
+        inventory_.set_status(iid, ItemStatus::INVENTORY);
     }
 }
 
@@ -132,12 +458,10 @@ void SessionManager::detect_held_items(const std::vector<const Track*>& hands,
                                         int frame_id) {
     std::set<int> seen_tids;
     for (const Track* t : foods) seen_tids.insert(t->track_id);
-
     for (const auto& kv : inventory_.items()) {
         if (kv.second.status == ItemStatus::TAKEN) continue;
         if (held_items_.count(kv.first)) continue;
         if (kv.second.track_id >= 0 && seen_tids.count(kv.second.track_id)) continue;
-
         int cover_hand = -1;
         for (const Track* h : hands) {
             if (hand_covers(h, kv.second.box, FRAME_W, FRAME_H)) {
@@ -163,7 +487,7 @@ void SessionManager::detect_held_items(const std::vector<const Track*>& hands,
 
 
 // ============================================================================
-//  处理 HELD 物品（整理 + 取出确认）
+//  处理 HELD 物品
 // ============================================================================
 SettlementResult SessionManager::process_held_items(
         const std::vector<const Track*>& hands,
@@ -182,7 +506,7 @@ SettlementResult SessionManager::process_held_items(
         InventoryItem* item = inventory_.find_by_item(item_id);
         if (!item) { held_done.push_back(item_id); continue; }
 
-        // 4a) 物品在原位置附近重新出现 → 没被拿走
+        // 4a) 原位重现 → 取消 HELD
         const Track* reappear = nullptr;
         for (const Track* f : foods) {
             if (f->cls_id != hi.cls_id || consumed_tids.count(f->track_id)) continue;
@@ -197,7 +521,7 @@ SettlementResult SessionManager::process_held_items(
         if (reappear) {
             inventory_.relocate_item(item_id, reappear->track_id, reappear->box,
                                      reappear->score, frame_id);
-            inventory_.set_status(item_id, ItemStatus::INVENTORY);  // 恢复为在库
+            inventory_.set_status(item_id, ItemStatus::INVENTORY);
             consumed_tids.insert(reappear->track_id);
             held_done.push_back(item_id);
             printf("\033[1;33m[DBG]\033[0m item#%d 在原位附近重现 → 取消 HELD\n", item_id);
@@ -219,7 +543,7 @@ SettlementResult SessionManager::process_held_items(
             continue;
         }
 
-        // 4c) 同类新 track 远处出现 → 整理
+        // 4c) 远处新 track → 整理
         const Track* putdown = nullptr;
         for (const Track* f : foods) {
             if (f->cls_id != hi.cls_id || consumed_tids.count(f->track_id)) continue;
@@ -242,68 +566,144 @@ SettlementResult SessionManager::process_held_items(
             res.happened = true;
             res.events.push_back({EventKind::MOVED, item_id, hi.cls_id,
                                   putdown->box, putdown->score, true});
+            item_anchor_[item_id] = putdown->box;
+            item_last_box_[item_id] = putdown->box;
             continue;
         }
 
-        // 4d) 手不在 + 没重现 + 没放下 → 恢复为在库，交给快照对比判断是否真的被拿走
-        //     不直接判 TAKEN，因为物品可能只是被其他物品遮挡了
+        // 4d) 手不在 + 没重现 + 没放下 → 恢复在库
         inventory_.set_status(item_id, ItemStatus::INVENTORY);
         held_done.push_back(item_id);
-        printf("\033[1;33m[DBG]\033[0m item#%d (%s) 手离开，恢复为在库（等快照对比确认）\n",
+        printf("\033[1;33m[DBG]\033[0m item#%d (%s) 手离开，恢复为在库\n",
                item_id, coco_cls_to_name(item->cls_id));
     }
-
     for (int id : held_done) held_items_.erase(id);
     return res;
 }
 
 
 // ============================================================================
-//  打印库存（表格格式）
+//  平滑移动整理检测
+// ============================================================================
+void SessionManager::detect_smooth_relocate(const std::vector<const Track*>& foods,
+                                             int frame_id,
+                                             const cv::Mat& frame,
+                                             SettlementResult& res) {
+    for (const Track* t : foods) {
+        InventoryItem* item = inventory_.find_by_track(t->track_id);
+        if (!item || item->status == ItemStatus::TAKEN || item->status == ItemStatus::HELD) continue;
+
+        int iid = item->item_id;
+
+        if (item_anchor_.find(iid) == item_anchor_.end()) {
+            item_anchor_[iid] = item->box;
+        }
+
+        bool settled = true;
+        auto lb = item_last_box_.find(iid);
+        if (lb != item_last_box_.end()) {
+            settled = center_distance(item->box, lb->second) < SMOOTH_SETTLE_PIX;
+        } else {
+            settled = false;
+        }
+
+        float move = center_distance(t->box, item_anchor_[iid]);
+        if (settled && move >= SMOOTH_RELOCATE_PIX) {
+            BBox old_pos = item_anchor_[iid];
+            printf("\n\033[1;32m[EVENT]\033[0m 整理(平滑): item#%d %s "
+                   "从(%.0f,%.0f)~(%.0f,%.0f) → (%.0f,%.0f)~(%.0f,%.0f)\n",
+                   iid, coco_cls_to_name(item->cls_id),
+                   old_pos.x1, old_pos.y1, old_pos.x2, old_pos.y2,
+                   t->box.x1, t->box.y1, t->box.x2, t->box.y2);
+            item_anchor_[iid] = t->box;
+            res.happened = true;
+            res.events.push_back({EventKind::MOVED, iid, item->cls_id,
+                                  t->box, t->score, true});
+
+            for (auto& kv2 : inventory_.items()) {
+                if (kv2.first == iid) continue;
+                if (kv2.second.status != ItemStatus::INVENTORY) continue;
+                float cov = 0.0f;
+                float b_area = kv2.second.box.area();
+                if (b_area > 0) {
+                    float ix1 = std::max(t->box.x1, kv2.second.box.x1);
+                    float iy1 = std::max(t->box.y1, kv2.second.box.y1);
+                    float ix2 = std::min(t->box.x2, kv2.second.box.x2);
+                    float iy2 = std::min(t->box.y2, kv2.second.box.y2);
+                    float iw = std::max(0.0f, ix2 - ix1);
+                    float ih = std::max(0.0f, iy2 - iy1);
+                    cov = (iw * ih) / b_area;
+                }
+                float dist = center_distance(t->box, kv2.second.box);
+                if (cov > OCCLUDE_OVERLAP_THRESH || dist < OCCLUDE_CENTER_DIST_THRESH) {
+                    inventory_.set_status(kv2.first, ItemStatus::OCCLUDED);
+                    printf("\033[1;33m[DBG]\033[0m item#%d (%s) 被整理后的 item#%d 遮挡 → OCCLUDED\n",
+                           kv2.first, coco_cls_to_name(kv2.second.cls_id), iid);
+                }
+            }
+            for (auto& kv2 : inventory_.items()) {
+                if (kv2.second.status != ItemStatus::OCCLUDED) continue;
+                float cov = 0.0f;
+                float b_area = kv2.second.last_bbox.area();
+                if (b_area > 0) {
+                    float ix1 = std::max(old_pos.x1, kv2.second.last_bbox.x1);
+                    float iy1 = std::max(old_pos.y1, kv2.second.last_bbox.y1);
+                    float ix2 = std::min(old_pos.x2, kv2.second.last_bbox.x2);
+                    float iy2 = std::min(old_pos.y2, kv2.second.last_bbox.y2);
+                    float iw = std::max(0.0f, ix2 - ix1);
+                    float ih = std::max(0.0f, iy2 - iy1);
+                    cov = (iw * ih) / b_area;
+                }
+                float dist = center_distance(old_pos, kv2.second.last_bbox);
+                if (cov > OCCLUDE_OVERLAP_THRESH || dist < OCCLUDE_CENTER_DIST_THRESH) {
+                    inventory_.set_status(kv2.first, ItemStatus::INVENTORY);
+                    printf("\033[1;36m[DBG]\033[0m item#%d (%s) 原位置物品移走 → 恢复在库\n",
+                           kv2.first, coco_cls_to_name(kv2.second.cls_id));
+                }
+            }
+        }
+
+        item_last_box_[iid] = t->box;
+    }
+}
+
+
+// ============================================================================
+//  打印库存
 // ============================================================================
 void SessionManager::print_inventory() {
     size_t n_total = inventory_.size();
     size_t n_taken = inventory_.count_by_status(ItemStatus::TAKEN);
-    size_t n_in = n_total - n_taken;
+    size_t n_occluded = inventory_.count_by_status(ItemStatus::OCCLUDED);
+    size_t n_in = n_total - n_taken - inventory_.count_by_status(ItemStatus::HELD);
 
     printf("\n");
-    printf("  ┌─────────────────────────────────────────────────┐\n");
-    printf("  │  库存清单 │ 实际在库: %-3zu │ 被拿走: %-3zu │ 总计: %-3zu │\n", n_in, n_taken, n_total);
-    printf("  ├────┬──────────────┬────────┬────────────────────┤\n");
-    printf("  │ #  │ 类别         │ 状态   │ 位置 (中心)        │\n");
-    printf("  ├────┼──────────────┼────────┼────────────────────┤\n");
-
-    // 先打印在库物品
+    printf("  ┌─────────────────────────────────────────────────────────┐\n");
+    printf("  │  库存清单 │ 在库: %-3zu │ 遮挡: %-3zu │ 拿走: %-3zu │ 总: %-3zu │\n",
+           n_in, n_occluded, n_taken, n_total);
+    printf("  ├────┬──────────────┬────────┬────────────────────────────┤\n");
+    printf("  │ #  │ 类别         │ 状态   │ 位置 (中心)                │\n");
+    printf("  ├────┼──────────────┼────────┼────────────────────────────┤\n");
     for (const auto& kv : inventory_.items()) {
         const auto& it = kv.second;
         if (it.status == ItemStatus::TAKEN || it.status == ItemStatus::HELD) continue;
-        printf("  │ %-2d │ %-12s │ %-6s │ (%4.0f,%4.0f)         │\n",
-               it.item_id, coco_cls_to_name(it.cls_id), "在库",
+        const char* status_str = (it.status == ItemStatus::OCCLUDED) ? "遮挡" : "在库";
+        printf("  │ %-2d │ %-12s │ %-6s │ (%4.0f,%4.0f)                 │\n",
+               it.item_id, coco_cls_to_name(it.cls_id), status_str,
                it.box.cx(), it.box.cy());
     }
-
-    // 打印 HELD 物品（显示为"遮挡"）
-    for (const auto& kv : inventory_.items()) {
-        if (kv.second.status != ItemStatus::HELD) continue;
-        printf("  │ %-2d │ %-12s │ %-6s │ (%4.0f,%4.0f)         │\n",
-               kv.second.item_id, coco_cls_to_name(kv.second.cls_id), "遮挡",
-               kv.second.box.cx(), kv.second.box.cy());
-    }
-
-    // 分隔线 + TAKEN 物品
     if (n_taken > 0) {
-        printf("  ├────┴──────────────┴────────┴────────────────────┤\n");
-        printf("  │  被拿走（临时记录，关门时不上传后台）            │\n");
-        printf("  ├────┬──────────────┬────────┬────────────────────┤\n");
+        printf("  ├────┴──────────────┴────────┴────────────────────────────┤\n");
+        printf("  │  被拿走（临时记录，关门时不上传后台）                    │\n");
+        printf("  ├────┬──────────────┬────────┬────────────────────────────┤\n");
         for (const auto& kv : inventory_.items()) {
             if (kv.second.status != ItemStatus::TAKEN) continue;
-            printf("  │ %-2d │ %-12s │ %-6s │ (%4.0f,%4.0f)         │\n",
+            printf("  │ %-2d │ %-12s │ %-6s │ (%4.0f,%4.0f)                 │\n",
                    kv.second.item_id, coco_cls_to_name(kv.second.cls_id), "拿走",
                    kv.second.box.cx(), kv.second.box.cy());
         }
     }
-
-    printf("  └────┴──────────────┴────────┴────────────────────┘\n\n");
+    printf("  └────┴──────────────┴────────┴────────────────────────────┘\n\n");
 }
 
 
@@ -317,17 +717,17 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks, int fr
 
 
 // ============================================================================
-//  主 update 接口
+//  主 update 接口（v5：逐帧对比，track_id 优先）
 // ============================================================================
 SettlementResult SessionManager::update(const std::vector<Track>& tracks,
                                         int frame_id,
                                         const cv::Mat& frame,
                                         long long time_ms) {
     current_time_ms_ = time_ms;
+    current_frame_id_ = frame_id;
     SettlementResult total_res;
     bool has_frame = !frame.empty();
 
-    // ---- 分类 tracks ----
     std::vector<const Track*> hands, foods;
     for (const auto& t : tracks) {
         if (is_hand(t.cls_id)) hands.push_back(&t);
@@ -340,35 +740,25 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
 
 
     // ================================================================
-    //  阶段 1：IDLE → 开机后立刻收集，手出现时初始化基线
-    //    不等"无手时段"，直接用"手出现前的检测结果"作为基线
+    //  IDLE → 开机初始化
     // ================================================================
     if (phase_ == SessionPhase::IDLE) {
-        // 不管有没有手，都聚合到初始段
-        aggregate_to_segment(foods, frame_id);
-        no_hand_streak_++;
-
-        // 触发条件：手第一次出现，或者已经收集了足够多帧（兜底）
-        bool should_init = hand_present || (no_hand_streak_ >= segment_frames_);
-
+        stable_streak_++;
+        bool should_init = hand_present || (stable_streak_ >= stable_frames_);
         if (should_init && !baseline_initialized_) {
-            // 用当前收集到的段作为基线
-            prev_snapshot_ = current_segment_;
-            prev_snapshot_.end_frame = frame_id;
-            has_prev_snapshot_ = true;
-
             if (backend_initialized_) {
                 for (const auto& bi : backend_inventory_) {
                     bool matched = false;
-                    for (const auto& kv : prev_snapshot_.items) {
+                    for (const Track* t : foods) {
                         bool m = has_frame
-                            ? is_same_item_strict(kv.second.box, kv.second.cls_id, bi.box, bi.cls_id, frame)
-                            : is_same_position(kv.second.box, bi.box, IDENTITY_CENTER_DIST, IDENTITY_IOU_THRESH);
+                            ? is_same_item_strict(t->box, t->cls_id, bi.box, bi.cls_id, frame)
+                            : is_same_position(t->box, bi.box, IDENTITY_CENTER_DIST, IDENTITY_IOU_THRESH);
                         if (m) {
-                            int new_id = inventory_.add_item(kv.second.track_id, kv.second.cls_id,
-                                                             kv.second.box, kv.second.best_score,
+                            int new_id = inventory_.add_item(t->track_id, t->cls_id,
+                                                             t->box, t->score,
                                                              frame_id, current_time_ms_);
-                            inventory_.set_status(new_id, ItemStatus::INVENTORY);
+                            item_anchor_[new_id] = t->box;
+                            item_last_box_[new_id] = t->box;
                             matched = true;
                             break;
                         }
@@ -376,91 +766,116 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
                     if (!matched) {
                         int new_id = inventory_.add_item(-1, bi.cls_id, bi.box, bi.score,
                                                          frame_id, current_time_ms_);
-                        inventory_.set_status(new_id, ItemStatus::INVENTORY);
+                        item_anchor_[new_id] = bi.box;
+                        item_last_box_[new_id] = bi.box;
                     }
                 }
             } else {
-                for (const auto& kv : prev_snapshot_.items) {
-                    inventory_.add_item(kv.second.track_id, kv.second.cls_id,
-                                        kv.second.box, kv.second.best_score,
-                                        frame_id, current_time_ms_);
+                for (const Track* t : foods) {
+                    int new_id = inventory_.add_item(t->track_id, t->cls_id,
+                                                     t->box, t->score,
+                                                     frame_id, current_time_ms_);
+                    item_anchor_[new_id] = t->box;
+                    item_last_box_[new_id] = t->box;
                 }
             }
             baseline_initialized_ = true;
             printf("[SESSION] 初始化完成: %zu 件 (手出现=%s, 帧数=%d)\n",
-                   inventory_.size(), hand_present ? "是" : "否", no_hand_streak_);
-            total_res.happened = true;  // 触发库存打印
+                   inventory_.size(), hand_present ? "是" : "否", stable_streak_);
+            total_res.happened = true;
 
-            // 如果手已经出现了，直接进 HAND_ACTIVE
             if (hand_present) {
                 phase_ = SessionPhase::HAND_ACTIVE;
-                current_segment_ = {frame_id, frame_id, {}, false};
                 detect_held_items(hands, foods, frame_id);
             } else {
-                phase_ = SessionPhase::COLLECTING;
-                current_segment_ = {frame_id, frame_id, {}, false};
+                phase_ = SessionPhase::ACTIVE;
             }
-            no_hand_streak_ = 0;
+            stable_streak_ = 0;
         }
         return total_res;
     }
 
 
     // ================================================================
-    //  阶段 2：COLLECTING → 收集无手时间段
+    //  ACTIVE → 逐帧对比库存（带帧跳过）
     // ================================================================
-    if (phase_ == SessionPhase::COLLECTING) {
-        if (hand_present) {
-            // 手出现了 → 切换到 HAND_ACTIVE
-            current_segment_.end_frame = frame_id;
-            phase_ = SessionPhase::HAND_ACTIVE;
-            no_hand_streak_ = 0;
-            detect_held_items(hands, foods, frame_id);
-        } else {
-            aggregate_to_segment(foods, frame_id);
-            no_hand_streak_++;
+    if (phase_ == SessionPhase::ACTIVE) {
+        // 帧跳过：只在手出现时立即处理，否则每隔 COMPARE_INTERVAL 帧处理一次
+        compare_counter_++;
+        bool should_compare = hand_present || (compare_counter_ >= COMPARE_INTERVAL);
+        if (should_compare) compare_counter_ = 0;
 
-            // 更新库存中物品的位置
-            for (const Track* t : foods) {
-                InventoryItem* item = inventory_.find_by_track(t->track_id);
-                if (!item || item->status == ItemStatus::TAKEN) continue;
-                item->last_bbox = item->box;
-                item->box = t->box;
-                item->score = t->score;
-                item->last_seen_frame = frame_id;
-                item->stable_frames++;
-            }
-
-            // 图片更新检查
-            for (const Track* t : foods) {
-                InventoryItem* item = inventory_.find_by_track(t->track_id);
-                if (!item || item->status != ItemStatus::INVENTORY) continue;
-                if (image_updated_.count(item->item_id)) continue;
-                if (frame_id - item->created_frame < IMAGE_UPDATE_DELAY_FRAMES) continue;
-                auto lb = item_last_box_.find(item->item_id);
-                if (lb != item_last_box_.end() &&
-                    center_distance(t->box, lb->second) >= SMOOTH_SETTLE_PIX) {
-                    item_last_box_[item->item_id] = t->box;
-                    continue;
-                }
-                image_updated_.insert(item->item_id);
-                printf("\033[1;33m[DBG]\033[0m item#%d (%s) 稳定截图更新 @frame=%d\n",
-                       item->item_id, coco_cls_to_name(item->cls_id), frame_id);
+        if (hand_present && should_compare) {
+            SettlementResult cmp_res = compare_frame_to_inventory(foods, hands, frame, frame_id);
+            if (cmp_res.happened) {
                 total_res.happened = true;
-                total_res.events.push_back({EventKind::IMAGE_UPDATE, item->item_id,
-                                            item->cls_id, item->box, item->score, true});
+                total_res.events.insert(total_res.events.end(),
+                                        cmp_res.events.begin(), cmp_res.events.end());
+            }
+            phase_ = SessionPhase::HAND_ACTIVE;
+            stable_streak_ = 0;
+            detect_held_items(hands, foods, frame_id);
+        } else if (should_compare) {
+            SettlementResult cmp_res = compare_frame_to_inventory(foods, hands, frame, frame_id);
+            if (cmp_res.happened) {
+                total_res.happened = true;
+                total_res.events.insert(total_res.events.end(),
+                                        cmp_res.events.begin(), cmp_res.events.end());
+            }
+
+            occlusion_check(foods, frame, frame_id);
+
+            // 平滑移动整理检测
+            detect_smooth_relocate(foods, frame_id, frame, total_res);
+        }
+
+        // 图片更新检查（每帧都跑，不受帧跳过影响）
+        for (const Track* t : foods) {
+            InventoryItem* item = inventory_.find_by_track(t->track_id);
+            if (!item || item->status != ItemStatus::INVENTORY) continue;
+            if (image_updated_.count(item->item_id)) continue;
+            if (frame_id - item->created_frame < IMAGE_UPDATE_DELAY_FRAMES) continue;
+            auto lb_it = item_last_box_.find(item->item_id);
+            if (lb_it != item_last_box_.end() &&
+                center_distance(t->box, lb_it->second) >= SMOOTH_SETTLE_PIX) {
                 item_last_box_[item->item_id] = t->box;
+                continue;
+            }
+            image_updated_.insert(item->item_id);
+            printf("\033[1;33m[DBG]\033[0m item#%d (%s) 稳定截图更新 @frame=%d\n",
+                   item->item_id, coco_cls_to_name(item->cls_id), frame_id);
+            total_res.happened = true;
+            total_res.events.push_back({EventKind::IMAGE_UPDATE, item->item_id,
+                                        item->cls_id, item->box, item->score, true});
+            item_last_box_[item->item_id] = t->box;
+        }
+
+        // 只在有真正的业务事件（IN/OUT/MOVED）时才打印库存
+        bool has_business_event = false;
+        for (const auto& ev : total_res.events) {
+            if (ev.kind == EventKind::IN || ev.kind == EventKind::OUT || ev.kind == EventKind::MOVED) {
+                has_business_event = true;
+                break;
             }
         }
+        if (has_business_event) print_inventory();
         return total_res;
     }
 
 
     // ================================================================
-    //  阶段 3：HAND_ACTIVE → 手在画面中
+    //  HAND_ACTIVE → 手在画面中
     // ================================================================
     if (phase_ == SessionPhase::HAND_ACTIVE) {
+        SettlementResult cmp_res = compare_frame_to_inventory(foods, hands, frame, frame_id);
+        if (cmp_res.happened) {
+            total_res.happened = true;
+            total_res.events.insert(total_res.events.end(),
+                                    cmp_res.events.begin(), cmp_res.events.end());
+        }
+
         if (hand_present) {
+            stable_streak_ = 0;
             SettlementResult held_res = process_held_items(hands, foods, hand_effective, frame_id, frame);
             if (held_res.happened) {
                 total_res.happened = true;
@@ -468,198 +883,27 @@ SettlementResult SessionManager::update(const std::vector<Track>& tracks,
                                         held_res.events.begin(), held_res.events.end());
             }
         } else {
-            // 手离开了 → 处理剩余 HELD
             SettlementResult held_res = process_held_items(hands, foods, hand_effective, frame_id, frame);
             if (held_res.happened) {
                 total_res.happened = true;
                 total_res.events.insert(total_res.events.end(),
                                         held_res.events.begin(), held_res.events.end());
             }
-            no_hand_streak_++;
-            if (no_hand_streak_ >= 3) {
-                // 手确认离开 → 切换到 COMPARING，开始收集新时间段
-                phase_ = SessionPhase::COMPARING;
-                current_segment_ = {frame_id, frame_id, {}, false};
-                aggregate_to_segment(foods, frame_id);
+            stable_streak_++;
+            if (stable_streak_ >= HAND_CONFIRM_LEAVE) {
+                phase_ = SessionPhase::ACTIVE;
+                stable_streak_ = 0;
             }
         }
-        // HELD 处理后打印库存
-        if (total_res.happened) {
-            print_inventory();
+        bool has_business_event = false;
+        for (const auto& ev : total_res.events) {
+            if (ev.kind == EventKind::IN || ev.kind == EventKind::OUT || ev.kind == EventKind::MOVED) {
+                has_business_event = true;
+                break;
+            }
         }
+        if (has_business_event) print_inventory();
         return total_res;
-    }
-
-
-    // ================================================================
-    //  阶段 4：COMPARING → 收集新时间段 → 对比快照
-    // ================================================================
-    if (phase_ == SessionPhase::COMPARING) {
-        if (hand_present) {
-            // 手又回来了 → 切回 HAND_ACTIVE
-            current_segment_.end_frame = frame_id;
-            phase_ = SessionPhase::HAND_ACTIVE;
-            no_hand_streak_ = 0;
-            detect_held_items(hands, foods, frame_id);
-        } else {
-            aggregate_to_segment(foods, frame_id);
-            no_hand_streak_++;
-
-            // 更新库存中物品的位置
-            for (const Track* t : foods) {
-                InventoryItem* item = inventory_.find_by_track(t->track_id);
-                if (!item || item->status == ItemStatus::TAKEN) continue;
-                item->last_bbox = item->box;
-                item->box = t->box;
-                item->score = t->score;
-                item->last_seen_frame = frame_id;
-                item->stable_frames++;
-            }
-
-            if (no_hand_streak_ >= segment_frames_) {
-                // ---- 新时间段收集完成，做快照对比 ----
-                TimeSegment new_snapshot = current_segment_;
-                new_snapshot.end_frame = frame_id;
-
-                // ==== 第一步：先处理减少（拿走） ====
-                // 找出库存中有但新快照中没有的物品
-                for (auto& inv_kv : inventory_.items()) {
-                    if (inv_kv.second.status == ItemStatus::TAKEN) continue;
-
-                    // 在新快照中找匹配
-                    bool found_in_snapshot = false;
-                    for (const auto& kv : new_snapshot.items) {
-                        if (is_same_item_strict(kv.second.box, kv.second.cls_id,
-                                                inv_kv.second.box, inv_kv.second.cls_id, frame)) {
-                            found_in_snapshot = true;
-                            break;
-                        }
-                    }
-                    if (found_in_snapshot) continue;
-
-                    // 没找到 → 检查原位置是否有其他物品覆盖住了它
-                    // 先查快照中的物品，再查库存中但不在快照中的物品（遮挡物可能自己也被遮挡了）
-                    bool covered = false;
-                    // 检查快照中的物品
-                    for (const auto& kv : new_snapshot.items) {
-                        if (kv.first == inv_kv.second.track_id) continue;  // 跳过自己
-                        float overlap = overlap_ratio_of_smaller(inv_kv.second.box, kv.second.box);
-                        float dist = center_distance(inv_kv.second.box, kv.second.box);
-                        if (overlap > 0.3f || dist < 40.0f) {
-                            covered = true;
-                            printf("\033[1;33m[DBG]\033[0m item#%d (%s) 被快照中的 item(track=%d, %s) 覆盖 "
-                                   "(overlap=%.2f, dist=%.0f) → 留在库存中\n",
-                                   inv_kv.first, coco_cls_to_name(inv_kv.second.cls_id),
-                                   kv.second.track_id, coco_cls_to_name(kv.second.cls_id),
-                                   overlap, dist);
-                            break;
-                        }
-                    }
-                    // 如果快照中没找到覆盖物，再查库存中但不在快照中的物品
-                    // （覆盖物可能自己也被遮挡了，不在快照中）
-                    if (!covered) {
-                        for (const auto& inv_kv2 : inventory_.items()) {
-                            if (inv_kv2.first == inv_kv.first) continue;  // 跳过自己
-                            if (inv_kv2.second.status == ItemStatus::TAKEN) continue;
-                            // 这个物品不在快照中（被遮挡了）
-                            if (new_snapshot.items.count(inv_kv2.second.track_id)) continue;
-                            float overlap = overlap_ratio_of_smaller(inv_kv.second.box, inv_kv2.second.box);
-                            float dist = center_distance(inv_kv.second.box, inv_kv2.second.box);
-                            if (overlap > 0.3f || dist < 40.0f) {
-                                covered = true;
-                                printf("\033[1;33m[DBG]\033[0m item#%d (%s) 被库存中的 item#%d (%s) 覆盖 "
-                                       "(overlap=%.2f, dist=%.0f) → 留在库存中\n",
-                                       inv_kv.first, coco_cls_to_name(inv_kv.second.cls_id),
-                                       inv_kv2.first, coco_cls_to_name(inv_kv2.second.cls_id),
-                                       overlap, dist);
-                                break;
-                            }
-                        }
-                    }
-                    if (covered) continue;
-
-                    // 确认拿走
-                    printf("\n\033[1;32m[EVENT]\033[0m 取出: item#%d %s (置信度 %.0f%%) "
-                           "原位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
-                           inv_kv.first, coco_cls_to_name(inv_kv.second.cls_id),
-                           inv_kv.second.score * 100,
-                           inv_kv.second.box.x1, inv_kv.second.box.y1,
-                           inv_kv.second.box.x2, inv_kv.second.box.y2);
-                    inventory_.set_status(inv_kv.first, ItemStatus::TAKEN);
-                    total_res.events.push_back({EventKind::OUT, inv_kv.first,
-                                                 inv_kv.second.cls_id, inv_kv.second.box,
-                                                 inv_kv.second.score, false});
-                    total_res.happened = true;
-                }
-
-                // ==== 第二步：处理增加（放入） ====
-                for (const auto& kv : new_snapshot.items) {
-                    // 跟库存做严格身份匹配
-                    bool found = false;
-                    for (auto& inv_kv : inventory_.items()) {
-                        if (inv_kv.second.status == ItemStatus::TAKEN) continue;
-                        if (is_same_item_strict(kv.second.box, kv.second.cls_id,
-                                                inv_kv.second.box, inv_kv.second.cls_id, frame)) {
-                            // 重新绑定 track
-                            inventory_.relocate_item(inv_kv.first, kv.second.track_id,
-                                                     kv.second.box, kv.second.best_score, frame_id);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        // 新物品入库
-                        int new_id = inventory_.add_item(kv.second.track_id, kv.second.cls_id,
-                                                         kv.second.box, kv.second.best_score,
-                                                         frame_id, current_time_ms_);
-                        printf("\n\033[1;32m[EVENT]\033[0m 放入: item#%d %s (置信度 %.0f%%) "
-                               "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
-                               new_id, coco_cls_to_name(kv.second.cls_id), kv.second.best_score * 100,
-                               kv.second.box.x1, kv.second.box.y1, kv.second.box.x2, kv.second.box.y2);
-                        total_res.events.push_back({EventKind::IN, new_id, kv.second.cls_id,
-                                                     kv.second.box, kv.second.best_score, true});
-                        total_res.happened = true;
-                    }
-                }
-
-                // ==== 第三步：TAKEN 恢复检查 ====
-                for (const auto& kv : new_snapshot.items) {
-                    for (auto& inv_kv : inventory_.items()) {
-                        if (inv_kv.second.status != ItemStatus::TAKEN) continue;
-                        if (is_same_item_strict(kv.second.box, kv.second.cls_id,
-                                                inv_kv.second.last_bbox, inv_kv.second.cls_id, frame)) {
-                            inventory_.relocate_item(inv_kv.first, kv.second.track_id,
-                                                     kv.second.box, kv.second.best_score, frame_id);
-                            inventory_.set_status(inv_kv.first, ItemStatus::INVENTORY);
-                            printf("\033[1;33m[DBG]\033[0m item#%d TAKEN 恢复 → 在库 (YOLO 抖动误判)\n", inv_kv.first);
-                            total_res.happened = true;
-                            break;
-                        }
-                    }
-                }
-
-                // 更新快照，切换回 COLLECTING
-                prev_snapshot_ = new_snapshot;
-                has_prev_snapshot_ = true;
-                current_segment_ = {frame_id, frame_id, {}, false};
-                phase_ = SessionPhase::COLLECTING;
-                no_hand_streak_ = 0;
-
-                // 快照对比后打印库存
-                if (total_res.happened) {
-                    print_inventory();
-                }
-            }
-        }
-        return total_res;
-    }
-
-
-    // ================================================================
-    //  兜底：其他阶段有事件时也打印库存
-    // ================================================================
-    if (total_res.happened) {
-        print_inventory();
     }
 
     return total_res;

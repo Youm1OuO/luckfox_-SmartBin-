@@ -75,7 +75,7 @@ python fridge_project/scripts/train.py stage-b \
 
 
 cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
-
+conda activate DL_env
 
 # .pt → .ONNX
 python export.py \
@@ -102,6 +102,13 @@ python export.py \
     --rknpu \
     --weight runs/train/hand_plus_v1/weights/best.pt \
     --imgsz 640
+
+
+
+python export.py \
+    --rknpu \
+    --weight runs/train/hand_plus_v1/weights/best.pt \
+    --imgsz 704
 
 
 ---------------------------------------------------------------------------------

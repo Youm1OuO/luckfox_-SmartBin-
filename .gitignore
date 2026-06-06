@@ -3,7 +3,7 @@ luckfox-pico/
 datasets/
 
 # ========== 大模型 / 中间产物 ==========
-models/
+/models/
 *.rknn
 *.onnx
 *.pth

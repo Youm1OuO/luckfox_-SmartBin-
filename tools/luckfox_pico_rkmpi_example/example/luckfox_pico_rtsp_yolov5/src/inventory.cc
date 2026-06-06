@@ -1,6 +1,6 @@
 // ============================================================================
 //  inventory.cc
-//  本地工作库存实现 — v4 简化版（无【被遮挡】状态）
+//  本地工作库存实现 — v5 逐帧对比版（含 OCCLUDED 状态）
 // ============================================================================
 #include "inventory.h"
 #include "fridge_config.h"
@@ -14,8 +14,9 @@ namespace fridge {
 const char* item_status_to_str(ItemStatus s) {
     switch (s) {
         case ItemStatus::INVENTORY: return "在库";
+        case ItemStatus::OCCLUDED:  return "遮挡";
         case ItemStatus::TAKEN:     return "被拿走";
-        case ItemStatus::HELD:      return "遮挡";
+        case ItemStatus::HELD:      return "被手拿着";
     }
     return "?";
 }
@@ -116,18 +117,19 @@ size_t InventoryDB::count_by_status(ItemStatus s) const {
 }
 
 void InventoryDB::print(const char* prefix) const {
-    // 先打印在库物品（非 TAKEN/HELD）
+    // 先打印在库物品（INVENTORY + OCCLUDED，排除 TAKEN/HELD）
     for (const auto& kv : items_) {
         const auto& it = kv.second;
         if (it.status == ItemStatus::TAKEN || it.status == ItemStatus::HELD) continue;
-        printf("%s  - item#%d cls=%d(%s) [在库] "
+        printf("%s  - item#%d cls=%d(%s) [%s] "
                "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d seen@%d\n",
                prefix,
                it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
+               item_status_to_str(it.status),
                it.box.x1, it.box.y1, it.box.x2, it.box.y2,
                it.score, it.track_id, it.last_seen_frame);
     }
-    // 再打印 TAKEN 的物品（用空行隔开）
+    // 再打印 TAKEN 的物品
     bool has_taken = false;
     for (const auto& kv : items_) {
         if (kv.second.status == ItemStatus::TAKEN) { has_taken = true; break; }
@@ -160,7 +162,7 @@ std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms) 
     bool first = true;
     for (const auto& kv : items_) {
         const auto& it = kv.second;
-        // 排除 TAKEN/HELD，只上报真正"在库"的物品
+        // 排除 TAKEN/HELD，只上报真正"在库"的物品（OCCLUDED 也算在库）
         if (it.status == ItemStatus::TAKEN || it.status == ItemStatus::HELD) continue;
         float bw = it.box.x2 - it.box.x1;
         float bh = it.box.y2 - it.box.y1;
