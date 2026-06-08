@@ -51,6 +51,7 @@ luckfox-pico/tools/linux/toolchain/
 
 # ========== vendor 化的 yolov5：排除训练数据集 / 运行输出 / 模型权重 ==========
 tools/yolov5/datasets/
+tools/yolov5/fridge_project/datasets
 tools/yolov5/runs/
 tools/yolov5/wandb/
 tools/yolov5/VOCdevkit/
@@ -109,3 +110,7 @@ tools/rknn-toolkit2/rknn-toolkit2/examples/functions/hybrid_quant/ssd_mobilenet_
 
 
 captures
+
+
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset_raw

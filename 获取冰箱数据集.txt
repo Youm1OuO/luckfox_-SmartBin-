@@ -1,0 +1,263 @@
+# 获取冰箱数据集 — 操作手册
+
+## 目标
+从 LuckFox 摄像头采集冰箱内部图片 → 标注 → 训练 YOLOv5 → 导出 RKNN 部署。
+
+**你的模型信息：**
+- 模型输入：704×704，BGR
+- RTSP 流地址：`rtsp://<luckfox_ip>:554/live/0`
+- 类别数量：43 个（hand + 42 种食材，详见步骤 4）
+
+---
+
+## 步骤 1：在 LuckFox 上采集图片
+
+先确保你的冰箱程序已经在运行（RTSP 流在推）：
+
+```bash
+# 在 LuckFox 上，启动你的程序
+./luckfox_pico_rtsp_yolov5
+```
+
+然后**另开一个终端**，用 ffmpeg 从本地 RTSP 流截图：
+
+```bash
+# 在 LuckFox 上执行
+# 每秒截 2 张，共截 200 张（约 100 秒），存到 ./dataset_raw/
+mkdir -p ./dataset_raw
+
+ffmpeg -i rtsp://127.0.0.1:554/live/0 \
+  -vf "fps=2" -q:v 2 \
+  ./dataset_raw/fridge_%04d.jpg \
+  -v quiet -frames:v 200
+```
+
+**采集期间要做的事：**
+- 逐个放入你要识别的物品（苹果、可乐、牛奶盒等）
+- 每个物品换 3~5 个角度/位置再放
+- 也拍一些**手拿物品**的画面（用于 hand 类别）
+- 物品间有遮挡也要拍一些
+- 开门/关门前后各拍一些（光线变化）
+
+> 可以分多次采集，每次存到不同目录（`batch1/`, `batch2/` ...），步骤 3 会合并。
+
+---
+
+## 步骤 2：把图片传到电脑
+
+在你的**电脑**上执行：
+
+```bash
+# scp 把 LuckFox 上的图片拉到电脑
+scp -r root@<luckfox_ip>:~/dataset_raw/ ./dataset_raw/
+```
+
+> 把 `<luckfox_ip>` 换成你 LuckFox 的实际 IP 地址（比如 192.168.168.130）。
+
+如果是分多次采集的：
+
+```bash
+scp -r root@<luckfox_ip>:~/batch1/ ./batch1/
+scp -r root@<luckfox_ip>:~/batch2/ ./batch2/
+```
+
+---
+
+## 步骤 3：生成 YOLO 数据集结构
+
+项目里已有 `tools/make_dataset.py`，它会自动：
+- 收集所有图片
+- 随机打乱，按 8:2 划分 train / val
+- 生成标准 YOLO 目录 + data.yaml + classes.txt
+
+```bash
+# 在电脑上，进入项目目录
+cd tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5
+
+# 单次采集
+python3 tools/make_dataset.py --input ./dataset_raw/ --output ./dataset
+
+# 多次采集合并
+python3 tools/make_dataset.py --input ./batch1/ ./batch2/ ./batch3/ --output ./dataset
+```
+
+生成的目录结构：
+
+```
+dataset/
+├── images/
+│   ├── train/       ← 训练集图片（已自动重命名 000001.jpg ...）
+│   └── val/         ← 验证集图片
+├── labels/
+│   ├── train/       ← 标注文件（空的，步骤 4 填入）
+│   └── val/
+├── classes.txt      ← 类别列表（给 LabelImg 用）
+└── data.yaml        ← 训练配置（给 YOLOv5 用）
+```
+
+---
+
+## 步骤 4：用 LabelImg 标注
+
+### 4.1 安装 LabelImg
+
+```bash
+pip install labelImg
+```
+
+### 4.2 启动标注
+
+```bash
+# 标注训练集
+labelImg ./dataset/images/train ./dataset/classes.txt
+
+# 标注完训练集后，再标验证集
+labelImg ./dataset/images/val ./dataset/classes.txt
+```
+
+### 4.3 LabelImg 里的设置
+
+1. 左侧点击 **PascalVOC** → 切换为 **YOLO** 格式
+2. 如果自动保存路径不对，点 **Change Save Dir** 指向 `./dataset/labels/train`（或 val）
+
+### 4.4 你的 43 个类别
+
+classes.txt 的行号 = 类别 ID（从 0 开始），共 43 类：
+
+| ID | 英文名 | 中文 | ID | 英文名 | 中文 |
+|----|--------|------|----|--------|------|
+| 0 | apple | 苹果 | 22 | milk_bottle | 牛奶瓶 |
+| 1 | banana | 香蕉 | 23 | yogurt_cup | 酸奶杯 |
+| 2 | orange | 橙子 | 24 | juice_bottle | 果汁瓶 |
+| 3 | tomato | 番茄 | 25 | soda_can | 可乐罐 |
+| 4 | lemon | 柠檬 | 26 | water_bottle | 水瓶 |
+| 5 | pear | 梨 | 27 | bagged_food | 袋装食品 |
+| 6 | grape | 葡萄 | 28 | boxed_food | 盒装食品 |
+| 7 | strawberry | 草莓 | 29 | canned_food | 罐头 |
+| 8 | watermelon | 西瓜 | 30 | jar_food | 玻璃罐 |
+| 9 | cantaloupe | 哈密瓜 | 31 | plastic_wrap | 保鲜膜 |
+| 10 | papaya | 木瓜 | 32 | fresh_box | 保鲜盒 |
+| 11 | avocado | 牛油果 | **33** | **hand** | **手** |
+| 12 | cucumber | 黄瓜 | 34 | mushroom | 蘑菇 |
+| 13 | carrot | 胡萝卜 | 35 | pumpkin | 南瓜 |
+| 14 | potato | 土豆 | 36 | garlic | 大蒜 |
+| 15 | onion | 洋葱 | 37 | ginger | 生姜 |
+| 16 | bell_pepper | 甜椒 | 38 | radish | 萝卜 |
+| 17 | leafy_green | 叶菜 | 39 | sweet_potato | 红薯 |
+| 18 | egg | 鸡蛋 | 40 | walnut | 核桃 |
+| 19 | meat_pack | 包装肉 | 41 | coriander | 香菜 |
+| 20 | fish_pack | 包装鱼 | 42 | okra | 秋葵 |
+| 21 | milk_box | 盒装牛奶 | | | |
+
+### 4.5 标注要求
+
+- 框要紧贴物体边缘，不要留太大空隙
+- 被遮挡的物体也要标（只要还能认出是什么）
+- **hand(ID=33) 必须标**：你的系统用它来判断用户在操作冰箱
+- 每个类别至少 **100~200 张**才有好效果
+- 小物体（如鸡蛋、草莓）如果太小标不准，可以适当放大一点框
+
+### 4.6 LabelImg 快捷键
+
+| 快捷键 | 功能 |
+|--------|------|
+| `W` | 创建矩形框 |
+| `D` | 下一张图 |
+| `A` | 上一张图 |
+| `Ctrl+S` | 保存当前标注 |
+| `Del` | 删除选中的框 |
+
+---
+
+## 步骤 5：训练 YOLOv5
+
+```bash
+# 1. 克隆 YOLOv5（如果没有的话）
+git clone https://github.com/ultralytics/yolov5.git
+cd yolov5
+pip install -r requirements.txt
+
+# 2. 开始训练
+python train.py \
+  --data /path/to/your/dataset/data.yaml \
+  --weights yolov5s.pt \
+  --epochs 100 \
+  --batch-size 16 \
+  --img 704 \
+  --name fridge_model
+```
+
+> `--img 704` 必须和你部署时的模型输入尺寸一致（你代码里 `model_width=704`）。
+
+训练完成后，最好的权重在：
+
+```
+runs/train/fridge_model/weights/best.pt
+```
+
+---
+
+## 步骤 6：导出 RKNN 并部署到 LuckFox
+
+```bash
+# 1. pt → onnx
+python export.py --weights runs/train/fridge_model/weights/best.pt \
+  --img 704 --include onnx
+
+# 2. onnx → rknn（用 RKNN-Toolkit2）
+#    参考 https://github.com/airockchip/rknn-toolkit2
+
+# 3. 把 best.rknn 放到设备上
+scp best.rknn root@<luckfox_ip>:~/model/yolov5.rknn
+
+# 4. 同步更新 labels_list.txt（如果类别有变化）
+scp dataset/classes.txt root@<luckfox_ip>:~/model/labels_list.txt
+```
+
+---
+
+## 附：标注质量检查脚本
+
+标注完后，可以用这个脚本批量查看标注框是否正确：
+
+```bash
+python3 -c "
+import cv2, glob, os
+for img in sorted(glob.glob('dataset/images/train/*.jpg'))[:20]:
+    lbl = img.replace('/images/', '/labels/').replace('.jpg', '.txt')
+    im = cv2.imread(img)
+    h, w = im.shape[:2]
+    if os.path.exists(lbl):
+        for line in open(lbl):
+            c, cx, cy, bw, bh = line.split()
+            x1 = int((float(cx)-float(bw)/2)*w)
+            y1 = int((float(cy)-float(bh)/2)*h)
+            x2 = int((float(cx)+float(bw)/2)*w)
+            y2 = int((float(cy)+float(bh)/2)*h)
+            cv2.rectangle(im,(x1,y1),(x2,y2),(0,255,0),2)
+            cv2.putText(im, c, (x1,y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+    cv2.imshow('check', im)
+    cv2.waitKey(0)
+"
+```
+
+## 附：常见问题
+
+**Q: 标注太慢怎么办？**
+- 可以用 [CVAT](https://cvat.ai/) 或 [Roboflow](https://roboflow.com/) 在线标注，更快
+- Roboflow 还有自动标注功能（用已有模型预标注，人工修正）
+
+**Q: 哪些类别最难标？**
+- `hand` — 手的姿势变化大，需要大量样本
+- 小物体（strawberry, garlic 等）— 框不好画，建议单独多拍一些
+- 相似物体（milk_box vs milk_bottle, soda_can vs canned_food）— 注意区分
+
+**Q: 数据量不够怎么办？**
+- 训练时加数据增强：YOLOv5 默认就会做基本增强
+- 也可以在训练命令加 `--hyp data/hyp.scratch.yaml` 调整增强强度
+
+**Q: LuckFox 上没有 ffmpeg 怎么办？**
+- 在电脑上直接从 RTSP 流截图也行：
+```bash
+ffmpeg -i rtsp://<luckfox_ip>:554/live/0 -vf "fps=2" -q:v 2 ./dataset_raw/fridge_%04d.jpg -frames:v 200
+```
