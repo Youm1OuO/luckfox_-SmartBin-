@@ -108,4 +108,10 @@ tools/rknn-toolkit2/rknn-toolkit2/examples/functions/hybrid_quant/ssd_mobilenet_
 
 
 
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset_raw
+
+
 captures
+
+.codegraph/codegraph.db
