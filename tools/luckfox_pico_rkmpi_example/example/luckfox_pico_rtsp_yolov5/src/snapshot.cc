@@ -1,110 +1,121 @@
 // ============================================================================
 //  snapshot.cc
-//  快照构造 + diff 实现
+//  多帧投票快照实现 — 新业务流程6
 // ============================================================================
 #include "snapshot.h"
 #include "fridge_config.h"
 
+#include <cmath>
+#include <algorithm>
+
 namespace fridge {
 
-const char* change_type_to_str(ChangeType t) {
-    switch (t) {
-        case ChangeType::IN:       return "IN";
-        case ChangeType::OUT:      return "OUT";
-        case ChangeType::RELOCATE: return "RELOCATE";
-    }
-    return "?";
+// ============================================================================
+//  SnapshotBuffer
+// ============================================================================
+
+SnapshotBuffer::SnapshotBuffer(int N, float s) : N_(N), s_(s) {
+    frames_.reserve(N);
+    frame_ids_.reserve(N);
+    hand_flags_.reserve(N);
 }
 
-Snapshot make_snapshot(const std::vector<Track>& tracks, int frame_id) {
-    Snapshot s;
-    s.frame_id = frame_id;
-    s.valid = true;
-    for (const auto& t : tracks) {
-        // 只收食材，手不进快照
-        if (!is_food(t.cls_id)) continue;
-        // 分数太低的 track（多半是 LOST 状态被强行带出来）也不收
-        if (t.score < SNAPSHOT_MIN_SCORE) continue;
-
-        SnapshotItem it;
-        it.track_id = t.track_id;
-        it.cls_id = t.cls_id;
-        it.box = t.box;
-        it.score = t.score;
-        s.items[t.track_id] = it;
-    }
-    return s;
+void SnapshotBuffer::push(const std::vector<Detection>& detections,
+                           int frame_id, bool has_hand) {
+    frames_.push_back(detections);
+    frame_ids_.push_back(frame_id);
+    hand_flags_.push_back(has_hand);
 }
 
-std::vector<ChangeEvent> diff_snapshots(const Snapshot& before, const Snapshot& after) {
-    std::vector<ChangeEvent> events;
+bool SnapshotBuffer::full() const {
+    return (int)frames_.size() >= N_;
+}
 
-    // 没有 before（没有"操作前"基线）→ 不能产生事件
-    // 这种情况发生在系统刚启动还没拿到第一份稳态时
-    if (!before.valid || !after.valid) return events;
+Snapshot SnapshotBuffer::take_snapshot() {
+    Snapshot snap;
+    snap.valid = false;
+    snap.has_hand = false;
+    snap.frame_id = 0;
 
-    // 1) 遍历 before：track_id 不在 after 中 → OUT
-    //    在 after 中 → 比较位置，决定 RELOCATE 或忽略
-    for (const auto& kv : before.items) {
-        int tid = kv.first;
-        const SnapshotItem& bef = kv.second;
+    if (frames_.empty()) return snap;
 
-        auto it = after.items.find(tid);
-        if (it == after.items.end()) {
-            // 拿走
-            ChangeEvent e;
-            e.type = ChangeType::OUT;
-            e.track_id = tid;
-            e.cls_id = bef.cls_id;
-            e.from_box = bef.box;
-            e.to_box = bef.box;
-            e.score = bef.score;
-            e.frame_before = before.frame_id;
-            e.frame_after = after.frame_id;
-            events.push_back(e);
-        } else {
-            const SnapshotItem& aft = it->second;
-            float d = center_distance(bef.box, aft.box);
-            if (d > RELOCATE_MOVE_PIX) {
-                // 整理（位置变化超过阈值）
-                ChangeEvent e;
-                e.type = ChangeType::RELOCATE;
-                e.track_id = tid;
-                // 类别按"after"的，因为 ByteTrack 出生时定的 cls_id 不每帧更新，
-                // 但 after 这一刻 YOLO 给出的判断更新；不过这套实现里 cls_id
-                // 一旦绑定就不变（tracker.cc 里有注释），所以 bef/aft.cls_id
-                // 两者其实相同
-                e.cls_id = aft.cls_id;
-                e.from_box = bef.box;
-                e.to_box = aft.box;
-                e.score = aft.score;
-                e.frame_before = before.frame_id;
-                e.frame_after = after.frame_id;
-                events.push_back(e);
+    // 检查是否有手
+    for (bool h : hand_flags_) {
+        if (h) snap.has_hand = true;
+    }
+
+    // 最后一帧的帧号
+    snap.frame_id = frame_ids_.back();
+
+    // ================================================================
+    //  多帧投票算法
+    //  对每一帧的每个 detection，与投票表中的候选物品做严格身份匹配：
+    //    匹配上 → count++，位置取加权平均
+    //    没匹配上 → 新增到投票表
+    //  N帧结束后，保留 count >= N*s 的物品
+    // ================================================================
+    std::vector<VotingItem> voting_table;
+    int min_count = (int)std::ceil(N_ * s_);
+
+    for (int fi = 0; fi < (int)frames_.size(); fi++) {
+        const auto& dets = frames_[fi];
+        for (const auto& det : dets) {
+            if (det.score < SNAPSHOT_MIN_SCORE) continue;
+
+            // 在投票表中查找匹配（严格身份匹配）
+            bool matched = false;
+            for (auto& vi : voting_table) {
+                // 1. 类别相同
+                if (vi.cls_id != det.cls_id) continue;
+                // 2. 中心距离近
+                if (center_distance(vi.box, det.box) >= IDENTITY_CENTER_DIST) continue;
+                // 3. 面积比差异小
+                if (area_ratio_diff(vi.box, det.box) >= IDENTITY_AREA_RATIO) continue;
+                // 4. IoU 高
+                if (iou(vi.box, det.box) < IDENTITY_IOU_THRESH) continue;
+                // 5. 像素颜色差异（这里没有frame，跳过颜色检查，用前4个条件）
+                //    投票阶段连续帧间颜色几乎不变，前4个条件已经足够
+
+                // 匹配上 → 更新
+                vi.count++;
+                // 位置取加权平均（累积平均）
+                float n = (float)vi.count;
+                vi.box.x1 = vi.box.x1 * (n-1)/n + det.box.x1 / n;
+                vi.box.y1 = vi.box.y1 * (n-1)/n + det.box.y1 / n;
+                vi.box.x2 = vi.box.x2 * (n-1)/n + det.box.x2 / n;
+                vi.box.y2 = vi.box.y2 * (n-1)/n + det.box.y2 / n;
+                if (det.score > vi.best_score) vi.best_score = det.score;
+                matched = true;
+                break;
             }
-            // 距离 <= 阈值 → 没动，跳过（这是绝大多数 track 的情况）
+
+            if (!matched) {
+                // 新增到投票表
+                VotingItem vi;
+                vi.cls_id = det.cls_id;
+                vi.box = det.box;
+                vi.best_score = det.score;
+                vi.count = 1;
+                voting_table.push_back(vi);
+            }
         }
     }
 
-    // 2) 遍历 after：track_id 不在 before 中 → IN
-    for (const auto& kv : after.items) {
-        int tid = kv.first;
-        if (before.items.find(tid) != before.items.end()) continue;
-
-        const SnapshotItem& aft = kv.second;
-        ChangeEvent e;
-        e.type = ChangeType::IN;
-        e.track_id = tid;
-        e.cls_id = aft.cls_id;
-        e.from_box = aft.box;
-        e.to_box = aft.box;
-        e.score = aft.score;
-        e.frame_before = before.frame_id;
-        e.frame_after = after.frame_id;
-        events.push_back(e);
+    // 过滤：只保留 count >= N*s 的物品
+    for (const auto& vi : voting_table) {
+        if (vi.count >= min_count) {
+            snap.items.push_back(vi);
+        }
     }
 
-    return events;
+    snap.valid = true;
+
+    // 重置缓冲区
+    frames_.clear();
+    frame_ids_.clear();
+    hand_flags_.clear();
+
+    return snap;
 }
 
 }  // namespace fridge

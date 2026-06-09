@@ -1,21 +1,22 @@
 // ============================================================================
 //  inventory.cc
-//  本地工作库存实现 — v4 简化版（无【被遮挡】状态）
+//  本地工作库存实现 — 新业务流程6：三态模型
 // ============================================================================
 #include "inventory.h"
 #include "fridge_config.h"
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include "yolov5.h"
 
 namespace fridge {
 
 const char* item_status_to_str(ItemStatus s) {
     switch (s) {
-        case ItemStatus::INVENTORY: return "在库";
-        case ItemStatus::TAKEN:     return "被拿走";
-        case ItemStatus::HELD:      return "遮挡";
+        case ItemStatus::VISIBLE:  return "可见";
+        case ItemStatus::OCCLUDED: return "遮挡";
+        case ItemStatus::OUT:      return "出库";
     }
     return "?";
 }
@@ -28,29 +29,13 @@ int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
     it.cls_id = cls_id;
     it.box = box;
     it.score = score;
-    it.status = ItemStatus::INVENTORY;  // 新入库默认"在库"
+    it.status = ItemStatus::VISIBLE;  // 新入库默认"可见"
     it.created_frame = frame_id;
     it.updated_frame = frame_id;
-    it.last_seen_frame = frame_id;
-    it.stable_frames = 0;
-    it.last_bbox = box;
     it.created_time_ms = time_ms;
+    it.out_time_ms = 0;
     items_[it.item_id] = it;
     return it.item_id;
-}
-
-InventoryItem* InventoryDB::find_by_track(int track_id) {
-    for (auto& kv : items_) {
-        if (kv.second.track_id == track_id) return &kv.second;
-    }
-    return nullptr;
-}
-
-const InventoryItem* InventoryDB::find_by_track(int track_id) const {
-    for (const auto& kv : items_) {
-        if (kv.second.track_id == track_id) return &kv.second;
-    }
-    return nullptr;
 }
 
 InventoryItem* InventoryDB::find_by_item(int item_id) {
@@ -63,44 +48,25 @@ const InventoryItem* InventoryDB::find_by_item(int item_id) const {
     return it == items_.end() ? nullptr : &it->second;
 }
 
-void InventoryDB::update_seen(int item_id, int track_id, const BBox& box,
-                              float score, int frame_id) {
+void InventoryDB::set_status(int item_id, ItemStatus new_status, long long time_ms) {
     auto it = items_.find(item_id);
     if (it == items_.end()) return;
-    it->second.last_bbox = it->second.box;
+    it->second.status = new_status;
+    if (new_status == ItemStatus::OUT) {
+        it->second.out_time_ms = time_ms;
+    } else {
+        it->second.out_time_ms = 0;
+    }
+}
+
+void InventoryDB::update_item(int item_id, int track_id, const BBox& box,
+                               float score, int frame_id) {
+    auto it = items_.find(item_id);
+    if (it == items_.end()) return;
     it->second.track_id = track_id;
     it->second.box = box;
     it->second.score = score;
     it->second.updated_frame = frame_id;
-    it->second.last_seen_frame = frame_id;
-    it->second.stable_frames++;
-}
-
-void InventoryDB::set_status(int item_id, ItemStatus new_status) {
-    auto it = items_.find(item_id);
-    if (it != items_.end()) {
-        it->second.status = new_status;
-    }
-}
-
-void InventoryDB::increment_stable_frames(int item_id) {
-    auto it = items_.find(item_id);
-    if (it != items_.end()) {
-        it->second.stable_frames++;
-    }
-}
-
-void InventoryDB::relocate_item(int item_id, int new_track_id, const BBox& new_box,
-                                float score, int frame_id) {
-    auto it = items_.find(item_id);
-    if (it == items_.end()) return;
-    it->second.last_bbox = it->second.box;
-    it->second.track_id = new_track_id;
-    it->second.box = new_box;
-    it->second.score = score;
-    it->second.updated_frame = frame_id;
-    it->second.last_seen_frame = frame_id;
-    it->second.stable_frames++;
 }
 
 void InventoryDB::remove_item(int item_id) {
@@ -115,34 +81,60 @@ size_t InventoryDB::count_by_status(ItemStatus s) const {
     return n;
 }
 
+void InventoryDB::cleanup_expired(long long now_ms) {
+    std::vector<int> expired;
+    for (const auto& kv : items_) {
+        if (kv.second.status == ItemStatus::OUT && kv.second.out_time_ms > 0) {
+            if (now_ms - kv.second.out_time_ms > OUT_ITEM_EXPIRE_MS) {
+                expired.push_back(kv.first);
+            }
+        }
+    }
+    for (int id : expired) {
+        printf("[INVENTORY] item#%d 出库超时，清除记录\n", id);
+        items_.erase(id);
+    }
+}
+
 void InventoryDB::print(const char* prefix) const {
-    // 先打印在库物品（非 TAKEN/HELD）
+    // 先打印可见物品
     for (const auto& kv : items_) {
         const auto& it = kv.second;
-        if (it.status == ItemStatus::TAKEN || it.status == ItemStatus::HELD) continue;
-        printf("%s  - item#%d cls=%d(%s) [在库] "
-               "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d seen@%d\n",
+        if (it.status != ItemStatus::VISIBLE) continue;
+        printf("%s  - item#%d cls=%d(%s) [可见] "
+               "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
                prefix,
                it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
                it.box.x1, it.box.y1, it.box.x2, it.box.y2,
-               it.score, it.track_id, it.last_seen_frame);
+               it.score, it.track_id);
     }
-    // 再打印 TAKEN 的物品（用空行隔开）
-    bool has_taken = false;
+    // 再打印遮挡物品
     for (const auto& kv : items_) {
-        if (kv.second.status == ItemStatus::TAKEN) { has_taken = true; break; }
+        const auto& it = kv.second;
+        if (it.status != ItemStatus::OCCLUDED) continue;
+        printf("%s  - item#%d cls=%d(%s) [遮挡] "
+               "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
+               prefix,
+               it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
+               it.box.x1, it.box.y1, it.box.x2, it.box.y2,
+               it.score, it.track_id);
     }
-    if (has_taken) {
-        printf("%s  --- 被拿走（临时记录，不上传后台）---\n", prefix);
+    // 再打印出库物品
+    bool has_out = false;
+    for (const auto& kv : items_) {
+        if (kv.second.status == ItemStatus::OUT) { has_out = true; break; }
+    }
+    if (has_out) {
+        printf("%s  --- 出库（临时记录）---\n", prefix);
         for (const auto& kv : items_) {
             const auto& it = kv.second;
-            if (it.status != ItemStatus::TAKEN) continue;
-            printf("%s  - item#%d cls=%d(%s) [被拿走] "
-                   "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d seen@%d\n",
+            if (it.status != ItemStatus::OUT) continue;
+            printf("%s  - item#%d cls=%d(%s) [出库] "
+                   "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
                    prefix,
                    it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
                    it.box.x1, it.box.y1, it.box.x2, it.box.y2,
-                   it.score, it.track_id, it.last_seen_frame);
+                   it.score, it.track_id);
         }
     }
 }
@@ -160,12 +152,12 @@ std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms) 
     bool first = true;
     for (const auto& kv : items_) {
         const auto& it = kv.second;
-        // 排除 TAKEN/HELD，只上报真正"在库"的物品
-        if (it.status == ItemStatus::TAKEN || it.status == ItemStatus::HELD) continue;
+        // 只上报 VISIBLE + OCCLUDED（在冰箱中的物品）
+        if (it.status == ItemStatus::OUT) continue;
         float bw = it.box.x2 - it.box.x1;
         float bh = it.box.y2 - it.box.y1;
         snprintf(buf, sizeof(buf),
-                 "%s{\"local_track_id\":%d,\"category\":\"%s\",\"fine_class\":\"%s\","
+                 "%s{\"item_id\":%d,\"category\":\"%s\",\"fine_class\":\"%s\","
                  "\"status\":\"%s\",\"bbox\":[%.0f,%.0f,%.0f,%.0f]}",
                  first ? "" : ",",
                  it.item_id, coarse_category(it.cls_id), coco_cls_to_name(it.cls_id),

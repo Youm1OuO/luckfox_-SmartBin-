@@ -1,7 +1,7 @@
 // ============================================================================
 //  geometry.h
 //  Bounding Box 几何工具 - IoU、中心点、面积等基础运算
-//  纯头文件实现，给 tracker 和 hand_state 共用
+//  纯头文件实现，给 tracker 和 session 共用
 // ============================================================================
 #ifndef __FRIDGE_GEOMETRY_H
 #define __FRIDGE_GEOMETRY_H
@@ -93,6 +93,31 @@ inline bool is_same_position(const BBox& a, const BBox& b,
                              float dist_thresh = 15.0f,
                              float iou_thresh = 0.7f) {
     return center_distance(a, b) < dist_thresh && iou(a, b) > iou_thresh;
+}
+
+// 物体对角线长度（自适应"附近"距离计算用）
+inline float diagonal(const BBox& b) {
+    return std::sqrt(b.w() * b.w() + b.h() * b.h());
+}
+
+// 自适应归一化中心距离（用于"附近"判定）
+// 用较小物体的对角线做分母，天然适配大小物品混合的场景：
+//   < 0.5  → 几乎重叠
+//   0.5~1.0 → 紧挨着
+//   > 1.0  → 比较远
+inline float normalized_nearby_distance(const BBox& a, const BBox& b) {
+    float d_min = std::min(diagonal(a), diagonal(b));
+    if (d_min <= 0.0f) return 999.0f;
+    return center_distance(a, b) / d_min;
+}
+
+// 面积比差异（用于严格身份匹配第3条件）
+// 结果在 [0, 1] 之间：0 = 面积完全一样，1 = 一个面积为0
+inline float area_ratio_diff(const BBox& a, const BBox& b) {
+    float aa = a.area(), ab = b.area();
+    float larger = std::max(aa, ab);
+    if (larger <= 0.0f) return 0.0f;
+    return std::abs(aa - ab) / larger;
 }
 
 }  // namespace fridge

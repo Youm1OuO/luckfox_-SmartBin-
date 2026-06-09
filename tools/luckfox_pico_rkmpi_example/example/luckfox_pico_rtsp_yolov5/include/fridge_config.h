@@ -137,79 +137,80 @@ constexpr int TRACK_BUFFER_FRAMES = 60;
 constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 
 // =========================================================================
-//  手部状态机参数（hand_state.* 模块用，当前未在 main.cc 调用，保留备用）
-// =========================================================================
-// 手框与某个物品框的 IoU 高于此值视为"贴住"
-constexpr float HAND_OBJ_IOU_HIGH = 0.40f;
-// 手框与某个物品框的 IoU 低于此值视为"分离"
-// (HAND_OBJ_IOU_HIGH > IoU > HAND_OBJ_IOU_LOW 是灰区，状态保持)
-constexpr float HAND_OBJ_IOU_LOW  = 0.20f;
-
-// 状态从"疑似"升级到"确定"需要连续保持的帧数（防抖动）
-constexpr int CONFIRM_FRAMES = 3;
-
-// 在确认"拿起"事件时，回看过去多少帧的物品类别做投票
-// (拿起前的瞬间物品是完整可见的，识别更可靠)
-constexpr int IDENTIFY_LOOKBACK = 5;
-
-
-// =========================================================================
-//  稳态切片 + 会话事件（stability / session 模块）
-// -------------------------------------------------------------------------
-//  这是当前 main.cc 实际使用的业务路径。核心思想：
-//    把"事件"定义成"两个稳态之间发生了什么"，
-//    每帧只判断"现在是稳态还是扰动态"，扰动态期间不更新库存，
-//    扰动 → 稳态确认时，对前后两份 track 快照做 diff，得到一批事件。
+//  稳态切片 + 会话事件
 // =========================================================================
 
-// 进入"稳态"前需要连续多少帧"看起来稳"才算确认
-// 10 FPS 下 6 帧 ≈ 0.6 秒，权衡延迟和稳定性
-constexpr int STABLE_CONFIRM_FRAMES = 6;
-
-// 一旦发现任何"扰动信号"立刻进入扰动态（不需要连续多帧），
-// 因为漏判扰动态的代价（误判事件）远大于多扰动一次的代价（多等 0.6 秒）。
-// 这里保留一个常量是为了未来若需要去抖动可以调，目前默认 1 帧即生效。
-constexpr int DISTURBED_CONFIRM_FRAMES = 1;
-
-// 物品 track 的中心点，过去多少帧位移在 STABLE_MOVE_PIX 之内才算"不动"
-// 用于稳态判定的第二个条件（所有食材 track 都必须满足"不动"）
-constexpr int STABLE_MOTION_WINDOW = 5;
-// 物品 track 中心点位移阈值（像素），<= 该值视为"不动"
-// 720x480 下 8 像素相当于物体中心点波动不超过 ~1%，足够松也足够严
-constexpr float STABLE_MOVE_PIX = 8.0f;
-
-// 整理事件的位置变化阈值：稳态前后同一 track_id 的中心点位移超过此值
-// 才算是"挪过位"，否则当作"没动"。
-// 比 STABLE_MOVE_PIX 大一些，避免抖动被当成 RELOCATE
-constexpr float RELOCATE_MOVE_PIX = 30.0f;
-
-// 进入稳态时所有 track 必须满足的最小本帧检测分数（防止 LOST 状态的 track
-// 被误当作"还在画面里"）。低于此分数的 track 不计入稳态快照。
-constexpr float SNAPSHOT_MIN_SCORE = 0.3f;
-
 // =========================================================================
-//  新业务流程3：身份匹配阈值（严格）
+//  新业务流程6：严格原位身份匹配阈值
 // -------------------------------------------------------------------------
 //  判断"这个新检测到的东西，是不是库存里那个旧东西"。
-//  三个条件全部满足才算同一个物品：中心距离 + IoU + 颜色差异。
+//  原位匹配只用于判断"位置基本没变"：
+//    1. 类别相同
+//    2. 中心距离 < IDENTITY_CENTER_DIST
+//    3. 面积比差异 < IDENTITY_AREA_RATIO
+//    4. IoU > IDENTITY_IOU_THRESH
+//  注意：整理/移动不允许只靠这里的外观相似直接确认。
 // =========================================================================
-constexpr float IDENTITY_CENTER_DIST = 15.0f;   // 中心点距离阈值（像素）
-constexpr float IDENTITY_IOU_THRESH  = 0.7f;    // IoU 阈值
-constexpr float IDENTITY_COLOR_DIFF  = 20.0f;   // 平均 RGB 差异阈值（每通道 0~255）
+constexpr float IDENTITY_CENTER_DIST  = 15.0f;   // ε1: 中心距离阈值（像素）
+constexpr float IDENTITY_AREA_RATIO   = 0.2f;    // ε2: 面积比差异阈值 (|A-B|/max(A,B))
+constexpr float IDENTITY_IOU_THRESH   = 0.5f;    // ε3: IoU 阈值（从0.7降到0.5，容忍bbox微变）
+constexpr float IDENTITY_COLOR_DIFF   = 20.0f;   // 像素颜色差异阈值（每通道 0~255）
 
 // =========================================================================
-//  新业务流程3：遮挡检测阈值（宽松）
+//  新业务流程6：整理 / 移动判定阈值
 // -------------------------------------------------------------------------
-//  判断"消失的物品是不是被别人挡住了"。只需要空间重叠，不需要同类同色。
+//  reid_match 只是外观输入，confirmed_relocation 还必须有移动/手/HELD
+//  等 OperationContext 证据，并且候选唯一性足够好。
 // =========================================================================
-constexpr float OCCLUDE_OVERLAP_THRESH = 0.3f;
+constexpr float RELOCATION_REID_MIN          = 0.70f;
+constexpr float RELOCATION_REID_STRONG       = 0.82f;
+constexpr float RELOCATION_REID_MARGIN       = 0.10f;
+constexpr float RELOCATION_EVIDENCE_WEAK     = 0.25f;
+constexpr float RELOCATION_EVIDENCE_STRONG   = 0.75f;
+constexpr int   PENDING_RELOCATION_CONFIRM_FRAMES = 1;
+constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
 
 // =========================================================================
-//  新业务流程3：被遮挡物品的超时倍数
-// -------------------------------------------------------------------------
-//  OCCLUDED 物品比 VISIBLE 物品给更长的超时宽限期（乘以此倍数）。
+//  新业务流程6：多帧快照投票
 // =========================================================================
-constexpr int OCCLUDED_GRACE_MULTIPLIER = 5;
+constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）
+constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（60%，即3帧中至少出现2次）
+constexpr float SNAPSHOT_MIN_SCORE    = 0.3f;     // 最低检测分数（低于此分数的不进快照）
+
+// =========================================================================
+//  新业务流程6：自适应"附近"距离阈值
+// -------------------------------------------------------------------------
+//  normalized_nearby_distance = center_distance / min(对角线A, 对角线B)
+//  小于此值判定为"附近"
+// =========================================================================
+constexpr float NEARBY_DISTANCE_THRESH = 1.0f;  // 设计文档建议值，可微调
+
+// =========================================================================
+//  新业务流程6：OperationContext / HELD 证据相关
+// =========================================================================
+// 连续多少帧没有检测到手 → 确认手离开画面
+constexpr int HAND_LEAVE_FRAMES  = 5;
+// 手持续多少帧才认为是长时间操作，长时间操作只提高整理证据权重
+constexpr int HAND_LONG_PRESENT_FRAMES = 12;
+// 手与物品重叠到什么程度，才作为 candidate_held 证据
+constexpr float HELD_HAND_OVERLAP_THRESH = 0.30f;
+// candidate_held 连续不可见多少帧后，建立 HELD 代理证据
+constexpr int HELD_CONFIRM_FRAMES = 2;
+// 物体 track 移动超过自身对角线多少比例，才作为移动证据
+constexpr float TRACK_MOVE_DISTANCE_RATIO = 0.50f;
+
+// =========================================================================
+//  新业务流程6：出库物品过期
+// -------------------------------------------------------------------------
+//  OUT 状态的物品超过此时间仍未重新出现 → 确认出库，从记录中清除
+// =========================================================================
+constexpr long long OUT_ITEM_EXPIRE_MS = 600000LL;  // 10分钟
+
+// =========================================================================
+//  帧尺寸（用于手部扩展等计算）
+// =========================================================================
+constexpr float FRAME_W = 1280.0f;
+constexpr float FRAME_H = 720.0f;
 
 }  // namespace fridge
 

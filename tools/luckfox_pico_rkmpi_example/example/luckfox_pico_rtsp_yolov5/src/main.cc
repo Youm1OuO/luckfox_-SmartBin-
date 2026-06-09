@@ -1,3 +1,15 @@
+// ============================================================================
+//  main.cc
+//  冰箱视觉系统 — 新业务流程6 主循环
+//
+//  每帧流水线：
+//    1. 摄像头采集 + YOLO推理 + 坐标映射
+//    2. ByteTrack-Lite 每帧更新
+//    3. OperationContext 收集手/HELD/ByteTrack移动证据
+//    4. 每帧推入 SnapshotBuffer（3帧投票缓冲区，快照含 has_hand 标记）
+//    5. 攒满3帧 → 生成 Snapshot → 送入 SessionManager 统一裁决
+//    6. 事件上报 + 画面绘制 + RTSP推流
+// ============================================================================
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -23,69 +35,57 @@
 #include "opencv2/imgproc/imgproc.hpp"
 
 // ===== 冰箱视觉系统模块 =====
-#include "fridge_config.h"     // 全局配置（类别 id、阈值）
-#include "geometry.h"          // BBox 几何工具
-#include "tracker.h"           // ByteTrack-Lite 跟踪器
-#include "snapshot.h"          // 稳态快照 + diff
-#include "stability.h"         // 稳态监控状态机
-#include "session.h"           // 会话管理器（编排 stability + diff + inventory）
-#include "inventory.h"         // 本地工作库存
-#include "cloud_uploader.h"    // 端云协同：异步上报上传器
-// hand_state.h 暂时保留备用（"主动确认/撤销"等扩展），当前业务路径不再调用
+#include "fridge_config.h"
+#include "geometry.h"
+#include "tracker.h"
+#include "snapshot.h"
+#include "session.h"
+#include "inventory.h"
+#include "cloud_uploader.h"
 
-// 1280*720, 1920*1080 
+// 1280*720, 1920*1080
 #define DISP_WIDTH  1280
-#define DISP_HEIGHT 720 
+#define DISP_HEIGHT 720
 
 // disp size
 int width    = DISP_WIDTH;
 int height   = DISP_HEIGHT;
 
 // model size
-// 注意：这两个值必须与 .rknn 模型的实际输入尺寸一致！
-// 640, 704, 960
-int model_width = 640;
-int model_height = 640;	
+int model_width = 704;
+int model_height = 704;
 float scale ;
 int leftPadding ;
 int topPadding  ;
 
 cv::Mat letterbox(cv::Mat input)
 {
-	float scaleX = (float)model_width  / (float)width; 
-	float scaleY = (float)model_height / (float)height; 
+	float scaleX = (float)model_width  / (float)width;
+	float scaleY = (float)model_height / (float)height;
 	scale = scaleX < scaleY ? scaleX : scaleY;
-	
+
 	int inputWidth   = (int)((float)width * scale);
 	int inputHeight  = (int)((float)height * scale);
 
 	leftPadding = (model_width  - inputWidth) / 2;
-	topPadding  = (model_height - inputHeight) / 2;	
-	
+	topPadding  = (model_height - inputHeight) / 2;
 
 	cv::Mat inputScale;
-    cv::resize(input, inputScale, cv::Size(inputWidth,inputHeight), 0, 0, cv::INTER_LINEAR);	
-	// 画布尺寸必须等于模型输入(model_width x model_height). 之前硬编码 640 是 bug:
-	// 当 model_width=320 时, memcpy 只会取画布左上 320x320 区域, 等于让模型只看到
-	// 摄像头画面缩到画布左上的一小块, 周围全是底色, 自然识别不出.
-	// padding 颜色也由原本的纯黑(0,0,0) 改回 yolov5 惯例的 (114,114,114).
+    cv::resize(input, inputScale, cv::Size(inputWidth,inputHeight), 0, 0, cv::INTER_LINEAR);
 	cv::Mat letterboxImage(model_height, model_width, CV_8UC3, cv::Scalar(114, 114, 114));
     cv::Rect roi(leftPadding, topPadding, inputWidth, inputHeight);
     inputScale.copyTo(letterboxImage(roi));
 
-	return letterboxImage; 	
+	return letterboxImage;
 }
 
-void mapCoordinates(int *x, int *y) {	
+void mapCoordinates(int *x, int *y) {
 	int mx = *x - leftPadding;
 	int my = *y - topPadding;
 
 	int rx = (int)((float)mx / scale);
 	int ry = (int)((float)my / scale);
 
-	// 把映射后的坐标 clamp 到原图范围内.
-	// 没有 clamp 时, 落在 letterbox padding 区域里的检测框会得到负坐标
-	// 或超出 (width, height) 的坐标, 导致后续画框/库存匹配出现 (-119, -67) 这种异常值.
 	if (rx < 0)      rx = 0;
 	if (ry < 0)      ry = 0;
 	if (rx > width)  rx = width;
@@ -100,75 +100,63 @@ int main(int argc, char *argv[]) {
   // 抑制 Rockchip MPP 硬件编码器的调试日志
   setenv("MPP_LOG_LEVEL", "1", 1);
   setenv("mpi_debug", "0", 1);
-  // 如果环境变量不生效，直接把 stderr 重定向到 /dev/null
-  // 我们的 printf 走 stdout 不受影响，只有 MPP 等库的 fprintf(stderr) 被静默
   freopen("/dev/null", "w", stderr);
 
   system("RkLunch-stop.sh");
-  system("rm -rf ./captures/*");   // 清空上次的截图，避免调试时越积越多
-  system("mkdir -p ./captures");   // 放入截图本地保存目录（无论云端通不通都存一份）
-	RK_S32 s32Ret = 0; 
-	int sX,sY,eX,eY; 
-		
+  system("rm -rf ./captures/*");
+  system("mkdir -p ./captures");
+
+	RK_S32 s32Ret = 0;
+	int sX,sY,eX,eY;
+
 	// Rknn model
 	char text[16];
-	rknn_app_context_t rknn_app_ctx;	
+	rknn_app_context_t rknn_app_ctx;
 	object_detect_result_list od_results;
     int ret;
 	const char *model_path = "./model/yolov5.rknn";
-    memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));	
+    memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
 	init_yolov5_model(model_path, &rknn_app_ctx);
 	printf("init rknn model success!\n");
 	init_post_process();
 
-	//h264_frame	
-	VENC_STREAM_S stFrame;	
+	//h264_frame
+	VENC_STREAM_S stFrame;
 	stFrame.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S));
 	RK_U64 H264_PTS = 0;
-	RK_U32 H264_TimeRef = 0; 
+	RK_U32 H264_TimeRef = 0;
 	VIDEO_FRAME_INFO_S stViFrame;
-	
+
 	// Create Pool
 	MB_POOL_CONFIG_S PoolCfg;
 	memset(&PoolCfg, 0, sizeof(MB_POOL_CONFIG_S));
 	PoolCfg.u64MBSize = width * height * 3 ;
 	PoolCfg.u32MBCnt = 1;
 	PoolCfg.enAllocType = MB_ALLOC_TYPE_DMA;
-	//PoolCfg.bPreAlloc = RK_FALSE;
 	MB_POOL src_Pool = RK_MPI_MB_CreatePool(&PoolCfg);
-	printf("Create Pool success !\n");	
+	printf("Create Pool success !\n");
 
-	// Get MB from Pool 
+	// Get MB from Pool
 	MB_BLK src_Blk = RK_MPI_MB_GetMB(src_Pool, width * height * 3, RK_TRUE);
-	
+
 	// Build h264_frame
 	VIDEO_FRAME_INFO_S h264_frame;
 	h264_frame.stVFrame.u32Width = width;
 	h264_frame.stVFrame.u32Height = height;
 	h264_frame.stVFrame.u32VirWidth = width;
 	h264_frame.stVFrame.u32VirHeight = height;
-	h264_frame.stVFrame.enPixelFormat =  RK_FMT_RGB888; 
+	h264_frame.stVFrame.enPixelFormat =  RK_FMT_RGB888;
 	h264_frame.stVFrame.u32FrameFlag = 160;
 	h264_frame.stVFrame.pMbBlk = src_Blk;
 	unsigned char *data = (unsigned char *)RK_MPI_MB_Handle2VirAddr(src_Blk);
 	cv::Mat frame(cv::Size(width,height),CV_8UC3,data);
 
 	// rkaiq init
-	RK_BOOL multi_sensor = RK_FALSE;	
+	RK_BOOL multi_sensor = RK_FALSE;
 	const char *iq_dir = "/etc/iqfiles";
 	rk_aiq_working_mode_t hdr_mode = RK_AIQ_WORKING_MODE_NORMAL;
-	//hdr_mode = RK_AIQ_WORKING_MODE_ISP_HDR2;
 	SAMPLE_COMM_ISP_Init(0, hdr_mode, multi_sensor, iq_dir);
 	SAMPLE_COMM_ISP_Run(0);
-	// 摄像头物理倒装, 需要把画面旋转 180°.
-	//
-	// 之前用过 SAMPLE_COMM_ISP_SetMirrorFlip(0, 1, 1) 走 ISP/sensor 通路, 但是:
-	//   1. 不是所有 sensor 都开放 mirror/flip 寄存器, 调了不报错也不生效;
-	//   2. 即便生效, 也只是改 sensor 输出, 排查问题时不直观.
-	// 改成软件翻转最稳: 在拿到 BGR 帧后做 cv::flip(frame, frame, -1).
-	// 一帧 720x480 BGR 大约 1ms, 没什么开销, 而且 YOLO 推理跟显示用的是同一份
-	// 画面, 翻转一次全部生效 (因为 letterbox 输入也来自 frame).
-	// 实际翻转见下面 while 循环里 cv::cvtColor 之后那一行.
 
 	// rkmpi init
 	if (RK_MPI_SYS_Init() != RK_SUCCESS) {
@@ -176,14 +164,14 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-	// rtsp init	
+	// rtsp init
 	rtsp_demo_handle g_rtsplive = NULL;
 	rtsp_session_handle g_rtsp_session;
 	g_rtsplive = create_rtsp_demo(554);
 	g_rtsp_session = rtsp_new_session(g_rtsplive, "/live/0");
 	rtsp_set_video(g_rtsp_session, RTSP_CODEC_ID_VIDEO_H264, NULL, 0);
 	rtsp_sync_video_ts(g_rtsp_session, rtsp_get_reltime(), rtsp_get_ntptime());
-	
+
 	// vi init
 	vi_dev_init();
 	vi_chn_init(0, width, height);
@@ -192,56 +180,42 @@ int main(int argc, char *argv[]) {
 	RK_CODEC_ID_E enCodecType = RK_VIDEO_ID_AVC;
 	venc_init(0, width, height, enCodecType);
 
-	printf("venc init success\n");	
+	printf("venc init success\n");
 
 	// ============================================================
-	//  冰箱视觉系统：初始化跟踪器 + 会话管理器
-	//  会话管理器内部封装了：稳态监控 + 快照 diff + 工作库存
+	//  业务模块初始化
 	// ============================================================
 	fridge::ByteTrackLite tracker;
 	fridge::SessionManager session;
+	fridge::SnapshotBuffer snap_buffer(fridge::SNAPSHOT_N, fridge::SNAPSHOT_S);
+	fridge::CloudUploader cloud;
+	cloud.start();
 	int g_frame_id = 0;
 
 	// ============================================================
-	//  端云协同：异步上报上传器
-	//   出入库事件 ITEM_IN/OUT/MOVED → POST /events/item
-	//   放入(ITEM_IN) 带物品框内截图(crop_image)，交给后端决定要不要
-	//   跑云端 AI 读标签/重识别。上传走后台线程，不阻塞推理。
-	// ============================================================
-	fridge::CloudUploader cloud;
-	cloud.start();
-
-	// ============================================================
 	//  开关门检测（全局亮度阈值法）
-	//   冰箱关门 → 画面变黑 → 整帧平均灰度暴跌
-	//   平均灰度 < DOOR_DARK_THRESH 视为关门
-	//   关门瞬间把当前库存打包上传后台（这里先打印 JSON，后续接 HTTP/MQTT）
 	// ============================================================
-	bool door_open = true;        // 假设启动时门是开的
-	const double DOOR_DARK_THRESH = 50.0;   // 平均灰度阈值，按实际冰箱调
-	int dark_streak = 0;          // 连续多少帧暗
-	int bright_streak = 0;        // 连续多少帧亮
-	const int DOOR_CONFIRM = 5;   // 连续 5 帧确认开/关，防抖
+	bool door_open = true;
+	const double DOOR_DARK_THRESH = 50.0;
+	int dark_streak = 0;
+	int bright_streak = 0;
+	const int DOOR_CONFIRM = 5;
 
   	while(1)
-	{	
+	{
 		// get vi frame
 		h264_frame.stVFrame.u32TimeRef = H264_TimeRef++;
-		h264_frame.stVFrame.u64PTS = TEST_COMM_GetNowUs(); 
+		h264_frame.stVFrame.u64PTS = TEST_COMM_GetNowUs();
 		s32Ret = RK_MPI_VI_GetChnFrame(0, 0, &stViFrame, -1);
 		if(s32Ret == RK_SUCCESS)
 		{
-			void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame.stVFrame.pMbBlk);	
+			void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame.stVFrame.pMbBlk);
 
-			// VI 给的是 YUV420SP, 直接转换到 frame 的 buffer (frame 已绑定到 data 上).
-			// 之前还多了一个临时 bgr Mat + resize 一次, 但 bgr 和 frame 实际是同一块
-			// 内存 + 同样尺寸, resize 是冗余且 src=dst 时 OpenCV 行为未定义, 现已去掉.
 			cv::Mat yuv420sp(height + height / 2, width, CV_8UC1, vi_data);
 			cv::cvtColor(yuv420sp, frame, cv::COLOR_YUV420sp2BGR);
 
 			// ============================================================
 			//  开关门检测：YUV420SP 的前 width*height 字节就是 Y(亮度)分量
-			//  直接对 Y 求平均，零额外开销（不用转灰度）
 			// ============================================================
 			{
 				cv::Mat y_plane(height, width, CV_8UC1, vi_data);
@@ -252,29 +226,23 @@ int main(int argc, char *argv[]) {
 				else          { bright_streak++; dark_streak = 0; }
 
 				if (door_open && dark_streak >= DOOR_CONFIRM) {
-					// 开 → 关
 					door_open = false;
 					printf("\n\033[1;33m[DOOR]\033[0m 关门 (亮度=%.0f), 上传库存:\n", mean_y);
-					RK_U64 ts = TEST_COMM_GetNowUs() / 1000;  // 毫秒
+					RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
 					std::string json = session.inventory().to_json("luckfox", (long long)ts);
 					printf("%s\n", json.c_str());
 				} else if (!door_open && bright_streak >= DOOR_CONFIRM) {
-					// 关 → 开
 					door_open = true;
 					printf("\n\033[1;33m[DOOR]\033[0m 开门 (亮度=%.0f)\n", mean_y);
-					// 新业务流程3：开门时从后台获取库存并初始化
-					// TODO: 替换为实际的 HTTP API 调用获取后台库存
-					// 目前传空 vector，走兜底 baseline 逻辑
 					if (!session.has_backend()) {
 						std::vector<fridge::InventoryItem> backend_items;
-						session.init_from_backend(backend_items, frame);
+						session.init_from_backend(backend_items);
 					}
 				}
 			}
 
-			// 关门状态下，画面是黑的，不跑 YOLO（省算力，也避免黑画面误检）
+			// 关门状态下，跳过识别
 			if (!door_open) {
-				// 直接编码黑画面推流，跳过识别
 				memcpy(data, frame.data, width * height * 3);
 				RK_MPI_VENC_SendFrame(0, &h264_frame, -1);
 				s32Ret = RK_MPI_VENC_GetStream(0, &stFrame, -1);
@@ -288,32 +256,30 @@ int main(int argc, char *argv[]) {
 					RK_MPI_VENC_ReleaseStream(0, &stFrame);
 				}
 				RK_MPI_VI_ReleaseChnFrame(0, 0, &stViFrame);
-				continue;   // 跳过本帧后续所有识别逻辑
+				continue;
 			}
 
-			// 摄像头物理倒装, 这里直接对原图做 180° 旋转 (= 上下+左右各翻一次).
-			// flipCode = -1 表示同时翻 X 和 Y 轴.
-			// 必须在 letterbox/inference 之前做, 这样 YOLO 看到的是正向画面,
-			// 检测框坐标也就直接对齐到旋转后的 frame 上, 不需要再二次映射.
+			// 摄像头物理倒装, 软件翻转 180°
 			cv::flip(frame, frame, -1);
 
-			//letterbox
-			cv::Mat letterboxImage = letterbox(frame);	
-			// 颜色顺序修正：rknn 模型(转换时 quant_img_RGB2BGR=False)期望 RGB，
-			// 而 frame 是 BGR。开关在 fridge_config.h::INFER_INPUT_BGR2RGB。
-			// 注意：只转送进模型的这份副本，不影响 frame 本身(推流/画框/截图仍用原 frame)。
+			// ============================================================
+			//  YOLO 推理
+			// ============================================================
+			cv::Mat letterboxImage = letterbox(frame);
 			if (fridge::INFER_INPUT_BGR2RGB) {
 				cv::cvtColor(letterboxImage, letterboxImage, cv::COLOR_BGR2RGB);
 			}
-			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data, model_width*model_height*3);		
+			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data,
+			       model_width*model_height*3);
 			inference_yolov5_model(&rknn_app_ctx, &od_results);
 
 			// ============================================================
-			//  Step A: 把 RKNN 的 detection 结果转成跟踪器需要的格式
-			//          同时把 letterbox 坐标映射回原图坐标
+			//  坐标映射：letterbox → 原图坐标
 			// ============================================================
 			std::vector<fridge::Detection> detections;
+			std::vector<fridge::BBox> hand_boxes;
 			detections.reserve(od_results.count);
+
 			for (int i = 0; i < od_results.count; i++) {
 				const object_detect_result& r = od_results.results[i];
 				int x1 = r.box.left;
@@ -328,156 +294,114 @@ int main(int argc, char *argv[]) {
 				d.score = r.prop;
 				d.cls_id = r.cls_id;
 				detections.push_back(d);
+
+				if (fridge::is_hand(r.cls_id)) {
+					hand_boxes.push_back(d.box);
+				}
 			}
 
 			// ============================================================
-			//  Step B: 跑 ByteTrack-Lite，得到带 track_id 的目标列表
+			//  获取时间戳（手检测和事件上报都需要）
+			// ============================================================
+			RK_U64 now_us = TEST_COMM_GetNowUs();
+			long long now_ms = (long long)(now_us / 1000);
+
+			// ============================================================
+			//  ByteTrack 每帧更新
 			// ============================================================
 			g_frame_id++;
 			const std::vector<fridge::Track>& tracks =
 				tracker.update(detections, g_frame_id);
 
-			// 注: 之前这里有"每 10 帧打印一次 track 列表"的调试日志,
-			//     已删除. 检测框直接看 RTSP 视频画面更直观,
-			//     终端只保留 SESSION/EVENT/Inventory 这种业务输出, 信号噪声比更高.
+			// ============================================================
+			//  OperationContext：每帧记录手、HELD代理、ByteTrack移动证据
+			//  注意：这里不直接产生库存事件，库存只由后面的稳定快照diff裁决。
+			// ============================================================
+			session.update_hand(hand_boxes, tracks, g_frame_id, now_ms);
 
 			// ============================================================
-			//  Step C: 跑会话管理器
-			//   - 内部判稳/扰动；
-			//   - STABLE→DISTURBED 时冻结 before；
-			//   - DISTURBED→STABLE 时取 after，diff，应用到本地工作库存。
-			//   多数帧没有事件产生，只在稳态切换那一刻才有。
+			//  快照缓冲：每帧都推入 SnapshotBuffer（含手标志）
+			//  设计要点：手在画面期间也推入，但快照 has_hand 标记为 true，
+			//  SessionManager 会跳过有手快照，不把它作为库存对比基准。
+			//  这样手离开后的第一份无手快照能正常进入对比流程。
 			// ============================================================
-			long long now_ms = (long long)(TEST_COMM_GetNowUs() / 1000);
-			fridge::SettlementResult settlement = session.update(tracks, g_frame_id, frame, now_ms);
+			bool has_hand = !hand_boxes.empty();
 
-			// ============================================================
-			//  Step C.5: 出入库事件上报 → POST /events/item
-			//   放入(ITEM_IN) 带物品框内截图(crop_image)，交给后端决定要不要
-			//   跑云端 AI 读标签/重识别；取出(ITEM_OUT)、整理(ITEM_MOVED) 不带图。
-			//   上报走后台线程异步发送，不阻塞推理。
-			//   注意：frame 此时已翻转过(正向)，bbox 坐标与之对齐，可直接裁剪。
-			//   bbox 统一转成《端侧返回数据格式.txt》要求的 [x, y, w, h]。
-			// ============================================================
-			auto crop_jpeg = [&](const fridge::BBox& b,
-			                     int& ox, int& oy, int& ow, int& oh,
-			                     std::vector<unsigned char>& out_jpeg) -> bool {
-				int rx1 = (int)b.x1 - 8, ry1 = (int)b.y1 - 8;
-				int rx2 = (int)b.x2 + 8, ry2 = (int)b.y2 + 8;
-				if (rx1 < 0) rx1 = 0;
-				if (ry1 < 0) ry1 = 0;
-				if (rx2 > width)  rx2 = width;
-				if (ry2 > height) ry2 = height;
-				ox = rx1; oy = ry1; ow = rx2 - rx1; oh = ry2 - ry1;
-				if (ow < 8 || oh < 8) return false;
-				cv::Rect roi(rx1, ry1, ow, oh);
-				cv::Mat crop = frame(roi).clone();   // clone：脱离主缓冲，安全交给上传线程
-				// 颜色修正：本项目里 frame 的通道顺序与编码链路"将错就错"地匹配
-				// (BGR 数据按 RGB 编码推流, 播放端又还原)。但 cv::imencode 严格
-				// 按 BGR 存 JPEG, 直接存会导致红蓝互换(可乐罐变蓝)。所以这里先把
-				// R/B 通道交换一次, 存出来的 JPEG 颜色才正常。
-				cv::cvtColor(crop, crop, cv::COLOR_BGR2RGB);
-				std::vector<int> enc_param = {cv::IMWRITE_JPEG_QUALITY, 80};
-				return cv::imencode(".jpg", crop, out_jpeg, enc_param);
-			};
-
-			for (const auto& ev : settlement.events) {
-				fridge::UploadJob job;
-				switch (ev.kind) {
-					case fridge::EventKind::IN:           job.kind = fridge::UploadKind::ITEM_IN;    break;
-					case fridge::EventKind::OUT:          job.kind = fridge::UploadKind::ITEM_OUT;   break;
-					case fridge::EventKind::MOVED:        job.kind = fridge::UploadKind::ITEM_MOVED; break;
-					case fridge::EventKind::IMAGE_UPDATE: job.kind = fridge::UploadKind::ITEM_IN;    break;
+			// 只把食物检测推入快照缓冲区（不含手）
+			std::vector<fridge::Detection> food_dets;
+			for (const auto& d : detections) {
+				if (fridge::is_food(d.cls_id) && d.score >= fridge::SNAPSHOT_MIN_SCORE) {
+					food_dets.push_back(d);
 				}
-				job.local_track_id = ev.item_id;
-				job.category       = fridge::coarse_category(ev.cls_id);
-				job.confidence     = ev.score;
-				job.timestamp_ms   = now_ms;
-				// IMAGE_UPDATE：异步线程截取稳定截图（不阻塞主循环）
-				if (ev.kind == fridge::EventKind::IMAGE_UPDATE && ev.crop_valid) {
-					// 主线程：clone ROI（极快，小区域内存拷贝）
-					int rx1 = std::max(0, (int)ev.box.x1 - 8);
-					int ry1 = std::max(0, (int)ev.box.y1 - 8);
-					int rx2 = std::min(width, (int)ev.box.x2 + 8);
-					int ry2 = std::min(height, (int)ev.box.y2 + 8);
-					if (rx2 > rx1 && ry2 > ry1) {
-						cv::Mat crop_clone = frame(cv::Rect(rx1, ry1, rx2 - rx1, ry2 - ry1)).clone();
-						int item_id = ev.item_id;
-						int cls_id = ev.cls_id;
-						// detached 线程：编码 + 保存 + 入队（不阻塞主循环）
-						std::thread([crop_clone, item_id, cls_id, &cloud, now_ms, rx1, ry1, rx2, ry2]() {
-							cv::cvtColor(crop_clone, crop_clone, cv::COLOR_BGR2RGB);
-							std::vector<unsigned char> jpeg;
-							std::vector<int> param = {cv::IMWRITE_JPEG_QUALITY, 80};
-							cv::imencode(".jpg", crop_clone, jpeg, param);
+			}
+			snap_buffer.push(food_dets, g_frame_id, has_hand);
 
-							char fname[160];
-							snprintf(fname, sizeof(fname),
-							         "./captures/item%d_%s_stable.jpg",
-							         item_id, coco_cls_to_name(cls_id));
-							FILE* fp = fopen(fname, "wb");
-							if (fp) {
-								fwrite(jpeg.data(), 1, jpeg.size(), fp);
-								fclose(fp);
-								printf("\033[1;36m[CAPTURE]\033[0m 稳定截图已保存: %s "
-								       "(%zu 字节)\n", fname, jpeg.size());
-							}
+			if (snap_buffer.full()) {
+				fridge::Snapshot snap = snap_buffer.take_snapshot();
+				fridge::SettlementResult res = session.push_snapshot(snap, frame);
 
-							fridge::UploadJob job2;
-							job2.kind = fridge::UploadKind::ITEM_IN;
-							job2.local_track_id = item_id;
-							job2.category = fridge::coarse_category(cls_id);
-							job2.confidence = 0;
-							job2.x = rx1; job2.y = ry1;
-							job2.w = rx2 - rx1; job2.h = ry2 - ry1;
-							job2.timestamp_ms = now_ms;
-							job2.jpeg = std::move(jpeg);
-							cloud.enqueue(job2);
-						}).detach();
+				// 处理快照对比产生的事件：上报云端
+				for (const auto& ev : res.events) {
+					fridge::UploadJob job;
+					switch (ev.kind) {
+						case fridge::EventKind::IN:    job.kind = fridge::UploadKind::ITEM_IN;    break;
+						case fridge::EventKind::OUT:   job.kind = fridge::UploadKind::ITEM_OUT;   break;
+						case fridge::EventKind::MOVED: job.kind = fridge::UploadKind::ITEM_MOVED; break;
 					}
-					// 主线程不等，继续处理下一个事件
-					continue;
-				}
+					job.local_track_id = ev.item_id;
+					job.category       = fridge::coarse_category(ev.cls_id);
+					job.confidence     = ev.score;
+					job.timestamp_ms   = now_ms;
 
-				// 放入(IN) 带截图（同步，和之前一样）
-				if (ev.kind == fridge::EventKind::IN && ev.crop_valid) {
-					if (crop_jpeg(ev.box, job.x, job.y, job.w, job.h, job.jpeg)) {
-						// 本地落盘一份，方便检查"截图到底截到没、截得对不对"。
-						// 无论云端通不通都会保存到 ./captures/ 下。
-						char fname[160];
-						snprintf(fname, sizeof(fname),
-						         "./captures/item%d_%s_%lld.jpg",
-						         ev.item_id, coco_cls_to_name(ev.cls_id),
-						         (long long)now_ms);
-						FILE* fp = fopen(fname, "wb");
-						if (fp) {
-							fwrite(job.jpeg.data(), 1, job.jpeg.size(), fp);
-							fclose(fp);
-							printf("\033[1;36m[CAPTURE]\033[0m 放入截图已保存: %s "
-							       "(%zu 字节, 区域 %dx%d)\n",
-							       fname, job.jpeg.size(), job.w, job.h);
-						} else {
-							printf("\033[1;31m[CAPTURE]\033[0m 保存失败(无法创建 %s, "
-							       "captures 目录存在吗?)\n", fname);
+					// 放入(IN) 带截图
+					if (ev.kind == fridge::EventKind::IN) {
+						int rx1 = std::max(0, (int)ev.box.x1 - 8);
+						int ry1 = std::max(0, (int)ev.box.y1 - 8);
+						int rx2 = std::min(width, (int)ev.box.x2 + 8);
+						int ry2 = std::min(height, (int)ev.box.y2 + 8);
+						if (rx2 > rx1 && ry2 > ry1) {
+							cv::Rect roi(rx1, ry1, rx2 - rx1, ry2 - ry1);
+							cv::Mat crop = frame(roi).clone();
+							cv::cvtColor(crop, crop, cv::COLOR_BGR2RGB);
+							std::vector<int> enc_param = {cv::IMWRITE_JPEG_QUALITY, 80};
+							std::vector<unsigned char> jpeg;
+							if (cv::imencode(".jpg", crop, jpeg, enc_param)) {
+								job.jpeg = std::move(jpeg);
+								job.x = rx1; job.y = ry1;
+								job.w = rx2 - rx1; job.h = ry2 - ry1;
+
+								// 本地落盘
+								char fname[160];
+								snprintf(fname, sizeof(fname),
+								         "./captures/item%d_%s_%lld.jpg",
+								         ev.item_id, coco_cls_to_name(ev.cls_id),
+								         (long long)now_ms);
+								FILE* fp = fopen(fname, "wb");
+								if (fp) {
+									fwrite(job.jpeg.data(), 1, job.jpeg.size(), fp);
+									fclose(fp);
+									printf("\033[1;36m[CAPTURE]\033[0m 放入截图: %s (%zu 字节)\n",
+									       fname, job.jpeg.size());
+								}
+							}
 						}
 					} else {
-						printf("\033[1;31m[CAPTURE]\033[0m 放入但裁图失败 "
-						       "(框太小? %.0f,%.0f~%.0f,%.0f)\n",
-						       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
+						job.x = (int)ev.box.x1;
+						job.y = (int)ev.box.y1;
+						job.w = (int)(ev.box.x2 - ev.box.x1);
+						job.h = (int)(ev.box.y2 - ev.box.y1);
 					}
-				} else {
-					// 不带图，仅给出 [x,y,w,h] 让后台知道位置
-					job.x = (int)ev.box.x1;
-					job.y = (int)ev.box.y1;
-					job.w = (int)(ev.box.x2 - ev.box.x1);
-					job.h = (int)(ev.box.y2 - ev.box.y1);
+					cloud.enqueue(job);
 				}
-				cloud.enqueue(job);
+
+				if (res.happened && !res.events.empty()) {
+					printf("\n\033[1;36m[INVENTORY]\033[0m 快照对比后库存:\n");
+					session.inventory().print("  ");
+				}
 			}
 
 			// ============================================================
-			//  Step D: 在画面上画 track（含 track_id），方便观察
-			//  外加一个右上角的"系统状态"指示（STABLE / DISTURBED）
+			//  画面绘制：bbox + 系统状态
 			// ============================================================
 			for (const auto& t : tracks) {
 				int x1 = (int)t.box.x1;
@@ -485,45 +409,38 @@ int main(int argc, char *argv[]) {
 				int x2 = (int)t.box.x2;
 				int y2 = (int)t.box.y2;
 
-				// 手用红框，物品用绿框
 				cv::Scalar color = fridge::is_hand(t.cls_id)
-					? cv::Scalar(0, 0, 255)      // BGR: 红
-					: cv::Scalar(0, 255, 0);     // BGR: 绿
+					? cv::Scalar(0, 0, 255)      // 红 = 手
+					: cv::Scalar(0, 255, 0);     // 绿 = 物品
 
-				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2),
-				              color, 2);
+				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
 
-				char text[64];
-				snprintf(text, sizeof(text), "#%d %s %.0f%%",
-				         t.track_id, coco_cls_to_name(t.cls_id),
-				         t.score * 100);
-				cv::putText(frame, text, cv::Point(x1, y1 - 6),
+				char label[64];
+				snprintf(label, sizeof(label), "#%d %s %.0f%%",
+				         t.track_id, coco_cls_to_name(t.cls_id), t.score * 100);
+				cv::putText(frame, label, cv::Point(x1, y1 - 6),
 				            cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
 			}
 
-			// ============================================================
-			//  Step E: 屏幕左上角叠加系统状态指示
-			//   - STABLE   绿色 — 现在画面安静，库存可信
-			//   - DISTURBED 红色 — 用户正在操作，库存暂停更新
-			//  让答辩 / 调试时一眼能看出"现在系统觉得用户在不在动"
-			// ============================================================
+			// 屏幕左上角：系统状态
 			{
-				fridge::SystemState ss = session.system_state();
-				bool stable = (ss == fridge::SystemState::STABLE);
-				cv::Scalar osd_color = stable
-					? cv::Scalar(0, 255, 0)
-					: cv::Scalar(0, 0, 255);
-				char osd[96];
-				snprintf(osd, sizeof(osd), "%s | inv=%zu(taken=%zu)",
-				         fridge::system_state_to_str(ss),
-				         session.inventory().size(),
-				         session.inventory().count_by_status(fridge::ItemStatus::TAKEN));
+				bool has_hand_now = session.hand_present();
+				cv::Scalar osd_color = has_hand_now
+					? cv::Scalar(0, 0, 255)   // 红 = 手在
+					: cv::Scalar(0, 255, 0);  // 绿 = 无手
+				const fridge::InventoryDB& inv = session.inventory();
+				char osd[128];
+				snprintf(osd, sizeof(osd), "%s | 可见=%zu 遮挡=%zu 出库=%zu",
+				         has_hand_now ? "HAND" : "STABLE",
+				         inv.count_by_status(fridge::ItemStatus::VISIBLE),
+				         inv.count_by_status(fridge::ItemStatus::OCCLUDED),
+				         inv.count_by_status(fridge::ItemStatus::OUT));
 				cv::putText(frame, osd, cv::Point(8, 22),
 				            cv::FONT_HERSHEY_SIMPLEX, 0.6, osd_color, 2);
 			}
 		}
-		memcpy(data, frame.data, width * height * 3);					
-		
+		memcpy(data, frame.data, width * height * 3);
+
 		// encode H264
 		RK_MPI_VENC_SendFrame(0, &h264_frame,-1);
 
@@ -533,15 +450,14 @@ int main(int argc, char *argv[]) {
 		{
 			if(g_rtsplive && g_rtsp_session)
 			{
-				//printf("len = %d PTS = %d \n",stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS);	
 				void *pData = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
 				rtsp_tx_video(g_rtsp_session, (uint8_t *)pData, stFrame.pstPack->u32Len,
-							  stFrame.pstPack->u64PTS);
+				              stFrame.pstPack->u64PTS);
 				rtsp_do_event(g_rtsplive);
 			}
 		}
 
-		// release frame 
+		// release frame
 		s32Ret = RK_MPI_VI_ReleaseChnFrame(0, 0, &stViFrame);
 		if (s32Ret != RK_SUCCESS) {
 			RK_LOGE("RK_MPI_VI_ReleaseChnFrame fail %x", s32Ret);
@@ -553,20 +469,18 @@ int main(int argc, char *argv[]) {
 		memset(text,0,8);
 	}
 
-
 	// Destory MB
 	RK_MPI_MB_ReleaseMB(src_Blk);
 	// Destory Pool
 	RK_MPI_MB_DestroyPool(src_Pool);
 
-	// 停止端云协同上传线程
 	cloud.stop();
-	
+
 	RK_MPI_VI_DisableChn(0, 0);
 	RK_MPI_VI_DisableDev(0);
 
 	SAMPLE_COMM_ISP_Stop(0);
-	
+
 	RK_MPI_VENC_StopRecvFrame(0);
 	RK_MPI_VENC_DestroyChn(0);
 
@@ -574,12 +488,11 @@ int main(int argc, char *argv[]) {
 
 	if (g_rtsplive)
 		rtsp_del_demo(g_rtsplive);
-	
+
 	RK_MPI_SYS_Exit();
 
-	// Release rknn model
-    release_yolov5_model(&rknn_app_ctx);		
+    release_yolov5_model(&rknn_app_ctx);
 	deinit_post_process();
-	
+
 	return 0;
 }

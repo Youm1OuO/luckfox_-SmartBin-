@@ -133,8 +133,13 @@ python3 tools/make_dataset.py --input dataset_raw --output dataset
 
 在 Windows cmd 里运行：
 ```
+train的画框
 C:\Users\Youm1OuO\AppData\Local\Programs\Python\Python312\Scripts\labelme.exe \wsl.localhost\Ubuntu\home\muyou\Projects\workspace\luckfox_demo\tools\luckfox_pico_rkmpi_example\example\luckfox_pico_rtsp_yolov5\dataset\images\train
 C:\Users\Youm1OuO\AppData\Local\Programs\Python\Python312\Scripts\labelme.exe \\wsl.localhost\Ubuntu\home\muyou\Projects\workspace\luckfox_demo\tools\luckfox_pico_rkmpi_example\example\luckfox_pico_rtsp_yolov5\dataset\images\train
+
+
+val的画框
+C:\Users\Youm1OuO\AppData\Local\Programs\Python\Python312\Scripts\labelme.exe \\wsl.localhost\Ubuntu\home\muyou\Projects\workspace\luckfox_demo\tools\luckfox_pico_rkmpi_example\example\luckfox_pico_rtsp_yolov5\dataset\images\val
 ```
 
 
