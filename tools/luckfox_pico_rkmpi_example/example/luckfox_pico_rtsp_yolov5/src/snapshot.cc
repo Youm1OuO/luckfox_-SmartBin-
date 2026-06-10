@@ -87,12 +87,13 @@ Snapshot SnapshotBuffer::take_snapshot() {
 
     // ================================================================
     //  多帧投票算法
-    //  对每一帧的每个 detection，与投票表中的候选物品做严格身份匹配：
+    //  对每一帧的每个 detection，与投票表中的候选物品做快照聚合匹配：
     //    匹配上 → count++，位置取加权平均
     //    没匹配上 → 新增到投票表
     //  N帧结束后，保留 count >= N*s 的物品
     // ================================================================
     std::vector<VotingItem> voting_table;
+    std::vector<int> voting_last_frame_index;
     int min_count = (int)std::ceil(N_ * s_);
 
     for (int fi = 0; fi < (int)frames_.size(); fi++) {
@@ -100,24 +101,44 @@ Snapshot SnapshotBuffer::take_snapshot() {
         for (const auto& det : dets) {
             if (det.score < SNAPSHOT_MIN_SCORE) continue;
 
-            // 在投票表中查找匹配（严格身份匹配）
-            bool matched = false;
-            for (auto& vi : voting_table) {
+            // 在投票表中查找最佳匹配。
+            // 同一个 voting item 在同一帧最多匹配一次，避免近距离同类物品
+            // 或同帧重复框被合并成一个候选并虚增 count。
+            int best_idx = -1;
+            float best_match_score = -1.0f;
+            for (int vi_idx = 0; vi_idx < (int)voting_table.size(); ++vi_idx) {
+                auto& vi = voting_table[vi_idx];
+                if (voting_last_frame_index[vi_idx] == fi) continue;
                 // 1. 类别相同
                 if (vi.cls_id != det.cls_id) continue;
                 // 2. 中心距离近
-                if (center_distance(vi.box, det.box) >= IDENTITY_CENTER_DIST) continue;
+                float dist = center_distance(vi.box, det.box);
+                if (dist >= SNAPSHOT_CLUSTER_CENTER_DIST) continue;
                 // 3. 面积比差异小
-                if (area_ratio_diff(vi.box, det.box) >= IDENTITY_AREA_RATIO) continue;
+                float area_diff = area_ratio_diff(vi.box, det.box);
+                if (area_diff >= SNAPSHOT_CLUSTER_AREA_RATIO) continue;
                 // 4. IoU 高
-                if (iou(vi.box, det.box) < IDENTITY_IOU_THRESH) continue;
+                float overlap = iou(vi.box, det.box);
+                if (overlap < SNAPSHOT_CLUSTER_IOU_THRESH) continue;
                 // 5. 像素颜色差异（这里没有frame，跳过颜色检查，用前4个条件）
                 //    投票阶段连续帧间颜色几乎不变，前4个条件已经足够
 
-                // 匹配上 → 更新
+                float dist_score = SNAPSHOT_CLUSTER_CENTER_DIST <= 0.0f
+                                 ? 0.0f
+                                 : 1.0f - dist / SNAPSHOT_CLUSTER_CENTER_DIST;
+                float match_score = 0.70f * overlap
+                                  + 0.20f * dist_score
+                                  + 0.10f * (1.0f - area_diff);
+                if (match_score > best_match_score) {
+                    best_match_score = match_score;
+                    best_idx = vi_idx;
+                }
+            }
+
+            if (best_idx >= 0) {
+                VotingItem& vi = voting_table[best_idx];
                 int old_count = vi.count;
                 vi.count++;
-                // 位置取加权平均（累积平均）
                 float n = (float)vi.count;
                 vi.box.x1 = vi.box.x1 * (n-1)/n + det.box.x1 / n;
                 vi.box.y1 = vi.box.y1 * (n-1)/n + det.box.y1 / n;
@@ -125,20 +146,19 @@ Snapshot SnapshotBuffer::take_snapshot() {
                 vi.box.y2 = vi.box.y2 * (n-1)/n + det.box.y2 / n;
                 merge_appearance(vi.appearance, det.appearance, old_count, vi.count);
                 if (det.score > vi.best_score) vi.best_score = det.score;
-                matched = true;
-                break;
+                voting_last_frame_index[best_idx] = fi;
+                continue;
             }
 
-            if (!matched) {
-                // 新增到投票表
-                VotingItem vi;
-                vi.cls_id = det.cls_id;
-                vi.box = det.box;
-                vi.best_score = det.score;
-                vi.count = 1;
-                vi.appearance = det.appearance;
-                voting_table.push_back(vi);
-            }
+            // 新增到投票表
+            VotingItem vi;
+            vi.cls_id = det.cls_id;
+            vi.box = det.box;
+            vi.best_score = det.score;
+            vi.count = 1;
+            vi.appearance = det.appearance;
+            voting_table.push_back(vi);
+            voting_last_frame_index.push_back(fi);
         }
     }
 

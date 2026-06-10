@@ -199,8 +199,15 @@ constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
 constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）
 constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（60%，即3帧中至少出现2次）
 constexpr float SNAPSHOT_MIN_SCORE    = 0.3f;     // 最低检测分数（低于此分数的不进快照）
+// 快照聚合只负责把连续 N 帧中同一个检测目标合并，不能直接复用严格原位身份阈值。
+// 这里比 IDENTITY_* 略宽，容忍 YOLO bbox 抖动；但仍要求重叠，避免近距离同类物品被合并。
+constexpr float SNAPSHOT_CLUSTER_CENTER_DIST = 30.0f;
+constexpr float SNAPSHOT_CLUSTER_AREA_RATIO  = 0.40f;
+constexpr float SNAPSHOT_CLUSTER_IOU_THRESH  = 0.30f;
 constexpr int   SNAPSHOT_HAND_BLOCK_MIN_COUNT = 2; // N帧中至少几帧有阻塞手，快照才算带手
 constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
+constexpr int   SNAPSHOT_MASS_DISAPPEAR_MIN_COUNT = 3;
+constexpr float SNAPSHOT_MASS_DISAPPEAR_RATIO = 0.60f;
 
 // =========================================================================
 //  新业务流程6：自适应"附近"距离阈值

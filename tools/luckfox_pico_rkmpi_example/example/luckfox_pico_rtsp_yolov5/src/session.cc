@@ -771,6 +771,11 @@ SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::M
             current_ = snap;
             if (snapshots_similar(current_, contrast_)) {
                 result = compare_snapshots(current_, frame);
+                if (result.reject_snapshot) {
+                    contrast_ = current_;
+                    operation_context_.unstable_frame_count++;
+                    break;
+                }
                 snap1_ = current_;
                 contrast_ = current_;
                 reset_operation_context(snap1_.frame_id, snap1_.frame_id);
@@ -911,6 +916,21 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (!used_snap2_origin_indices.count(j)) {
             appeared_indices.push_back(j);
         }
+    }
+
+    int baseline_count = (int)snap1_.items.size();
+    int disappeared_count = (int)disappeared_indices.size();
+    float disappeared_ratio = baseline_count <= 0
+                            ? 0.0f
+                            : (float)disappeared_count / (float)baseline_count;
+    if (baseline_count >= SNAPSHOT_MASS_DISAPPEAR_MIN_COUNT &&
+        disappeared_count >= SNAPSHOT_MASS_DISAPPEAR_MIN_COUNT &&
+        disappeared_ratio >= SNAPSHOT_MASS_DISAPPEAR_RATIO) {
+        result.reject_snapshot = true;
+        printf("[SESSION] 快照疑似批量漏检，跳过本轮库存更新 "
+               "(baseline=%d current=%zu disappeared=%d ratio=%.2f)\n",
+               baseline_count, snap2.items.size(), disappeared_count, disappeared_ratio);
+        return result;
     }
 
     for (const auto& p : same_position_pairs) {
@@ -1174,6 +1194,41 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 target_occupied_by_stable_baseline(snap1_, same_position_pairs,
                                                    baseline_idx, B.box)) {
                 continue;
+            }
+            if (baseline_idx >= 0) {
+                int still_visible_idx = -1;
+                for (const auto& p : same_position_pairs) {
+                    if (p.first == baseline_idx) {
+                        still_visible_idx = p.second;
+                        break;
+                    }
+                }
+                if (still_visible_idx >= 0) {
+                    const VotingItem& old_position_object = snap2.items[still_visible_idx];
+                    bool old_position_has_owner = false;
+                    for (const auto& other_kv : inventory_.items()) {
+                        int other_id = other_kv.first;
+                        if (other_id == candidate_id) continue;
+                        if (consumed_inventory_ids.count(other_id)) continue;
+                        const InventoryItem& other = other_kv.second;
+                        if (other.status != ItemStatus::VISIBLE) continue;
+                        if (other.cls_id != old_position_object.cls_id) continue;
+                        if (strict_box_match(old_position_object.box,
+                                             old_position_object.cls_id,
+                                             other.box,
+                                             other.cls_id) ||
+                            relaxed_box_match(old_position_object.box,
+                                              old_position_object.cls_id,
+                                              other.box,
+                                              other.cls_id)) {
+                            old_position_has_owner = true;
+                            break;
+                        }
+                    }
+                    if (!old_position_has_owner) {
+                        continue;
+                    }
+                }
             }
 
             float evidence = relocation_evidence_score(candidate_id, inv.box, B.box);

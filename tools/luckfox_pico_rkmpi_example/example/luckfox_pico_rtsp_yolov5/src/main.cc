@@ -135,6 +135,17 @@ static bool covered_by_track(const fridge::Detection& det,
 	return false;
 }
 
+static bool covered_by_detection(const fridge::Track& track,
+                                 const std::vector<fridge::Detection>& detections) {
+	for (const auto& d : detections) {
+		if (d.cls_id != track.cls_id) continue;
+		if (fridge::iou(track.box, d.box) >= 0.50f) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void fill_appearance_feature(const cv::Mat& frame, fridge::Detection& det) {
 	fridge::AppearanceFeature feature;
 	if (frame.empty()) {
@@ -456,12 +467,25 @@ int main(int argc, char *argv[]) {
 			// ============================================================
 			bool has_hand = has_snapshot_blocking_hand;
 
-			// 只把食物检测推入快照缓冲区（不含手）
+			// 只把食物检测推入快照缓冲区（不含手）。
+			// YOLO 原始检测是主输入；已确认 ByteTrack 物品 track 作为补充输入，
+			// 避免画面上能看到稳定 track，但业务快照因为短时漏检完全忽略它。
 			std::vector<fridge::Detection> food_dets;
 			for (const auto& d : detections) {
 				if (fridge::is_food(d.cls_id) && d.score >= fridge::SNAPSHOT_MIN_SCORE) {
 					food_dets.push_back(d);
 				}
+			}
+			for (const auto& t : tracks) {
+				if (!fridge::is_food(t.cls_id)) continue;
+				if (covered_by_detection(t, food_dets)) continue;
+
+				fridge::Detection d;
+				d.box = t.box;
+				d.score = std::max(t.score, fridge::SNAPSHOT_MIN_SCORE);
+				d.cls_id = t.cls_id;
+				fill_appearance_feature(frame, d);
+				food_dets.push_back(d);
 			}
 			snap_buffer.push(food_dets, g_frame_id, has_hand);
 
