@@ -70,7 +70,8 @@ public:
     void print(const char* prefix = "") const;
 
     // 关门时上传后台用：把库存导出成 JSON 字符串（只含 VISIBLE + OCCLUDED）
-    std::string to_json(const char* device_id, long long timestamp_ms) const;
+    std::string to_json(const char* device_id, long long timestamp_ms,
+                        const char* session_id = nullptr) const;
 
 private:
     std::map<int, InventoryItem> items_;

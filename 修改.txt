@@ -82,6 +82,12 @@ fridge_config.h — 新增阈值常量
 
 
 
+路径：
+    tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/src/main.cc
+内容：
+    if (fridge::is_hand(r.cls_id) && d.score >= 0.30f) {
+        hand_boxes.push_back(d.box);
+    }
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
 

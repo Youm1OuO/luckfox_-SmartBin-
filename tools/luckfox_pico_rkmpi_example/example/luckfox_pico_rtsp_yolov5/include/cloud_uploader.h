@@ -28,6 +28,7 @@ enum class UploadKind {
     ITEM_IN,       // 放入（带截图）
     ITEM_OUT,      // 取出（不带图）
     ITEM_MOVED,    // 挪位（不带图）
+    DOOR_CLOSE,    // 关门时最终库存快照
 };
 
 // 一个待上传任务（端 → 云）
@@ -39,6 +40,9 @@ struct UploadJob {
     int          x = 0, y = 0, w = 0, h = 0;  // bbox [x, y, w, h]（原图像素）
     long long    timestamp_ms = 0;      // 事件发生时间戳（毫秒）
     std::vector<unsigned char> jpeg;    // 物品框局部截图 JPEG（仅 ITEM_IN 带；可空）
+    std::string  raw_json;              // DOOR_CLOSE 使用：完整库存 JSON
+    int          attempts = 0;           // 后台线程重试计数
+    int          max_attempts = 3;       // 网络临时失败时最多尝试次数
 };
 
 // 端云协同上传器：后台线程异步 POST，不阻塞推理主链路
@@ -55,12 +59,16 @@ public:
     // 队列满时丢弃最旧任务，保证不会无限堆积撑爆内存
     void enqueue(const UploadJob& job);
 
+    // 关门线程调用：上传最终库存快照
+    void enqueue_inventory_snapshot(const std::string& json, long long timestamp_ms);
+
     // ---- 配置（构造后、start 前可改；默认值见 fridge_config.h）----
     // 也可被环境变量覆盖：FRIDGE_CLOUD_HOST / FRIDGE_CLOUD_PORT /
     //                      FRIDGE_ITEM_PATH / FRIDGE_DEVICE_ID
     std::string host;
     int         port = 8000;
     std::string item_path;       // 出入库事件端点，默认 /events/item
+    std::string inventory_path;  // 关门库存端点，默认 /inventory/close
     std::string device_id;
 
     // 统计（调试用）

@@ -31,6 +31,22 @@ inline bool is_food(int cls_id) {
 }
 
 // =========================================================================
+//  YOLO 输出阈值
+// -------------------------------------------------------------------------
+//  分三层：
+//    1. YOLO_CANDIDATE_SCORE_THRESH：RKNN 原始输出的粗筛，低一点，避免过早丢候选。
+//    2. YOLO_OBJECT_SCORE_THRESH / YOLO_HAND_SCORE_THRESH：postprocess 最终输出阈值。
+//    3. 业务层手阈值：HAND_SNAPSHOT_BLOCK_*，只用于决定是否阻塞快照。
+// =========================================================================
+constexpr float YOLO_CANDIDATE_SCORE_THRESH = 0.01f;
+constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.25f;    // 物品的阈值
+constexpr float YOLO_HAND_SCORE_THRESH      = 0.30f;    // 手的阈值
+
+inline float yolo_output_score_threshold(int cls_id) {
+    return is_hand(cls_id) ? YOLO_HAND_SCORE_THRESH : YOLO_OBJECT_SCORE_THRESH;
+}
+
+// =========================================================================
 //  粗粒度分类映射（对应 classes.yaml 的 coarse_grained）
 // -------------------------------------------------------------------------
 //  赛题要求至少输出粗类（蔬果 / 肉蛋生鲜 / 饮料乳品 / 包装食品）。
@@ -94,12 +110,15 @@ inline bool has_label(int cls_id) {
 //  现场改 IP 不想重新编译时，直接设环境变量：
 //    export FRIDGE_CLOUD_HOST=192.168.168.1
 //    export FRIDGE_CLOUD_PORT=8000
-//  上报端点：POST /events/item（事件 ITEM_IN/OUT/MOVED）。
+//  上报端点：
+//    POST /events/item      单个事件 ITEM_IN/OUT/MOVED
+//    POST /inventory/close  关门时最终库存快照
 //  放入(ITEM_IN) 带物品框内截图，后端拿到图后自行决定要不要跑云端 AI。
 // =========================================================================
 constexpr const char* CLOUD_HOST       = "192.168.168.1";   // 云端/网关主机
 constexpr int         CLOUD_PORT       = 8000;              // 端口
 constexpr const char* CLOUD_ITEM_PATH  = "/events/item";    // 出入库事件端点
+constexpr const char* CLOUD_INVENTORY_PATH = "/inventory/close"; // 关门库存端点
 constexpr const char* CLOUD_DEVICE_ID  = "luckfox";         // 设备 ID
 
 // =========================================================================
@@ -176,6 +195,8 @@ constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
 constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）
 constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（60%，即3帧中至少出现2次）
 constexpr float SNAPSHOT_MIN_SCORE    = 0.3f;     // 最低检测分数（低于此分数的不进快照）
+constexpr int   SNAPSHOT_HAND_BLOCK_MIN_COUNT = 2; // N帧中至少几帧有阻塞手，快照才算带手
+constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
 
 // =========================================================================
 //  新业务流程6：自适应"附近"距离阈值
@@ -190,6 +211,11 @@ constexpr float NEARBY_DISTANCE_THRESH = 1.0f;  // 设计文档建议值，可�
 // =========================================================================
 // 连续多少帧没有检测到手 → 确认手离开画面
 constexpr int HAND_LEAVE_FRAMES  = 5;
+// 手证据阈值：用于 OperationContext / OSD，和 YOLO_HAND_SCORE_THRESH 保持一致即可。
+constexpr float HAND_CONTEXT_SCORE_THRESH = YOLO_HAND_SCORE_THRESH;
+// 阻塞快照的手要更严格，避免低置信/小框误检长期卡住库存对比。
+constexpr float HAND_SNAPSHOT_BLOCK_SCORE_THRESH = 0.45f;
+constexpr float HAND_SNAPSHOT_BLOCK_MIN_AREA_RATIO = 0.002f;
 // 手持续多少帧才认为是长时间操作，长时间操作只提高整理证据权重
 constexpr int HAND_LONG_PRESENT_FRAMES = 12;
 // 手与物品重叠到什么程度，才作为 candidate_held 证据

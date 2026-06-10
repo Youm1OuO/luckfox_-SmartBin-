@@ -31,6 +31,12 @@ bool SnapshotBuffer::full() const {
     return (int)frames_.size() >= N_;
 }
 
+void SnapshotBuffer::reset() {
+    frames_.clear();
+    frame_ids_.clear();
+    hand_flags_.clear();
+}
+
 Snapshot SnapshotBuffer::take_snapshot() {
     Snapshot snap;
     snap.valid = false;
@@ -39,10 +45,12 @@ Snapshot SnapshotBuffer::take_snapshot() {
 
     if (frames_.empty()) return snap;
 
-    // 检查是否有手
+    // 检查是否有足够稳定的阻塞手。单帧疑似手不直接废掉整个快照。
+    int hand_count = 0;
     for (bool h : hand_flags_) {
-        if (h) snap.has_hand = true;
+        if (h) hand_count++;
     }
+    snap.has_hand = hand_count >= SNAPSHOT_HAND_BLOCK_MIN_COUNT;
 
     // 最后一帧的帧号
     snap.frame_id = frame_ids_.back();
@@ -111,9 +119,7 @@ Snapshot SnapshotBuffer::take_snapshot() {
     snap.valid = true;
 
     // 重置缓冲区
-    frames_.clear();
-    frame_ids_.clear();
-    hand_flags_.clear();
+    reset();
 
     return snap;
 }

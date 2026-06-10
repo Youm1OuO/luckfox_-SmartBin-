@@ -48,6 +48,9 @@ public:
     // 取出快照并重置缓冲区
     Snapshot take_snapshot();
 
+    // 外部门状态切换时调用，避免跨会话残留帧混进第一份快照
+    void reset();
+
 private:
     int N_;
     float s_;

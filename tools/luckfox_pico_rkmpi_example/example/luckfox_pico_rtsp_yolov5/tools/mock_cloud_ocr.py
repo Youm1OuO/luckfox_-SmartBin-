@@ -3,10 +3,11 @@
 """
 端云协同 - 云端 Mock 服务器（用于本地联调）
 
-模拟"后台同学的服务"，提供两个端点（对应《不知道.md》后端配对机制）：
+模拟"后台同学的服务"，提供三个端点（对应《不知道.md》后端配对机制）：
 
     POST /events/item         出入库事件 ITEM_IN / ITEM_OUT / ITEM_MOVED
     POST /events/label_scan   标签扫描（用户把标签朝镜头）
+    POST /inventory/close     关门时最终库存快照
 
 它做的事：
     1. 收到 label_scan → 把标签图存下来 + 模拟 OCR 读出品牌/保质期，
@@ -14,6 +15,7 @@
     2. 收到 ITEM_IN → 从 pending_labels 里找"最近、未消费、未过期"的一条，
        配对成功就把标签信息挂到这件物品上（演示后端的时间窗配对逻辑）。
     3. ITEM_OUT / ITEM_MOVED → 仅记录。
+    4. DOOR_CLOSE → 记录最终库存快照。
 
 真实部署时，后端用真的 OCR/VLM 替换 fake_ocr() 即可，端侧不用改。
 
@@ -105,6 +107,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_label_scan(payload)
         elif path.endswith("/item"):
             self.handle_item(payload)
+        elif path.endswith("/inventory/close"):
+            self.handle_inventory_close(payload)
         else:
             print(f"[MOCK] 未知路径: {self.path}")
             self._reply(404, {"error": "unknown path"})
@@ -152,6 +156,17 @@ class Handler(BaseHTTPRequestHandler):
             print(line)
         self._reply(200, {"ok": True})
 
+    # ----- 关门最终库存：后端保存本轮会话最终结果 -----
+    def handle_inventory_close(self, payload):
+        device = payload.get("device_id", "?")
+        session_id = payload.get("session_id", "")
+        inventory = payload.get("inventory", [])
+        visible = sum(1 for it in inventory if it.get("status") == "可见")
+        occluded = sum(1 for it in inventory if it.get("status") == "遮挡")
+        print(f"[MOCK][DOOR_CLOSE] {device} session={session_id} "
+              f"inventory={len(inventory)} visible={visible} occluded={occluded}")
+        self._reply(200, {"ok": True})
+
     def _reply(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -171,6 +186,7 @@ def main():
     print(f"[MOCK] 云端 mock 服务已启动: http://{args.host}:{args.port}")
     print(f"[MOCK]   POST /events/item        出入库事件")
     print(f"[MOCK]   POST /events/label_scan  标签扫描")
+    print(f"[MOCK]   POST /inventory/close    关门库存")
     print(f"[MOCK] 裁剪图保存目录: {SAVE_DIR}")
     print("[MOCK] 等待端侧上传... (Ctrl+C 退出)")
     try:

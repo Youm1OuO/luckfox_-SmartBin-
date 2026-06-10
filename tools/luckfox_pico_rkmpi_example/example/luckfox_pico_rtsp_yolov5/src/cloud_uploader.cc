@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
 
 #include <unistd.h>
 #include <netdb.h>
@@ -31,6 +32,7 @@ const char* upload_kind_to_str(UploadKind k) {
         case UploadKind::ITEM_IN:    return "ITEM_IN";
         case UploadKind::ITEM_OUT:   return "ITEM_OUT";
         case UploadKind::ITEM_MOVED: return "ITEM_MOVED";
+        case UploadKind::DOOR_CLOSE: return "DOOR_CLOSE";
     }
     return "UNKNOWN";
 }
@@ -77,11 +79,13 @@ CloudUploader::CloudUploader()
     host       = CLOUD_HOST;
     port       = CLOUD_PORT;
     item_path  = CLOUD_ITEM_PATH;
+    inventory_path = CLOUD_INVENTORY_PATH;
     device_id  = CLOUD_DEVICE_ID;
 
     if (const char* h = getenv("FRIDGE_CLOUD_HOST"))   host = h;
     if (const char* p = getenv("FRIDGE_CLOUD_PORT"))   port = atoi(p);
     if (const char* ip = getenv("FRIDGE_ITEM_PATH"))   item_path = ip;
+    if (const char* ip = getenv("FRIDGE_INVENTORY_PATH")) inventory_path = ip;
     if (const char* d = getenv("FRIDGE_DEVICE_ID"))    device_id = d;
 }
 
@@ -91,8 +95,9 @@ void CloudUploader::start() {
     if (running_.load()) return;
     running_.store(true);
     thread_ = std::thread(&CloudUploader::worker_loop, this);
-    printf("[CLOUD] uploader started → http://%s:%d%s (device=%s)\n",
-           host.c_str(), port, item_path.c_str(), device_id.c_str());
+    printf("[CLOUD] uploader started → http://%s:%d%s, inventory=%s (device=%s)\n",
+           host.c_str(), port, item_path.c_str(), inventory_path.c_str(),
+           device_id.c_str());
 }
 
 void CloudUploader::stop() {
@@ -111,6 +116,16 @@ void CloudUploader::enqueue(const UploadJob& job) {
     in_cv_.notify_one();
 }
 
+void CloudUploader::enqueue_inventory_snapshot(const std::string& json,
+                                               long long timestamp_ms) {
+    UploadJob job;
+    job.kind = UploadKind::DOOR_CLOSE;
+    job.timestamp_ms = timestamp_ms;
+    job.raw_json = json;
+    job.max_attempts = 3;
+    enqueue(job);
+}
+
 // ---------------------------------------------------------------------------
 //  组装 JSON —— 严格对应《端侧返回数据格式.txt》出入库事件：
 //    {"device_id","timestamp","event_type","data":[
@@ -118,6 +133,10 @@ void CloudUploader::enqueue(const UploadJob& job) {
 //  crop_image 仅 ITEM_IN 带（jpeg 非空时）；ITEM_OUT/MOVED 为空字符串。
 // ---------------------------------------------------------------------------
 std::string CloudUploader::build_json(const UploadJob& job) {
+    if (job.kind == UploadKind::DOOR_CLOSE && !job.raw_json.empty()) {
+        return job.raw_json;
+    }
+
     std::string b64;
     if (!job.jpeg.empty()) b64 = base64_encode(job.jpeg.data(), job.jpeg.size());
 
@@ -209,6 +228,13 @@ bool CloudUploader::http_post(const std::string& path, const std::string& body,
 
     if (raw.empty()) { printf("[CLOUD] 空响应\n"); return false; }
 
+    if (raw.find("HTTP/1.1 2") != 0 && raw.find("HTTP/1.0 2") != 0) {
+        size_t line_end = raw.find("\r\n");
+        std::string status_line = line_end == std::string::npos ? raw : raw.substr(0, line_end);
+        printf("[CLOUD] HTTP 非成功状态: %s\n", status_line.c_str());
+        return false;
+    }
+
     // 6) 切出 body（找第一个空行 \r\n\r\n）
     size_t pos = raw.find("\r\n\r\n");
     resp_body = (pos == std::string::npos) ? raw : raw.substr(pos + 4);
@@ -229,17 +255,37 @@ void CloudUploader::worker_loop() {
 
         std::string body = build_json(job);
         std::string resp;
-        bool ok = http_post(item_path, body, resp);
+        const std::string& path =
+            job.kind == UploadKind::DOOR_CLOSE ? inventory_path : item_path;
+        bool ok = http_post(path, body, resp);
 
         if (ok) {
             sent_ok_++;
-            printf("[CLOUD] 事件 %s (item#%d, %zuB jpeg) 上报成功\n",
-                   upload_kind_to_str(job.kind), job.local_track_id,
-                   job.jpeg.size());
+            if (job.kind == UploadKind::DOOR_CLOSE) {
+                printf("[CLOUD] 关门库存快照上报成功 (%zuB json)\n", body.size());
+            } else {
+                printf("[CLOUD] 事件 %s (item#%d, %zuB jpeg) 上报成功\n",
+                       upload_kind_to_str(job.kind), job.local_track_id,
+                       job.jpeg.size());
+            }
         } else {
-            sent_fail_++;
-            printf("[CLOUD] %s 上报失败（云端不可达？）\n",
-                   upload_kind_to_str(job.kind));
+            if (job.attempts + 1 < job.max_attempts) {
+                job.attempts++;
+                printf("[CLOUD] %s 上报失败，准备第 %d/%d 次重试\n",
+                       upload_kind_to_str(job.kind), job.attempts + 1,
+                       job.max_attempts);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                {
+                    std::lock_guard<std::mutex> lk(in_mtx_);
+                    while (jobs_.size() >= MAX_QUEUE) jobs_.pop_front();
+                    jobs_.push_back(job);
+                }
+                in_cv_.notify_one();
+            } else {
+                sent_fail_++;
+                printf("[CLOUD] %s 上报失败（已达到最大重试次数）\n",
+                       upload_kind_to_str(job.kind));
+            }
         }
     }
     printf("[CLOUD] uploader stopped (ok=%d, fail=%d)\n",

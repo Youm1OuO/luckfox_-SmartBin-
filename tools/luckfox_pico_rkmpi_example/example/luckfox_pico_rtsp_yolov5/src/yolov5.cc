@@ -18,6 +18,7 @@
 #include <math.h>
 
 #include "yolov5.h"
+#include "fridge_config.h"
 
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
@@ -185,9 +186,8 @@ int release_yolov5_model(rknn_app_context_t *app_ctx)
 int inference_yolov5_model(rknn_app_context_t *app_ctx,  object_detect_result_list *od_results)
 {
     int ret;
-    const float nms_threshold = NMS_THRESH;      // 默认的NMS阈值
-    const float box_conf_threshold = 0.01f;      // 手的单独的初始阈值, 降低能令手(score>=0.10)能通过
-    // 注意：postprocess.cc 输出阶段会按类别区分阈值（手>=0.10, 其他>=0.20）
+    const float nms_threshold = NMS_THRESH;
+    const float box_conf_threshold = fridge::YOLO_CANDIDATE_SCORE_THRESH;
    
     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
     if (ret < 0) {

@@ -95,6 +95,45 @@ void mapCoordinates(int *x, int *y) {
 	*y = ry;
 }
 
+static bool request_backend_inventory(const char* device_id,
+                                      const char* session_id,
+                                      long long opened_at_ms,
+                                      std::vector<fridge::InventoryItem>& items,
+                                      bool* authoritative_empty) {
+	(void)device_id;
+	(void)session_id;
+	(void)opened_at_ms;
+	items.clear();
+	if (authoritative_empty) *authoritative_empty = false;
+
+	// 后台库存 GET/POST 协议还没有在端侧落地。这里保留明确接入点：
+	// 后续拿到后端返回 JSON 后，只需要在本函数里填充 items 并返回 true。
+	printf("[BACKEND] 开门库存获取接口未接入，使用首个无手稳定快照兜底\n");
+	return false;
+}
+
+static bool is_snapshot_blocking_hand(const fridge::Detection& det) {
+	if (!fridge::is_hand(det.cls_id)) return false;
+	if (det.score < fridge::HAND_SNAPSHOT_BLOCK_SCORE_THRESH) return false;
+
+	float frame_area = fridge::FRAME_W * fridge::FRAME_H;
+	if (frame_area <= 0.0f) return false;
+
+	float area_ratio = det.box.area() / frame_area;
+	return area_ratio >= fridge::HAND_SNAPSHOT_BLOCK_MIN_AREA_RATIO;
+}
+
+static bool covered_by_track(const fridge::Detection& det,
+                             const std::vector<fridge::Track>& tracks) {
+	for (const auto& t : tracks) {
+		if (t.cls_id != det.cls_id) continue;
+		if (fridge::iou(t.box, det.box) >= 0.50f) {
+			return true;
+		}
+	}
+	return false;
+}
+
 
 int main(int argc, char *argv[]) {
   // 抑制 Rockchip MPP 硬件编码器的调试日志
@@ -195,11 +234,13 @@ int main(int argc, char *argv[]) {
 	// ============================================================
 	//  开关门检测（全局亮度阈值法）
 	// ============================================================
-	bool door_open = true;
+	bool door_open = false;
 	const double DOOR_DARK_THRESH = 50.0;
 	int dark_streak = 0;
 	int bright_streak = 0;
 	const int DOOR_CONFIRM = 5;
+	int door_session_seq = 0;
+	char door_session_id[96] = "";
 
   	while(1)
 	{
@@ -229,14 +270,34 @@ int main(int argc, char *argv[]) {
 					door_open = false;
 					printf("\n\033[1;33m[DOOR]\033[0m 关门 (亮度=%.0f), 上传库存:\n", mean_y);
 					RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
-					std::string json = session.inventory().to_json("luckfox", (long long)ts);
+					session.finish_session((long long)ts);
+					std::string json = session.inventory().to_json(
+						cloud.device_id.c_str(), (long long)ts, door_session_id);
 					printf("%s\n", json.c_str());
+					cloud.enqueue_inventory_snapshot(json, (long long)ts);
+					snap_buffer.reset();
 				} else if (!door_open && bright_streak >= DOOR_CONFIRM) {
 					door_open = true;
 					printf("\n\033[1;33m[DOOR]\033[0m 开门 (亮度=%.0f)\n", mean_y);
-					if (!session.has_backend()) {
-						std::vector<fridge::InventoryItem> backend_items;
-						session.init_from_backend(backend_items);
+					RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
+					door_session_seq++;
+					snprintf(door_session_id, sizeof(door_session_id),
+					         "%lld_%d_%s", (long long)ts, door_session_seq,
+					         cloud.device_id.c_str());
+
+					session.start_new_session((long long)ts);
+					snap_buffer.reset();
+
+					std::vector<fridge::InventoryItem> backend_items;
+					bool authoritative_empty = false;
+					if (request_backend_inventory(cloud.device_id.c_str(),
+					                              door_session_id,
+					                              (long long)ts,
+					                              backend_items,
+					                              &authoritative_empty)) {
+						session.init_from_backend(backend_items, authoritative_empty);
+					} else {
+						session.mark_backend_unavailable();
 					}
 				}
 			}
@@ -277,8 +338,11 @@ int main(int argc, char *argv[]) {
 			//  坐标映射：letterbox → 原图坐标
 			// ============================================================
 			std::vector<fridge::Detection> detections;
+			std::vector<fridge::Detection> hand_dets_for_display;
 			std::vector<fridge::BBox> hand_boxes;
+			bool has_snapshot_blocking_hand = false;
 			detections.reserve(od_results.count);
+			hand_dets_for_display.reserve(od_results.count);
 
 			for (int i = 0; i < od_results.count; i++) {
 				const object_detect_result& r = od_results.results[i];
@@ -295,8 +359,14 @@ int main(int argc, char *argv[]) {
 				d.cls_id = r.cls_id;
 				detections.push_back(d);
 
-				if (fridge::is_hand(r.cls_id)) {
-					hand_boxes.push_back(d.box);
+				if (fridge::is_hand(d.cls_id)) {
+					if (d.score >= fridge::HAND_CONTEXT_SCORE_THRESH) {
+						hand_boxes.push_back(d.box);
+						hand_dets_for_display.push_back(d);
+					}
+					if (is_snapshot_blocking_hand(d)) {
+						has_snapshot_blocking_hand = true;
+					}
 				}
 			}
 
@@ -320,12 +390,11 @@ int main(int argc, char *argv[]) {
 			session.update_hand(hand_boxes, tracks, g_frame_id, now_ms);
 
 			// ============================================================
-			//  快照缓冲：每帧都推入 SnapshotBuffer（含手标志）
-			//  设计要点：手在画面期间也推入，但快照 has_hand 标记为 true，
-			//  SessionManager 会跳过有手快照，不把它作为库存对比基准。
-			//  这样手离开后的第一份无手快照能正常进入对比流程。
+			//  快照缓冲：手证据和快照阻塞分开。
+			//  OperationContext 可以使用较敏感的 hand_boxes；
+			//  快照阻塞只接受更高置信度/足够面积的手，避免弱误检长期卡住库存。
 			// ============================================================
-			bool has_hand = !hand_boxes.empty();
+			bool has_hand = has_snapshot_blocking_hand;
 
 			// 只把食物检测推入快照缓冲区（不含手）
 			std::vector<fridge::Detection> food_dets;
@@ -403,6 +472,29 @@ int main(int argc, char *argv[]) {
 			// ============================================================
 			//  画面绘制：bbox + 系统状态
 			// ============================================================
+			for (const auto& d : detections) {
+				bool should_display_raw =
+					fridge::is_hand(d.cls_id)
+						? d.score >= fridge::HAND_CONTEXT_SCORE_THRESH
+						: d.score >= fridge::SNAPSHOT_MIN_SCORE;
+				if (!should_display_raw || covered_by_track(d, tracks)) continue;
+
+				int x1 = (int)d.box.x1;
+				int y1 = (int)d.box.y1;
+				int x2 = (int)d.box.x2;
+				int y2 = (int)d.box.y2;
+				cv::Scalar color = fridge::is_hand(d.cls_id)
+					? cv::Scalar(0, 0, 255)
+					: cv::Scalar(0, 255, 0);
+				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 1);
+
+				char label[64];
+				snprintf(label, sizeof(label), "%s %.0f%%",
+				         coco_cls_to_name(d.cls_id), d.score * 100);
+				cv::putText(frame, label, cv::Point(x1, y1 - 6),
+				            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+			}
+
 			for (const auto& t : tracks) {
 				int x1 = (int)t.box.x1;
 				int y1 = (int)t.box.y1;
@@ -430,8 +522,10 @@ int main(int argc, char *argv[]) {
 					: cv::Scalar(0, 255, 0);  // 绿 = 无手
 				const fridge::InventoryDB& inv = session.inventory();
 				char osd[128];
-				snprintf(osd, sizeof(osd), "%s | 可见=%zu 遮挡=%zu 出库=%zu",
+				snprintf(osd, sizeof(osd), "%s rawH=%zu blockH=%d | V=%zu O=%zu OUT=%zu",
 				         has_hand_now ? "HAND" : "STABLE",
+				         hand_dets_for_display.size(),
+				         has_snapshot_blocking_hand ? 1 : 0,
 				         inv.count_by_status(fridge::ItemStatus::VISIBLE),
 				         inv.count_by_status(fridge::ItemStatus::OCCLUDED),
 				         inv.count_by_status(fridge::ItemStatus::OUT));

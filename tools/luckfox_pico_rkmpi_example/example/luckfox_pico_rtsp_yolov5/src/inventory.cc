@@ -139,14 +139,16 @@ void InventoryDB::print(const char* prefix) const {
     }
 }
 
-std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms) const {
+std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms,
+                                 const char* session_id) const {
     std::string s;
     char buf[768];
 
     snprintf(buf, sizeof(buf),
              "{\"device_id\":\"%s\",\"timestamp\":%lld,"
+             "\"session_id\":\"%s\","
              "\"event_type\":\"DOOR_CLOSE\",\"inventory\":[",
-             device_id, timestamp_ms);
+             device_id, timestamp_ms, session_id ? session_id : "");
     s += buf;
 
     bool first = true;

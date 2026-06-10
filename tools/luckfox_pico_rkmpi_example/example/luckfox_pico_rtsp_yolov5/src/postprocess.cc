@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "yolov5.h"
+#include "fridge_config.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -115,15 +116,15 @@ static int nms(int validCount, std::vector<float> &outputLocations, std::vector<
 {
     for (int i = 0; i < validCount; ++i)
     {
-        if (order[i] == -1 || classIds[i] != filterId)
+        int n = order[i];
+        if (n == -1 || classIds[n] != filterId)
         {
             continue;
         }
-        int n = order[i];
         for (int j = i + 1; j < validCount; ++j)
         {
             int m = order[j];
-            if (m == -1 || classIds[i] != filterId)
+            if (m == -1 || classIds[m] != filterId)
             {
                 continue;
             }
@@ -464,9 +465,7 @@ int post_process(rknn_app_context_t *app_ctx, void *outputs,  float conf_thresho
         int id = classId[n];
         float obj_conf = objProbs[i];
 
-        // 按类别区分置信度阈值：手的阈值更低（0.10），其他类别用标准阈值（0.20）
-        // 原因：手拿着东西时置信度会下降，需要更宽松的阈值才能检测到
-        float class_thresh = (id == 33) ? 0.01f : conf_threshold;
+        float class_thresh = fridge::yolo_output_score_threshold(id);
         if (obj_conf < class_thresh) continue;
 
         od_results->results[last_count].box.left =      (int)(clamp(x1, 0, model_in_w));

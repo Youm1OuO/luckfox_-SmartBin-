@@ -106,19 +106,84 @@ SessionManager::SessionManager()
       no_hand_streak_(0),
       next_context_id_(1),
       next_pending_id_(1),
-      backend_initialized_(false),
+      backend_status_(BackendStatus::UNKNOWN),
+      init_state_(InitState::WAIT_FIRST_STABLE_SNAPSHOT),
       inventory_initialized_(false),
-      current_time_ms_(0) {
+      current_time_ms_(0),
+      session_start_time_ms_(0),
+      first_empty_grace_logged_(false) {
     snap1_ = {{}, 0, false, false};
     contrast_ = {{}, 0, false, false};
     current_ = {{}, 0, false, false};
     operation_context_.reset(next_context_id_++, 0, 0);
 }
 
-void SessionManager::init_from_backend(const std::vector<InventoryItem>& items) {
+void SessionManager::start_new_session(long long time_ms) {
+    current_time_ms_ = time_ms;
+    session_start_time_ms_ = time_ms;
+    first_empty_grace_logged_ = false;
+    inventory_ = InventoryDB();
+    backend_items_.clear();
+    backend_status_ = BackendStatus::UNKNOWN;
+    init_state_ = InitState::WAIT_BACKEND;
+    inventory_initialized_ = false;
+    pending_relocations_.clear();
+    hand_present_ = false;
+    no_hand_streak_ = 0;
+    reset_snap_state();
+    printf("[SESSION] 新开门会话：等待后台库存或首个无手稳定快照\n");
+}
+
+void SessionManager::init_from_backend(const std::vector<InventoryItem>& items,
+                                       bool authoritative_empty) {
+    if (init_state_ == InitState::READY) {
+        printf("[SESSION] 后台库存返回过晚，当前会话已 READY，忽略本次后台初始化\n");
+        return;
+    }
+
     backend_items_ = items;
-    backend_initialized_ = true;
-    printf("[SESSION] 后台库存接收: %zu 件\n", items.size());
+
+    if (!items.empty() || authoritative_empty) {
+        backend_status_ = BackendStatus::TRUSTED;
+        init_state_ = InitState::WAIT_FIRST_STABLE_SNAPSHOT;
+        printf("[SESSION] 后台库存可信：%zu 件，等待首个无手稳定快照对齐\n",
+               items.size());
+        return;
+    }
+
+    backend_items_.clear();
+    backend_status_ = BackendStatus::NO_TRUSTED_BACKEND;
+    init_state_ = InitState::WAIT_FIRST_STABLE_SNAPSHOT;
+    printf("[SESSION] 后台返回空列表但不具权威性，改用首个无手稳定快照初始化\n");
+}
+
+void SessionManager::mark_backend_unavailable() {
+    if (init_state_ == InitState::READY) {
+        return;
+    }
+
+    backend_items_.clear();
+    backend_status_ = BackendStatus::NO_TRUSTED_BACKEND;
+    init_state_ = InitState::WAIT_FIRST_STABLE_SNAPSHOT;
+    printf("[SESSION] 无可信后台库存，等待首个无手稳定快照初始化\n");
+}
+
+void SessionManager::finish_session(long long time_ms) {
+    current_time_ms_ = time_ms;
+
+    if (!pending_relocations_.empty()) {
+        printf("[SESSION] 关门：清理 %zu 个未确认整理候选，不强行提交 MOVED\n",
+               pending_relocations_.size());
+        pending_relocations_.clear();
+    }
+
+    hand_present_ = false;
+    no_hand_streak_ = 0;
+
+    printf("[SESSION] 会话结束：最终库存 可见=%zu 遮挡=%zu 出库历史=%zu\n",
+           inventory_.count_by_status(ItemStatus::VISIBLE),
+           inventory_.count_by_status(ItemStatus::OCCLUDED),
+           inventory_.count_by_status(ItemStatus::OUT));
 }
 
 // ============================================================================
@@ -485,7 +550,9 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
 // ============================================================================
 
 void SessionManager::init_snapshot(const Snapshot& snap, const cv::Mat& frame) {
-    if (backend_initialized_) {
+    inventory_ = InventoryDB();
+
+    if (backend_status_ == BackendStatus::TRUSTED) {
         printf("[SESSION] 初始化：匹配后台库存 (%zu 件) 与快照 (%zu 件)\n",
                backend_items_.size(), snap.items.size());
 
@@ -512,6 +579,15 @@ void SessionManager::init_snapshot(const Snapshot& snap, const cv::Mat& frame) {
                        new_id, coco_cls_to_name(bi.cls_id));
             }
         }
+
+        for (int vi_idx = 0; vi_idx < (int)snap.items.size(); vi_idx++) {
+            if (matched_snap_indices.count(vi_idx)) continue;
+            const auto& vi = snap.items[vi_idx];
+            int new_id = inventory_.add_item(-1, vi.cls_id, vi.box, vi.best_score,
+                                             snap.frame_id, current_time_ms_);
+            printf("[SESSION]   item#%d %s → 可见（初始化发现后台未记录物品）\n",
+                   new_id, coco_cls_to_name(vi.cls_id));
+        }
     } else {
         printf("[SESSION] 初始化：无后台库存，用快照初始化 (%zu 件)\n", snap.items.size());
         for (const auto& vi : snap.items) {
@@ -519,6 +595,9 @@ void SessionManager::init_snapshot(const Snapshot& snap, const cv::Mat& frame) {
                                 snap.frame_id, current_time_ms_);
         }
     }
+
+    init_state_ = InitState::READY;
+    inventory_initialized_ = true;
 }
 
 bool SessionManager::snapshots_similar(const Snapshot& a, const Snapshot& b) {
@@ -542,6 +621,10 @@ bool SessionManager::snapshots_similar(const Snapshot& a, const Snapshot& b) {
 }
 
 SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::Mat& frame) {
+    if (!snap.valid) {
+        return SettlementResult();
+    }
+
     // 带手快照只提供 OperationContext 证据，不进入库存 diff。
     if (snap.has_hand) {
         return SettlementResult();
@@ -551,9 +634,26 @@ SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::M
 
     switch (snap_state_) {
         case SnapState::IDLE: {
+            if (init_state_ == InitState::WAIT_BACKEND ||
+                backend_status_ == BackendStatus::UNKNOWN) {
+                mark_backend_unavailable();
+            }
+
+            if (!inventory_initialized_ &&
+                backend_status_ != BackendStatus::TRUSTED &&
+                snap.items.empty() &&
+                session_start_time_ms_ > 0 &&
+                current_time_ms_ - session_start_time_ms_ < FIRST_SNAPSHOT_EMPTY_GRACE_MS) {
+                if (!first_empty_grace_logged_) {
+                    printf("[SESSION] 首个无手稳定快照为 0 件，等待曝光稳定窗口 (%lldms)\n",
+                           FIRST_SNAPSHOT_EMPTY_GRACE_MS);
+                    first_empty_grace_logged_ = true;
+                }
+                break;
+            }
+
             if (!inventory_initialized_) {
                 init_snapshot(snap, frame);
-                inventory_initialized_ = true;
             }
             snap1_ = snap;
             contrast_ = snap;
@@ -561,10 +661,10 @@ SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::M
             snap_state_ = SnapState::COMPARE;
             reset_operation_context(snap.frame_id, snap.frame_id);
             result.happened = true;
-            if (inventory_.size() > 0) {
-                printf("[SESSION] 快照已就绪，进入统一对比模式\n");
-                print_inventory();
-            }
+            printf("[SESSION] 快照已就绪，进入统一对比模式 (库存=%zu 件)\n",
+                   inventory_.count_by_status(ItemStatus::VISIBLE) +
+                   inventory_.count_by_status(ItemStatus::OCCLUDED));
+            print_inventory();
             break;
         }
 

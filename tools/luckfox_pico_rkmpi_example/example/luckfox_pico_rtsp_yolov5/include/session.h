@@ -47,6 +47,19 @@ enum class SnapState {
     COMPARE,     // 正常对比阶段
 };
 
+// 开门初始化状态：后台请求和第一份无手稳定快照是两个独立阶段
+enum class InitState {
+    WAIT_BACKEND,
+    WAIT_FIRST_STABLE_SNAPSHOT,
+    READY,
+};
+
+enum class BackendStatus {
+    UNKNOWN,
+    TRUSTED,
+    NO_TRUSTED_BACKEND,
+};
+
 enum class RelocationDecision {
     NO_RELOCATION,
     LOW_CONFIDENCE,
@@ -119,8 +132,19 @@ public:
 
     // ===== 主接口 =====
 
+    // 开门：开始一轮新会话，等待后台库存或首个无手稳定快照
+    void start_new_session(long long time_ms = 0);
+
     // 初始化（开门时从后台获取库存）
-    void init_from_backend(const std::vector<InventoryItem>& items);
+    // authoritative_empty=true 表示后台明确知道库存为空；默认空列表不可信。
+    void init_from_backend(const std::vector<InventoryItem>& items,
+                           bool authoritative_empty = false);
+
+    // 后台失败、超时、未接入或返回非权威空列表时调用
+    void mark_backend_unavailable();
+
+    // 关门：冻结本轮库存，清理未确认的跨快照证据
+    void finish_session(long long time_ms = 0);
 
     // 每帧调用：更新 OperationContext
     // hand_boxes: 当前帧所有手的bbox
@@ -138,7 +162,8 @@ public:
     SettlementResult push_snapshot(const Snapshot& snap, const cv::Mat& frame);
 
     // ===== 查询接口 =====
-    bool has_backend() const { return backend_initialized_; }
+    bool has_backend() const { return backend_status_ == BackendStatus::TRUSTED; }
+    bool ready() const { return init_state_ == InitState::READY; }
     const InventoryDB& inventory() const { return inventory_; }
     InventoryDB& inventory() { return inventory_; }
 
@@ -166,12 +191,15 @@ private:
 
     // ---- 库存 ----
     InventoryDB inventory_;
-    bool backend_initialized_;
+    BackendStatus backend_status_;
+    InitState init_state_;
     bool inventory_initialized_;                  // 库存是否已初始化（防止重复初始化）
     std::vector<InventoryItem> backend_items_;
 
     // ---- 时间 ----
     long long current_time_ms_;
+    long long session_start_time_ms_;
+    bool first_empty_grace_logged_;
 
     // ---- 辅助方法 ----
 
