@@ -24,11 +24,22 @@
 
 namespace fridge {
 
+// 轻量外观特征。只保存固定长度的小特征，不引入额外模型。
+struct AppearanceFeature {
+    bool valid;
+    float mean_bgr[3];
+    float patch_bgr[9][3];
+    float hue_hist[8];
+
+    AppearanceFeature() : valid(false), mean_bgr{0.0f, 0.0f, 0.0f}, patch_bgr{}, hue_hist{} {}
+};
+
 // 一条 detection（输入到 tracker 的原始检测结果）
 struct Detection {
     BBox box;       // 像素坐标，原图分辨率
     float score;    // 置信度 [0, 1]
     int cls_id;     // YOLO 类别 id
+    AppearanceFeature appearance; // bbox内的轻量外观特征，给快照/reid使用
 };
 
 // Track 的生命状态

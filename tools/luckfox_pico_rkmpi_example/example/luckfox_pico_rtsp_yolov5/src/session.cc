@@ -34,6 +34,85 @@ float aspect_ratio(const BBox& b) {
     return std::max(1.0f, b.w()) / h;
 }
 
+float similarity_from_abs_diff(float diff, float scale) {
+    if (scale <= 0.0f) return 0.0f;
+    return clamp01(1.0f - diff / scale);
+}
+
+float mean_color_similarity(const AppearanceFeature& a, const AppearanceFeature& b) {
+    float diff = 0.0f;
+    for (int c = 0; c < 3; ++c) {
+        diff += std::abs(a.mean_bgr[c] - b.mean_bgr[c]);
+    }
+    return similarity_from_abs_diff(diff / 3.0f, 255.0f);
+}
+
+float patch_color_similarity(const AppearanceFeature& a, const AppearanceFeature& b) {
+    float diff = 0.0f;
+    for (int p = 0; p < 9; ++p) {
+        for (int c = 0; c < 3; ++c) {
+            diff += std::abs(a.patch_bgr[p][c] - b.patch_bgr[p][c]);
+        }
+    }
+    return similarity_from_abs_diff(diff / 27.0f, 255.0f);
+}
+
+float hue_hist_similarity(const AppearanceFeature& a, const AppearanceFeature& b) {
+    float intersection = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        intersection += std::min(a.hue_hist[i], b.hue_hist[i]);
+    }
+    return clamp01(intersection);
+}
+
+float appearance_similarity(const AppearanceFeature& a, const AppearanceFeature& b) {
+    if (!a.valid || !b.valid) return -1.0f;
+    float mean_sim = mean_color_similarity(a, b);
+    float patch_sim = patch_color_similarity(a, b);
+    float hue_sim = hue_hist_similarity(a, b);
+    return clamp01(0.35f * mean_sim + 0.40f * patch_sim + 0.25f * hue_sim);
+}
+
+float overlap_ratio_of_first(const BBox& covered, const BBox& cover) {
+    float ix1 = std::max(covered.x1, cover.x1);
+    float iy1 = std::max(covered.y1, cover.y1);
+    float ix2 = std::min(covered.x2, cover.x2);
+    float iy2 = std::min(covered.y2, cover.y2);
+    float iw = std::max(0.0f, ix2 - ix1);
+    float ih = std::max(0.0f, iy2 - iy1);
+    float inter = iw * ih;
+    float area = covered.area();
+    if (inter <= 0.0f || area <= 0.0f) return 0.0f;
+    return inter / area;
+}
+
+bool covers_disappeared_position(const BBox& old_box, const BBox& cover_box) {
+    if (iou(old_box, cover_box) >= OCCLUSION_IOU_THRESH) return true;
+    if (overlap_ratio_of_first(old_box, cover_box) >= OCCLUSION_COVER_RATIO) return true;
+    return point_in_box(old_box.cx(), old_box.cy(), cover_box);
+}
+
+bool target_position_conflicts(const BBox& target, const BBox& occupied) {
+    if (iou(target, occupied) >= RELOCATION_TARGET_OCCUPIED_IOU) return true;
+    if (overlap_ratio_of_smaller(target, occupied) >= RELOCATION_TARGET_OCCUPIED_COVER) return true;
+    return point_in_box(target.cx(), target.cy(), occupied);
+}
+
+bool target_occupied_by_stable_baseline(
+        const Snapshot& baseline,
+        const std::vector<std::pair<int, int>>& same_position_pairs,
+        int moving_baseline_idx,
+        const BBox& target_box) {
+    for (const auto& p : same_position_pairs) {
+        if (p.first == moving_baseline_idx) continue;
+        const VotingItem& stable_old = baseline.items[p.first];
+        if (target_position_conflicts(target_box, stable_old.box)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool strict_box_match(const BBox& a, int cls_a, const BBox& b, int cls_b) {
     if (cls_a != cls_b) return false;
     if (center_distance(a, b) >= IDENTITY_CENTER_DIST) return false;
@@ -290,9 +369,28 @@ float SessionManager::reid_score(const VotingItem& a, const VotingItem& b) const
     float ar_b = aspect_ratio(b.box);
     float ar_score = 1.0f - std::min(std::abs(ar_a - ar_b) / std::max(ar_a, ar_b), 1.0f);
     float score_score = 1.0f - std::min(std::abs(a.best_score - b.best_score), 1.0f);
+    float appearance_score = appearance_similarity(a.appearance, b.appearance);
 
-    // 同类别是基础条件，但不能让它单独决定整理。
-    float score = 0.40f + 0.30f * area_score + 0.20f * ar_score + 0.10f * score_score;
+    // 同类别只是硬条件，不再给过高基础分。外观特征有效时优先使用外观；
+    // 外观无效时退回到几何分数，但尺寸/比例差异过大时会封顶。
+    float score = 0.0f;
+    if (appearance_score >= 0.0f) {
+        score = 0.10f
+              + 0.45f * appearance_score
+              + 0.25f * area_score
+              + 0.15f * ar_score
+              + 0.05f * score_score;
+    } else {
+        score = 0.20f
+              + 0.45f * area_score
+              + 0.25f * ar_score
+              + 0.10f * score_score;
+    }
+
+    if (area_score < RELOCATION_REID_MIN_AREA_SCORE ||
+        ar_score < RELOCATION_REID_MIN_ASPECT_SCORE) {
+        score = std::min(score, RELOCATION_REID_MIN - 0.01f);
+    }
     return clamp01(score);
 }
 
@@ -661,6 +759,7 @@ SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::M
             snap_state_ = SnapState::COMPARE;
             reset_operation_context(snap.frame_id, snap.frame_id);
             result.happened = true;
+            result.inventory_changed = true;
             printf("[SESSION] 快照已就绪，进入统一对比模式 (库存=%zu 件)\n",
                    inventory_.count_by_status(ItemStatus::VISIBLE) +
                    inventory_.count_by_status(ItemStatus::OCCLUDED));
@@ -676,7 +775,8 @@ SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::M
                 contrast_ = current_;
                 reset_operation_context(snap1_.frame_id, snap1_.frame_id);
 
-                if (result.happened) {
+                if (result.inventory_changed) {
+                    printf("\n\033[1;36m[INVENTORY]\033[0m 库存状态已变化:\n");
                     print_inventory();
                 }
             } else {
@@ -746,6 +846,7 @@ void SessionManager::process_pending_relocations(const Snapshot& snap2,
                 result.events.push_back({EventKind::MOVED, p.item_id_A,
                                           p.class_id, B.box, B.best_score});
                 result.happened = true;
+                result.inventory_changed = true;
             }
             continue;
         }
@@ -774,9 +875,29 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     std::vector<int> disappeared_indices;
     std::vector<int> appeared_indices;
     std::set<int> used_snap2_origin_indices;
+    std::vector<int> snap1_inventory_ids(snap1_.items.size(), -1);
+    std::set<int> used_inventory_origin_ids;
 
     for (int i = 0; i < (int)snap1_.items.size(); ++i) {
         const VotingItem& A = snap1_.items[i];
+        int best_item_id = -1;
+        float best_item_dist = 999999.0f;
+        for (const auto& kv : inventory_.items()) {
+            if (used_inventory_origin_ids.count(kv.first)) continue;
+            const InventoryItem& inv = kv.second;
+            if (inv.status == ItemStatus::OUT) continue;
+            if (!strict_box_match(A.box, A.cls_id, inv.box, inv.cls_id)) continue;
+            float d = center_distance(A.box, inv.box);
+            if (d < best_item_dist) {
+                best_item_dist = d;
+                best_item_id = kv.first;
+            }
+        }
+        if (best_item_id >= 0) {
+            snap1_inventory_ids[i] = best_item_id;
+            used_inventory_origin_ids.insert(best_item_id);
+        }
+
         int b_idx = find_in_snapshot_strict(snap2, A.cls_id, A.box, used_snap2_origin_indices);
         if (b_idx >= 0) {
             same_position_pairs.push_back({i, b_idx});
@@ -794,13 +915,19 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
 
     for (const auto& p : same_position_pairs) {
         const VotingItem& B = snap2.items[p.second];
-        int item_id = find_inventory_item_strict(B.box, B.cls_id, false);
+        int item_id = snap1_inventory_ids[p.first];
+        if (item_id < 0) {
+            item_id = find_inventory_item_strict(B.box, B.cls_id, false);
+        }
         if (item_id < 0) continue;
 
         const InventoryItem* item = inventory_.find_by_item(item_id);
         if (!item) continue;
         if (item->status == ItemStatus::OCCLUDED) {
-            inventory_.set_status(item_id, ItemStatus::VISIBLE, current_time_ms_);
+            if (inventory_.set_status(item_id, ItemStatus::VISIBLE, current_time_ms_)) {
+                result.happened = true;
+                result.inventory_changed = true;
+            }
         }
         inventory_.update_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
     }
@@ -809,6 +936,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     std::set<int> consumed_appeared_indices;
     std::set<int> reserved_snap2_indices;
     std::set<int> blocked_appeared_inventory_ids;
+    std::set<int> consumed_inventory_ids;
 
     process_pending_relocations(snap2, result, reserved_snap2_indices);
 
@@ -819,7 +947,10 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (consumed_disappeared_indices.count(a_idx)) continue;
         const VotingItem& A = snap1_.items[a_idx];
 
-        int item_id = find_inventory_item_strict(A.box, A.cls_id, false);
+        int item_id = snap1_inventory_ids[a_idx];
+        if (item_id < 0) {
+            item_id = find_inventory_item_strict(A.box, A.cls_id, false);
+        }
         if (item_id < 0) continue;
         const InventoryItem* item = inventory_.find_by_item(item_id);
         if (!item || item->status != ItemStatus::VISIBLE) continue;
@@ -835,6 +966,9 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             if (reserved_snap2_indices.count(b_idx)) continue;
             const VotingItem& B = snap2.items[b_idx];
             if (A.cls_id != B.cls_id) continue;
+            if (target_occupied_by_stable_baseline(snap1_, same_position_pairs, a_idx, B.box)) {
+                continue;
+            }
             float r = reid_score(A, B);
             if (r >= RELOCATION_REID_MIN) {
                 candidates.push_back({b_idx, r});
@@ -858,11 +992,13 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             inventory_.update_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
             consumed_disappeared_indices.insert(a_idx);
             consumed_appeared_indices.insert(best_idx);
+            consumed_inventory_ids.insert(item_id);
             printf("\033[1;32m[EVENT]\033[0m 整理: item#%d %s "
                    "(reid=%.2f evidence=%.2f)\n",
                    item_id, coco_cls_to_name(A.cls_id), best_reid, evidence_score);
             result.events.push_back({EventKind::MOVED, item_id, A.cls_id, B.box, B.best_score});
             result.happened = true;
+            result.inventory_changed = true;
         } else if (decision == RelocationDecision::LOW_CONFIDENCE) {
             bool exists = false;
             for (auto& p : pending_relocations_) {
@@ -898,6 +1034,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             consumed_disappeared_indices.insert(a_idx);
             consumed_appeared_indices.insert(best_idx);
             reserved_snap2_indices.insert(best_idx);
+            consumed_inventory_ids.insert(item_id);
         }
     }
 
@@ -908,7 +1045,10 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (consumed_disappeared_indices.count(a_idx)) continue;
 
         const VotingItem& A = snap1_.items[a_idx];
-        int item_id = find_inventory_item_strict(A.box, A.cls_id, false);
+        int item_id = snap1_inventory_ids[a_idx];
+        if (item_id < 0) {
+            item_id = find_inventory_item_strict(A.box, A.cls_id, false);
+        }
         if (item_id < 0) continue;
 
         const InventoryItem* item = inventory_.find_by_item(item_id);
@@ -929,6 +1069,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             const VotingItem& C = snap2.items[c_idx];
             float nearby_dist = normalized_nearby_distance(A.box, C.box);
             if (nearby_dist >= NEARBY_DISTANCE_THRESH) continue;
+            if (!covers_disappeared_position(A.box, C.box)) continue;
 
             int inventory_c_id = -1;
             float best_c_dist = 999.0f;
@@ -955,34 +1096,49 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 inventory_.set_status(inventory_c_id, ItemStatus::VISIBLE, current_time_ms_);
                 inventory_.update_item(inventory_c_id, -1, C.box, C.best_score, snap2.frame_id);
                 consumed_appeared_indices.insert(c_idx);
-                printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
+                const InventoryItem* out_item = inventory_.find_by_item(item_id);
+                long long out_order = out_item ? out_item->out_order_id : 0;
+                printf("\033[1;32m[EVENT]\033[0m 取出: out#%lld item#%d %s "
                        "(旧物品 item#%d 露出)\n",
-                       item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
+                       out_order, item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
                 result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
                 result.happened = true;
+                result.inventory_changed = true;
+                consumed_inventory_ids.insert(item_id);
                 found_reason = true;
                 break;
             }
 
             if (inventory_c && inventory_c->status == ItemStatus::VISIBLE) {
+                inventory_.set_status(item_id, ItemStatus::OCCLUDED, current_time_ms_);
+                printf("[SESSION] item#%d (%s) 被可见物品 item#%d 覆盖，转为遮挡\n",
+                       item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
+                result.happened = true;
+                result.inventory_changed = true;
                 found_reason = true;
                 break;
             }
 
             inventory_.set_status(item_id, ItemStatus::OCCLUDED, current_time_ms_);
             blocked_appeared_inventory_ids.insert(item_id);
-            printf("[SESSION] item#%d (%s) 可能被新物品遮挡，C 留给新物品流程处理\n",
+            printf("[SESSION] item#%d (%s) 被新物品覆盖，转为遮挡；C 留给新物品流程处理\n",
                    item_id, coco_cls_to_name(A.cls_id));
+            result.happened = true;
+            result.inventory_changed = true;
             found_reason = true;
             break;
         }
 
         if (!found_reason) {
             inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
-            printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (位置空了)\n",
-                   item_id, coco_cls_to_name(A.cls_id));
+            const InventoryItem* out_item = inventory_.find_by_item(item_id);
+            long long out_order = out_item ? out_item->out_order_id : 0;
+            printf("\033[1;32m[EVENT]\033[0m 取出: out#%lld item#%d %s (位置空了)\n",
+                   out_order, item_id, coco_cls_to_name(A.cls_id));
             result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
             result.happened = true;
+            result.inventory_changed = true;
+            consumed_inventory_ids.insert(item_id);
         }
     }
 
@@ -995,6 +1151,63 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
 
         const VotingItem& B = snap2.items[b_idx];
 
+        int operation_move_id = -1;
+        float operation_move_reid = 0.0f;
+        float operation_move_evidence = 0.0f;
+        float operation_move_score = 0.0f;
+        for (const auto& kv : inventory_.items()) {
+            int candidate_id = kv.first;
+            if (consumed_inventory_ids.count(candidate_id)) continue;
+            const InventoryItem& inv = kv.second;
+            if (inv.status != ItemStatus::VISIBLE) continue;
+            if (inv.cls_id != B.cls_id) continue;
+            if (strict_box_match(inv.box, inv.cls_id, B.box, B.cls_id)) continue;
+
+            int baseline_idx = -1;
+            for (int i = 0; i < (int)snap1_inventory_ids.size(); ++i) {
+                if (snap1_inventory_ids[i] == candidate_id) {
+                    baseline_idx = i;
+                    break;
+                }
+            }
+            if (baseline_idx >= 0 &&
+                target_occupied_by_stable_baseline(snap1_, same_position_pairs,
+                                                   baseline_idx, B.box)) {
+                continue;
+            }
+
+            float evidence = relocation_evidence_score(candidate_id, inv.box, B.box);
+            if (evidence < RELOCATION_EVIDENCE_STRONG) continue;
+
+            float reid = baseline_idx >= 0 ? reid_score(snap1_.items[baseline_idx], B)
+                                           : RELOCATION_REID_STRONG;
+            if (reid < RELOCATION_REID_MIN) continue;
+
+            float score = 0.60f * evidence + 0.40f * reid;
+            if (score > operation_move_score) {
+                operation_move_score = score;
+                operation_move_id = candidate_id;
+                operation_move_reid = reid;
+                operation_move_evidence = evidence;
+            }
+        }
+
+        if (operation_move_id >= 0) {
+            inventory_.set_status(operation_move_id, ItemStatus::VISIBLE, current_time_ms_);
+            inventory_.update_item(operation_move_id, -1, B.box, B.best_score, snap2.frame_id);
+            consumed_inventory_ids.insert(operation_move_id);
+            consumed_appeared_indices.insert(b_idx);
+            printf("\033[1;32m[EVENT]\033[0m 整理: item#%d %s "
+                   "(旧位置未消失, reid=%.2f evidence=%.2f)\n",
+                   operation_move_id, coco_cls_to_name(B.cls_id),
+                   operation_move_reid, operation_move_evidence);
+            result.events.push_back({EventKind::MOVED, operation_move_id,
+                                      B.cls_id, B.box, B.best_score});
+            result.happened = true;
+            result.inventory_changed = true;
+            continue;
+        }
+
         int local_id = find_inventory_item_strict(B.box, B.cls_id, false);
         if (blocked_appeared_inventory_ids.count(local_id)) {
             local_id = -1;
@@ -1005,6 +1218,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 inventory_.set_status(local_id, ItemStatus::VISIBLE, current_time_ms_);
                 printf("[SESSION] item#%d (%s) 从遮挡恢复为可见\n",
                        local_id, coco_cls_to_name(B.cls_id));
+                result.happened = true;
+                result.inventory_changed = true;
             }
             inventory_.update_item(local_id, -1, B.box, B.best_score, snap2.frame_id);
             continue;
@@ -1018,6 +1233,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 inventory_.update_item(out_id, -1, B.box, B.best_score, snap2.frame_id);
                 printf("[SESSION] item#%d (%s) 从出库恢复为可见\n",
                        out_id, coco_cls_to_name(B.cls_id));
+                result.happened = true;
+                result.inventory_changed = true;
                 continue;
             }
         }
@@ -1030,6 +1247,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                B.box.x1, B.box.y1, B.box.x2, B.box.y2);
         result.events.push_back({EventKind::IN, new_id, B.cls_id, B.box, B.best_score});
         result.happened = true;
+        result.inventory_changed = true;
     }
 
     // ---------------------------------------------------------------------
@@ -1050,6 +1268,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     for (int id : out_to_remove) {
         printf("[SESSION] 清理冗余 OUT item#%d\n", id);
         inventory_.remove_item(id);
+        result.happened = true;
+        result.inventory_changed = true;
     }
 
     std::vector<int> occluded_to_remove;
@@ -1067,9 +1287,14 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     for (int id : occluded_to_remove) {
         printf("[SESSION] 清理冗余 OCCLUDED item#%d\n", id);
         inventory_.remove_item(id);
+        result.happened = true;
+        result.inventory_changed = true;
     }
 
-    inventory_.cleanup_expired(current_time_ms_);
+    if (inventory_.cleanup_expired(current_time_ms_)) {
+        result.happened = true;
+        result.inventory_changed = true;
+    }
     return result;
 }
 
@@ -1106,19 +1331,19 @@ void SessionManager::print_inventory() {
         printf("\n");
         printf("  ┌──────────────────────────────────────────────────┐\n");
         printf("  │  出库记录 │ 共: %-3zu                               │\n", n_out);
-        printf("  ├────┬──────────────┬───────────────────────────────┤\n");
-        printf("  │ #  │ 类别         │ 原位置 (中心)                 │\n");
-        printf("  ├────┼──────────────┼───────────────────────────────┤\n");
+        printf("  ├──────┬────┬──────────────┬───────────────────────┤\n");
+        printf("  │ 单号 │ #  │ 类别         │ 原位置 (中心)         │\n");
+        printf("  ├──────┼────┼──────────────┼───────────────────────┤\n");
 
         for (const auto& kv : inventory_.items()) {
             const auto& it = kv.second;
             if (it.status != ItemStatus::OUT) continue;
-            printf("  │ %-2d │ %-12s │ (%4.0f,%4.0f)                │\n",
-                   it.item_id, coco_cls_to_name(it.cls_id),
+            printf("  │ %-4lld │ %-2d │ %-12s │ (%4.0f,%4.0f)      │\n",
+                   it.out_order_id, it.item_id, coco_cls_to_name(it.cls_id),
                    it.box.cx(), it.box.cy());
         }
 
-        printf("  └────┴──────────────┴───────────────────────────────┘\n");
+        printf("  └──────┴────┴──────────────┴───────────────────────┘\n");
     }
     printf("\n");
 }

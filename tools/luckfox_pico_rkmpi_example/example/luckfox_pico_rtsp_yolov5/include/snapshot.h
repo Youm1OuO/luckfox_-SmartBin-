@@ -23,6 +23,7 @@ struct VotingItem {
     BBox box;           // 平均位置（多帧加权平均）
     float best_score;   // 最高分数
     int count;          // 出现帧数
+    AppearanceFeature appearance; // 多帧融合后的轻量外观特征
 };
 
 // 一份快照（投票过滤后的最终结果）

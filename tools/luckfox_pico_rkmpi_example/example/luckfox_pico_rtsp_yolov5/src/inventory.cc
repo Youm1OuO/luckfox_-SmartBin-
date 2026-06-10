@@ -34,6 +34,7 @@ int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
     it.updated_frame = frame_id;
     it.created_time_ms = time_ms;
     it.out_time_ms = 0;
+    it.out_order_id = 0;
     items_[it.item_id] = it;
     return it.item_id;
 }
@@ -48,15 +49,24 @@ const InventoryItem* InventoryDB::find_by_item(int item_id) const {
     return it == items_.end() ? nullptr : &it->second;
 }
 
-void InventoryDB::set_status(int item_id, ItemStatus new_status, long long time_ms) {
+bool InventoryDB::set_status(int item_id, ItemStatus new_status, long long time_ms) {
     auto it = items_.find(item_id);
-    if (it == items_.end()) return;
+    if (it == items_.end()) return false;
+
+    ItemStatus old_status = it->second.status;
+    if (old_status == new_status) {
+        return false;
+    }
+
     it->second.status = new_status;
     if (new_status == ItemStatus::OUT) {
         it->second.out_time_ms = time_ms;
+        it->second.out_order_id = next_out_order_id_++;
     } else {
         it->second.out_time_ms = 0;
+        it->second.out_order_id = 0;
     }
+    return true;
 }
 
 void InventoryDB::update_item(int item_id, int track_id, const BBox& box,
@@ -81,7 +91,7 @@ size_t InventoryDB::count_by_status(ItemStatus s) const {
     return n;
 }
 
-void InventoryDB::cleanup_expired(long long now_ms) {
+bool InventoryDB::cleanup_expired(long long now_ms) {
     std::vector<int> expired;
     for (const auto& kv : items_) {
         if (kv.second.status == ItemStatus::OUT && kv.second.out_time_ms > 0) {
@@ -94,6 +104,7 @@ void InventoryDB::cleanup_expired(long long now_ms) {
         printf("[INVENTORY] item#%d 出库超时，清除记录\n", id);
         items_.erase(id);
     }
+    return !expired.empty();
 }
 
 void InventoryDB::print(const char* prefix) const {
@@ -129,10 +140,10 @@ void InventoryDB::print(const char* prefix) const {
         for (const auto& kv : items_) {
             const auto& it = kv.second;
             if (it.status != ItemStatus::OUT) continue;
-            printf("%s  - item#%d cls=%d(%s) [出库] "
+            printf("%s  - out#%lld item#%d cls=%d(%s) [出库] "
                    "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
                    prefix,
-                   it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
+                   it.out_order_id, it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
                    it.box.x1, it.box.y1, it.box.x2, it.box.y2,
                    it.score, it.track_id);
         }

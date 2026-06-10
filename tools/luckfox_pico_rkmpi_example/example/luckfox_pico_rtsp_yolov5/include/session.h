@@ -38,6 +38,7 @@ struct InventoryEvent {
 
 struct SettlementResult {
     bool happened = false;
+    bool inventory_changed = false;
     std::vector<InventoryEvent> events;
 };
 

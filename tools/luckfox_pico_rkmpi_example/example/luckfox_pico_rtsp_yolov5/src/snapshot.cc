@@ -10,6 +10,36 @@
 
 namespace fridge {
 
+namespace {
+
+void merge_appearance(AppearanceFeature& dst,
+                      const AppearanceFeature& src,
+                      int old_count,
+                      int new_count) {
+    if (!src.valid) return;
+    if (!dst.valid || old_count <= 0) {
+        dst = src;
+        return;
+    }
+
+    float old_w = (float)old_count / (float)new_count;
+    float new_w = 1.0f / (float)new_count;
+    for (int c = 0; c < 3; ++c) {
+        dst.mean_bgr[c] = dst.mean_bgr[c] * old_w + src.mean_bgr[c] * new_w;
+    }
+    for (int p = 0; p < 9; ++p) {
+        for (int c = 0; c < 3; ++c) {
+            dst.patch_bgr[p][c] = dst.patch_bgr[p][c] * old_w + src.patch_bgr[p][c] * new_w;
+        }
+    }
+    for (int h = 0; h < 8; ++h) {
+        dst.hue_hist[h] = dst.hue_hist[h] * old_w + src.hue_hist[h] * new_w;
+    }
+    dst.valid = true;
+}
+
+}  // namespace
+
 // ============================================================================
 //  SnapshotBuffer
 // ============================================================================
@@ -85,6 +115,7 @@ Snapshot SnapshotBuffer::take_snapshot() {
                 //    投票阶段连续帧间颜色几乎不变，前4个条件已经足够
 
                 // 匹配上 → 更新
+                int old_count = vi.count;
                 vi.count++;
                 // 位置取加权平均（累积平均）
                 float n = (float)vi.count;
@@ -92,6 +123,7 @@ Snapshot SnapshotBuffer::take_snapshot() {
                 vi.box.y1 = vi.box.y1 * (n-1)/n + det.box.y1 / n;
                 vi.box.x2 = vi.box.x2 * (n-1)/n + det.box.x2 / n;
                 vi.box.y2 = vi.box.y2 * (n-1)/n + det.box.y2 / n;
+                merge_appearance(vi.appearance, det.appearance, old_count, vi.count);
                 if (det.score > vi.best_score) vi.best_score = det.score;
                 matched = true;
                 break;
@@ -104,6 +136,7 @@ Snapshot SnapshotBuffer::take_snapshot() {
                 vi.box = det.box;
                 vi.best_score = det.score;
                 vi.count = 1;
+                vi.appearance = det.appearance;
                 voting_table.push_back(vi);
             }
         }

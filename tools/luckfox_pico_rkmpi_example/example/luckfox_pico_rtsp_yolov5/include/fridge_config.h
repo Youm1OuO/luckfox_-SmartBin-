@@ -186,6 +186,10 @@ constexpr float RELOCATION_REID_STRONG       = 0.82f;
 constexpr float RELOCATION_REID_MARGIN       = 0.10f;
 constexpr float RELOCATION_EVIDENCE_WEAK     = 0.25f;
 constexpr float RELOCATION_EVIDENCE_STRONG   = 0.75f;
+constexpr float RELOCATION_REID_MIN_AREA_SCORE   = 0.45f;
+constexpr float RELOCATION_REID_MIN_ASPECT_SCORE = 0.45f;
+constexpr float RELOCATION_TARGET_OCCUPIED_IOU   = 0.25f;
+constexpr float RELOCATION_TARGET_OCCUPIED_COVER = 0.50f;
 constexpr int   PENDING_RELOCATION_CONFIRM_FRAMES = 1;
 constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
 
@@ -205,6 +209,8 @@ constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定
 //  小于此值判定为"附近"
 // =========================================================================
 constexpr float NEARBY_DISTANCE_THRESH = 1.0f;  // 设计文档建议值，可微调
+constexpr float OCCLUSION_IOU_THRESH = 0.10f;
+constexpr float OCCLUSION_COVER_RATIO = 0.35f;
 
 // =========================================================================
 //  新业务流程6：OperationContext / HELD 证据相关

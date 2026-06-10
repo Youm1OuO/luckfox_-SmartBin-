@@ -36,11 +36,12 @@ struct InventoryItem {
     int updated_frame;        // 最近更新帧号
     long long created_time_ms;// 入库时间戳
     long long out_time_ms;    // 出库时间戳（仅OUT状态有效，用于过期清理）
+    long long out_order_id;   // 出库单号（仅OUT状态有效）
 };
 
 class InventoryDB {
 public:
-    InventoryDB() : next_item_id_(1) {}
+    InventoryDB() : next_item_id_(1), next_out_order_id_(1) {}
 
     // 新增一个物品，返回分配的 item_id（默认状态：VISIBLE）
     int add_item(int track_id, int cls_id, const BBox& box, float score,
@@ -51,7 +52,7 @@ public:
     const InventoryItem* find_by_item(int item_id) const;
 
     // 标记某个物品为指定状态
-    void set_status(int item_id, ItemStatus new_status, long long time_ms = 0);
+    bool set_status(int item_id, ItemStatus new_status, long long time_ms = 0);
 
     // 更新某个物品的位置和信息
     void update_item(int item_id, int track_id, const BBox& box, float score, int frame_id);
@@ -64,7 +65,7 @@ public:
     size_t count_by_status(ItemStatus s) const;
 
     // 清理过期的 OUT 物品
-    void cleanup_expired(long long now_ms);
+    bool cleanup_expired(long long now_ms);
 
     // 调试打印
     void print(const char* prefix = "") const;
@@ -76,6 +77,7 @@ public:
 private:
     std::map<int, InventoryItem> items_;
     int next_item_id_;
+    long long next_out_order_id_;
 };
 
 const char* item_status_to_str(ItemStatus s);

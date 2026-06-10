@@ -23,6 +23,7 @@
 #include <sys/poll.h>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
 #include <vector>
 #include <thread>
 
@@ -132,6 +133,64 @@ static bool covered_by_track(const fridge::Detection& det,
 		}
 	}
 	return false;
+}
+
+static void fill_appearance_feature(const cv::Mat& frame, fridge::Detection& det) {
+	fridge::AppearanceFeature feature;
+	if (frame.empty()) {
+		det.appearance = feature;
+		return;
+	}
+
+	int x1 = std::max(0, (int)det.box.x1);
+	int y1 = std::max(0, (int)det.box.y1);
+	int x2 = std::min(frame.cols, (int)det.box.x2);
+	int y2 = std::min(frame.rows, (int)det.box.y2);
+	if (x2 <= x1 || y2 <= y1) {
+		det.appearance = feature;
+		return;
+	}
+
+	cv::Mat roi = frame(cv::Rect(x1, y1, x2 - x1, y2 - y1));
+	cv::Mat small;
+	cv::resize(roi, small, cv::Size(24, 24), 0, 0, cv::INTER_LINEAR);
+
+	cv::Scalar mean = cv::mean(small);
+	feature.mean_bgr[0] = (float)mean[0];
+	feature.mean_bgr[1] = (float)mean[1];
+	feature.mean_bgr[2] = (float)mean[2];
+
+	for (int py = 0; py < 3; ++py) {
+		for (int px = 0; px < 3; ++px) {
+			cv::Rect pr(px * 8, py * 8, 8, 8);
+			cv::Scalar pm = cv::mean(small(pr));
+			int idx = py * 3 + px;
+			feature.patch_bgr[idx][0] = (float)pm[0];
+			feature.patch_bgr[idx][1] = (float)pm[1];
+			feature.patch_bgr[idx][2] = (float)pm[2];
+		}
+	}
+
+	cv::Mat hsv;
+	cv::cvtColor(small, hsv, cv::COLOR_BGR2HSV);
+	float hist_sum = 0.0f;
+	for (int yy = 0; yy < hsv.rows; ++yy) {
+		for (int xx = 0; xx < hsv.cols; ++xx) {
+			const cv::Vec3b& p = hsv.at<cv::Vec3b>(yy, xx);
+			if (p[1] < 20 || p[2] < 20) continue;
+			int bin = std::min(7, (int)p[0] * 8 / 180);
+			feature.hue_hist[bin] += 1.0f;
+			hist_sum += 1.0f;
+		}
+	}
+	if (hist_sum > 0.0f) {
+		for (int i = 0; i < 8; ++i) {
+			feature.hue_hist[i] /= hist_sum;
+		}
+	}
+
+	feature.valid = true;
+	det.appearance = feature;
 }
 
 
@@ -357,6 +416,7 @@ int main(int argc, char *argv[]) {
 				d.box = fridge::BBox((float)x1, (float)y1, (float)x2, (float)y2);
 				d.score = r.prop;
 				d.cls_id = r.cls_id;
+				fill_appearance_feature(frame, d);
 				detections.push_back(d);
 
 				if (fridge::is_hand(d.cls_id)) {
@@ -463,10 +523,6 @@ int main(int argc, char *argv[]) {
 					cloud.enqueue(job);
 				}
 
-				if (res.happened && !res.events.empty()) {
-					printf("\n\033[1;36m[INVENTORY]\033[0m 快照对比后库存:\n");
-					session.inventory().print("  ");
-				}
 			}
 
 			// ============================================================
