@@ -45,7 +45,7 @@ cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
 python fridge_project/scripts/train.py stage-c \
     --data /home/muyou/Projects/workspace/luckfox_demo/tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset/data.yaml \
     --weights runs/train/hand_plus_v1/weights/best.pt \
-    --epochs 500 \
+    --epochs 800 \
     --batch-size 32 \
     --imgsz 704 \
     --workers 8 \

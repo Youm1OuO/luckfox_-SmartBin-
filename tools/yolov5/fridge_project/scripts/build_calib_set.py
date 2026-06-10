@@ -16,6 +16,9 @@ build_calib_set.py
       train/images/ + train/labels/    <- 抽这个
       valid/images/ + valid/labels/    <- 也抽这个 (可选)
       test/images/  + test/labels/     <- 默认不抽 (留作真测试集)
+    <yolo_dataset>/
+      images/train/ + labels/train/     <- 也支持
+      images/val/   + labels/val/       <- 也支持
     <another_dataset>/
       train/images/...                  <- 自动发现
     <flat_dataset>/
@@ -68,8 +71,8 @@ DEFAULT_RKNN_YOLOV5 = (
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
-# Roboflow 风格的 split 子目录名 (按"应不应该用作校准"排序)
-SPLIT_DIRS_DEFAULT = ["train", "valid"]   # 默认含 train + valid
+# Roboflow / YOLO 风格的 split 子目录名 (按"应不应该用作校准"排序)
+SPLIT_DIRS_DEFAULT = ["train", "valid", "val"]   # 默认含 train + valid/val
 SPLIT_DIR_TEST = "test"
 
 
@@ -106,6 +109,7 @@ def discover_image_dirs(datasets_root: Path, splits, include_test: bool):
     例如:
       datasets/<X>/train/images <-> datasets/<X>/train/labels
       datasets/<Y>/images       <-> datasets/<Y>/labels
+      datasets/<Z>/images/train <-> datasets/<Z>/labels/train
 
     splits: 用户指定的 split 名字列表 (用来过滤 train/valid/test);
             扁平结构 (无 split) 不受限, 直接接受.
@@ -113,18 +117,41 @@ def discover_image_dirs(datasets_root: Path, splits, include_test: bool):
     if not datasets_root.is_dir():
         return []
 
-    allowed_splits = set(splits)
+    allowed_splits = {s.lower() for s in splits}
+    # Ultralytics 常用 val, Roboflow 常用 valid；用户写任意一个都认为等价。
+    if "valid" in allowed_splits:
+        allowed_splits.add("val")
+    if "val" in allowed_splits:
+        allowed_splits.add("valid")
     if include_test:
         allowed_splits.add(SPLIT_DIR_TEST)
 
     pairs = []
+    seen = set()
+
+    def add_pair(images_dir: Path, labels_dir: Path):
+        if not images_dir.is_dir() or not labels_dir.is_dir():
+            return
+        # 对 images/train 这种布局来说，外层 images 目录本身没有图片，
+        # 只包含 train/val 子目录；跳过它，避免输出一个 0 张的假子集。
+        has_direct_image = any(
+            p.is_file() and p.suffix.lower() in IMG_EXTS
+            for p in images_dir.iterdir()
+        )
+        if not has_direct_image:
+            return
+        key = (images_dir.resolve(), labels_dir.resolve())
+        if key in seen:
+            return
+        seen.add(key)
+        pairs.append((images_dir, labels_dir))
+
     # rglob 比手动 walk 简洁, 性能也够用 (Roboflow 数据集层级浅)
+    # 结构1: train/images + train/labels，或扁平 images + labels。
     for images_dir in datasets_root.rglob("images"):
         if not images_dir.is_dir():
             continue
         labels_dir = images_dir.parent / "labels"
-        if not labels_dir.is_dir():
-            continue
 
         # 判断是否处在某个 split 子目录下 (train/valid/test)
         # 父目录名 = split_name (Roboflow 风格)
@@ -139,7 +166,21 @@ def discover_image_dirs(datasets_root: Path, splits, include_test: bool):
                 continue
         # 扁平结构: 直接通过
 
-        pairs.append((images_dir, labels_dir))
+        add_pair(images_dir, labels_dir)
+
+    # 结构2: images/train + labels/train，images/val + labels/val。
+    for split_images_dir in datasets_root.rglob("images/*"):
+        if not split_images_dir.is_dir():
+            continue
+        split_name = split_images_dir.name.lower()
+        if split_name not in {"train", "valid", "val", "test"}:
+            continue
+        if split_name not in allowed_splits:
+            continue
+
+        dataset_root = split_images_dir.parent.parent
+        labels_dir = dataset_root / "labels" / split_images_dir.name
+        add_pair(split_images_dir, labels_dir)
 
     # 排序保证可复现 (随机种子 + 输入顺序固定 -> 输出固定)
     pairs.sort(key=lambda p: str(p[0]).lower())

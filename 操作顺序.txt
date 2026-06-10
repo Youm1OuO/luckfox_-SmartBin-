@@ -1,5 +1,8 @@
 # .pt → .ONNX (正常的训练与转模型, 在wls中)
 # export.py 在 yolov5 中
+
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+
 python export.py \
     --rknpu \
     --weight <.pt 的权重文件的路径名> \
@@ -12,6 +15,13 @@ python export.py \
 // 改矫正用的图片 (在wls中)
     cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5/fridge_project/scripts/
     python build_calib_set.py --num 200
+
+冰箱数据集时：
+    cd /home/muyou/Projects/workspace/luckfox_demo
+
+    python3 tools/yolov5/fridge_project/scripts/build_calib_set.py \
+        --num 300 \
+        --datasets-root tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset
 
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
@@ -56,14 +66,15 @@ docker 中的指令:
 
 // .onnx 转 .rknn (在docker中)
 cd /workspace/tools/rknn_model_zoo/examples/yolov5/python
+
 python3 convert.py ../model/yolov5s.onnx rv1106 i8 ./yolov5.rknn
 python3 convert.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
 python3 convert_fridge.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
 即:
 python3 convert_fridge.py \
-    /workspace/tools/yolov5/runs/train/hand_plus_v1/weights/best.onnx \
+    /workspace/tools/yolov5/runs/train/fridge_self_704_unfreeze/weights/best.onnx \
     rv1106 i8 \
-    /workspace/tools/yolov5/runs/train/hand_plus_v1/weights/best.rknn
+    /workspace/tools/yolov5/runs/train/fridge_self_704_unfreeze/weights/best.rknn
 
 
 
@@ -80,6 +91,7 @@ python3 convert_fridge.py \
 //上传到开发板 (在docker中)
     scp -r {path} root@192.168.168.100:/root/
     （即：scp -r install/uclibc/luckfox_pico_rtsp_yolov5_demo  root@192.168.168.100:/root/）
+
 
 
 // 把图片保存到文件中

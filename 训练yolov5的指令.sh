@@ -104,6 +104,12 @@ python export.py \
     --imgsz 640
 
 
+python export.py \
+    --rknpu \
+    --weight runs/train/fridge_self_704_unfreeze/weights/best.pt \
+    --imgsz 704
+
+
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
@@ -111,8 +117,15 @@ python export.py \
 
 
 
-│          阶段         │ freeze │                                              理由                                               │
-├───────────────────────┼────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 第一阶段（公开数据集）  │ 0      │ 模型已经学过 43 类，但手的数据是新的，需要全部层都更新                                          │
-├───────────────────────┼────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 第二阶段（冰箱照片）    │ 10     │ 冰箱图片量少，全部放开容易把之前学好的特征破坏掉；冻结 backbone，只训练分类头，保留已学好的特征 
+
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+./run_train_fridge_two_stage.sh
+
+
+
+
+cd /home/muyou/Projects/workspace/luckfox_demo
+
+python3 tools/yolov5/fridge_project/scripts/build_calib_set.py \
+    --num 300 \
+    --datasets-root tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset
