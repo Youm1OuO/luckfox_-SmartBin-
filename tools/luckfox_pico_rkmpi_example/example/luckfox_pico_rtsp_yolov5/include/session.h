@@ -244,7 +244,21 @@ private:
                                         float* evidence_score) const;
     void process_pending_relocations(const Snapshot& snap2,
                                      SettlementResult& result,
-                                     std::set<int>& reserved_snap2_indices);
+                                     std::set<int>& reserved_snap2_indices,
+                                     std::set<int>& protected_occluded_item_ids);
+    bool apply_relocation_visibility_changes(
+        int moved_item_id,
+        const BBox& old_box,
+        const VotingItem& new_object,
+        const Snapshot& snap2,
+        const std::vector<int>& disappeared_indices,
+        const std::vector<int>& appeared_indices,
+        const std::vector<int>& baseline_item_ids,
+        std::set<int>& consumed_disappeared_indices,
+        std::set<int>& consumed_appeared_indices,
+        const std::set<int>& reserved_snap2_indices,
+        std::set<int>& protected_occluded_item_ids,
+        bool allow_reveal);
 
     // 严格身份匹配（5条件，含颜色，frame为空时跳过颜色检查）
     bool match_strict(const BBox& a, int cls_a, const BBox& b, int cls_b,
