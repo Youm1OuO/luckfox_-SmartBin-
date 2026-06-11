@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <set>
+#include <vector>
 #include <opencv2/imgproc.hpp>
 
 namespace fridge {
@@ -43,6 +44,62 @@ bool strict_box_match(const BBox& a, int cls_a, const BBox& b, int cls_b) {
     if (area_ratio_diff(a, b) >= IDENTITY_AREA_RATIO) return false;
     if (iou(a, b) < IDENTITY_IOU_THRESH) return false;
     return true;
+}
+
+float snapshot_stable_match_score(const BBox& a, int cls_a, const BBox& b, int cls_b) {
+    if (cls_a != cls_b) return -1.0f;
+
+    float dist = center_distance(a, b);
+    if (dist >= SNAPSHOT_STABLE_CENTER_DIST) return -1.0f;
+
+    float area_diff = area_ratio_diff(a, b);
+    if (area_diff >= SNAPSHOT_STABLE_AREA_RATIO) return -1.0f;
+
+    float box_iou = iou(a, b);
+    if (box_iou < SNAPSHOT_STABLE_IOU_THRESH) return -1.0f;
+
+    float distance_score =
+        1.0f - std::min(dist / SNAPSHOT_STABLE_CENTER_DIST, 1.0f);
+    float area_score =
+        1.0f - std::min(area_diff / SNAPSHOT_STABLE_AREA_RATIO, 1.0f);
+
+    return 0.45f * distance_score + 0.35f * box_iou + 0.20f * area_score;
+}
+
+bool match_snapshot_items_one_to_one(const Snapshot& a,
+                                     const Snapshot& b,
+                                     int a_index,
+                                     std::vector<bool>& used_b) {
+    if (a_index >= (int)a.items.size()) return true;
+
+    const VotingItem& vi_a = a.items[a_index];
+    std::vector<std::pair<float, int>> candidates;
+    for (int j = 0; j < (int)b.items.size(); ++j) {
+        if (used_b[j]) continue;
+        const VotingItem& vi_b = b.items[j];
+        float score = snapshot_stable_match_score(vi_a.box, vi_a.cls_id,
+                                                  vi_b.box, vi_b.cls_id);
+        if (score >= 0.0f) {
+            candidates.push_back({score, j});
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const std::pair<float, int>& lhs,
+                 const std::pair<float, int>& rhs) {
+                  return lhs.first > rhs.first;
+              });
+
+    for (const auto& candidate : candidates) {
+        int b_index = candidate.second;
+        used_b[b_index] = true;
+        if (match_snapshot_items_one_to_one(a, b, a_index + 1, used_b)) {
+            return true;
+        }
+        used_b[b_index] = false;
+    }
+
+    return false;
 }
 
 bool relaxed_box_match(const BBox& a, int cls_a, const BBox& b, int cls_b) {
@@ -295,7 +352,10 @@ float SessionManager::reid_score(const VotingItem& a, const VotingItem& b) const
     float score_score = 1.0f - std::min(std::abs(a.best_score - b.best_score), 1.0f);
 
     // 同类别是基础条件，但不能让它单独决定整理。
-    float score = 0.40f + 0.30f * area_score + 0.20f * ar_score + 0.10f * score_score;
+    float score = REID_CLASS_BASE_SCORE +
+                  REID_AREA_WEIGHT * area_score +
+                  REID_ASPECT_WEIGHT * ar_score +
+                  REID_DET_SCORE_WEIGHT * score_score;
     return clamp01(score);
 }
 
@@ -605,22 +665,11 @@ void SessionManager::init_snapshot(const Snapshot& snap, const cv::Mat& frame) {
 
 bool SessionManager::snapshots_similar(const Snapshot& a, const Snapshot& b) {
     if (!a.valid || !b.valid) return false;
+    if (a.has_hand || b.has_hand) return false;
+    if (a.items.size() != b.items.size()) return false;
 
-    std::set<int> used_b;
-    int matched_count = 0;
-    for (const auto& vi_a : a.items) {
-        int idx = find_in_snapshot_strict(b, vi_a.cls_id, vi_a.box, used_b);
-        if (idx >= 0) {
-            used_b.insert(idx);
-            matched_count++;
-        }
-    }
-
-    int denom = std::max((int)a.items.size(), (int)b.items.size());
-    float match_ratio = denom == 0 ? 1.0f : (float)matched_count / (float)denom;
-    int count_diff = std::abs((int)a.items.size() - (int)b.items.size());
-
-    return match_ratio >= 0.7f && count_diff <= 2;
+    std::vector<bool> used_b(b.items.size(), false);
+    return match_snapshot_items_one_to_one(a, b, 0, used_b);
 }
 
 SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::Mat& frame) {

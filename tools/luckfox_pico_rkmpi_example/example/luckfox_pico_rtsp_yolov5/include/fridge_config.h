@@ -160,7 +160,30 @@ constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 // =========================================================================
 
 // =========================================================================
-//  新业务流程6：严格原位身份匹配阈值
+//  新业务流程6：4.1 快照内聚合匹配 snapshot_cluster_match
+// -------------------------------------------------------------------------
+//  用于把 N 帧中的同一个物品聚合成一个快照候选。这里需要比原位匹配宽松，
+//  因为 YOLO bbox 会抖动，物体移动/整理时 bbox 变化会更大。
+// =========================================================================
+constexpr float SNAPSHOT_CLUSTER_AREA_DIFF_MAX = 0.50f;        // 面积比例约 0.5 ~ 2.0
+constexpr float SNAPSHOT_CLUSTER_CENTER_NORM_MAX = 1.05f;      // 归一化中心距离，宽于 strict_origin_match
+constexpr float SNAPSHOT_CLUSTER_IOU_ENOUGH = 0.20f;
+constexpr float SNAPSHOT_CLUSTER_OVERLAP_ENOUGH = 0.25f;
+constexpr float SNAPSHOT_CLUSTER_SCORE_MIN = 0.22f;
+constexpr float SNAPSHOT_CLUSTER_MOTION_NORM_FOR_LAST_BOX = 0.35f;
+
+// =========================================================================
+//  新业务流程6：4.2 快照之间差异判断 snapshots_similar
+// -------------------------------------------------------------------------
+//  只判断两份无手快照是否已经稳定，不做库存身份重识别。
+//  即使当前值与 strict_origin_match 一样，也保持独立参数，避免后续调参耦合。
+// =========================================================================
+constexpr float SNAPSHOT_STABLE_CENTER_DIST = 15.0f;
+constexpr float SNAPSHOT_STABLE_AREA_RATIO  = 0.20f;
+constexpr float SNAPSHOT_STABLE_IOU_THRESH  = 0.50f;
+
+// =========================================================================
+//  新业务流程6：4.3 原位严格匹配 strict_origin_match
 // -------------------------------------------------------------------------
 //  判断"这个新检测到的东西，是不是库存里那个旧东西"。
 //  原位匹配只用于判断"位置基本没变"：
@@ -176,7 +199,17 @@ constexpr float IDENTITY_IOU_THRESH   = 0.5f;    // ε3: IoU 阈值（从0.7降�
 constexpr float IDENTITY_COLOR_DIFF   = 20.0f;   // 像素颜色差异阈值（每通道 0~255）
 
 // =========================================================================
-//  新业务流程6：整理 / 移动判定阈值
+//  新业务流程6：4.4 外观重识别匹配 reid_match
+// -------------------------------------------------------------------------
+//  reid_score 只输出外观相似分数，不直接决定库存事件。
+// =========================================================================
+constexpr float REID_CLASS_BASE_SCORE = 0.40f;
+constexpr float REID_AREA_WEIGHT      = 0.30f;
+constexpr float REID_ASPECT_WEIGHT    = 0.20f;
+constexpr float REID_DET_SCORE_WEIGHT = 0.10f;
+
+// =========================================================================
+//  新业务流程6：4.5 整理 / 移动判定 relocation_match
 // -------------------------------------------------------------------------
 //  reid_match 只是外观输入，confirmed_relocation 还必须有移动/手/HELD
 //  等 OperationContext 证据，并且候选唯一性足够好。

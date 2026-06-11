@@ -12,13 +12,6 @@ namespace fridge {
 
 namespace {
 
-constexpr float CLUSTER_AREA_DIFF_MAX = 0.50f;       // 面积比例约 0.5 ~ 2.0
-constexpr float CLUSTER_CENTER_NORM_MAX = 1.05f;     // 明显宽于 strict_origin_match
-constexpr float CLUSTER_IOU_ENOUGH = 0.20f;
-constexpr float CLUSTER_OVERLAP_ENOUGH = 0.25f;
-constexpr float CLUSTER_SCORE_MIN = 0.22f;
-constexpr float CLUSTER_MOTION_NORM_FOR_LAST_BOX = 0.35f;
-
 struct SnapshotCluster {
     VotingItem item;
     BBox first_box;
@@ -31,21 +24,21 @@ float snapshot_cluster_score(const SnapshotCluster& cluster,
     if (cluster.item.cls_id != det.cls_id) return -1.0f;
 
     float area_diff = area_ratio_diff(cluster.last_box, det.box);
-    if (area_diff > CLUSTER_AREA_DIFF_MAX) return -1.0f;
+    if (area_diff > SNAPSHOT_CLUSTER_AREA_DIFF_MAX) return -1.0f;
 
     float center_norm = normalized_nearby_distance(cluster.last_box, det.box);
     float box_iou = iou(cluster.last_box, det.box);
     float box_overlap = overlap_ratio_of_smaller(cluster.last_box, det.box);
 
-    bool close_enough = center_norm <= CLUSTER_CENTER_NORM_MAX;
-    bool overlaps_enough = box_iou >= CLUSTER_IOU_ENOUGH ||
-                           box_overlap >= CLUSTER_OVERLAP_ENOUGH;
+    bool close_enough = center_norm <= SNAPSHOT_CLUSTER_CENTER_NORM_MAX;
+    bool overlaps_enough = box_iou >= SNAPSHOT_CLUSTER_IOU_ENOUGH ||
+                           box_overlap >= SNAPSHOT_CLUSTER_OVERLAP_ENOUGH;
     if (!close_enough && !overlaps_enough) return -1.0f;
 
-    float distance_score = 1.0f - std::min(center_norm / CLUSTER_CENTER_NORM_MAX, 1.0f);
-    float iou_score = std::min(box_iou / CLUSTER_IOU_ENOUGH, 1.0f);
-    float overlap_score = std::min(box_overlap / CLUSTER_OVERLAP_ENOUGH, 1.0f);
-    float area_score = 1.0f - std::min(area_diff / CLUSTER_AREA_DIFF_MAX, 1.0f);
+    float distance_score = 1.0f - std::min(center_norm / SNAPSHOT_CLUSTER_CENTER_NORM_MAX, 1.0f);
+    float iou_score = std::min(box_iou / SNAPSHOT_CLUSTER_IOU_ENOUGH, 1.0f);
+    float overlap_score = std::min(box_overlap / SNAPSHOT_CLUSTER_OVERLAP_ENOUGH, 1.0f);
+    float area_score = 1.0f - std::min(area_diff / SNAPSHOT_CLUSTER_AREA_DIFF_MAX, 1.0f);
 
     return 0.45f * distance_score +
            0.25f * iou_score +
@@ -86,7 +79,7 @@ SnapshotCluster make_cluster(const Detection& det, int frame_index) {
 VotingItem finalize_cluster(const SnapshotCluster& cluster) {
     VotingItem item = cluster.item;
     float motion_norm = normalized_nearby_distance(cluster.first_box, cluster.last_box);
-    if (motion_norm >= CLUSTER_MOTION_NORM_FOR_LAST_BOX) {
+    if (motion_norm >= SNAPSHOT_CLUSTER_MOTION_NORM_FOR_LAST_BOX) {
         item.box = cluster.last_box;
     }
     return item;
@@ -167,7 +160,7 @@ Snapshot SnapshotBuffer::take_snapshot() {
                 }
             }
 
-            if (best_idx >= 0 && best_score >= CLUSTER_SCORE_MIN) {
+            if (best_idx >= 0 && best_score >= SNAPSHOT_CLUSTER_SCORE_MIN) {
                 update_cluster(clusters[best_idx], det, fi);
                 used_clusters[best_idx] = true;
             } else {
