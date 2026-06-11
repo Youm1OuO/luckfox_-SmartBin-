@@ -223,6 +223,19 @@ constexpr int   PENDING_RELOCATION_CONFIRM_FRAMES = 1;
 constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
 
 // =========================================================================
+//  新业务流程6：待确认新物品 PendingNewObject
+// -------------------------------------------------------------------------
+//  正在整理某类物品时，额外冒出的同类新物品先延迟一份稳定快照确认。
+// =========================================================================
+constexpr int   PENDING_NEW_OBJECT_CONFIRM_FRAMES = 1;
+constexpr int   PENDING_NEW_OBJECT_EXPIRE_FRAMES  = 2;
+constexpr float PENDING_NEW_OBJECT_NEARBY_DISTANCE = 0.75f;
+constexpr float PENDING_NEW_OBJECT_AREA_RATIO = 0.45f;
+constexpr float PENDING_NEW_OBJECT_MERGE_CENTER_NORM = 0.35f;
+constexpr float PENDING_NEW_OBJECT_MERGE_IOU_THRESH = 0.25f;
+constexpr float PENDING_NEW_OBJECT_MERGE_OVERLAP_THRESH = 0.55f;
+
+// =========================================================================
 //  新业务流程6：多帧快照投票
 // =========================================================================
 constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）

@@ -126,6 +126,18 @@ struct PendingRelocation {
     int expire_after_stable_count = 2;
 };
 
+struct PendingNewObject {
+    int pending_id = 0;
+    int class_id = -1;
+    BBox candidate_bbox;
+    VotingItem snapshot_object_B;
+    int created_snapshot_id = 0;
+    int last_checked_snapshot_id = 0;
+    int stable_count = 0;
+    int expire_after_stable_count = 2;
+    std::set<int> related_existing_item_ids;
+};
+
 class SessionManager {
 public:
     SessionManager();
@@ -188,6 +200,8 @@ private:
     int next_context_id_;
     std::vector<PendingRelocation> pending_relocations_;
     int next_pending_id_;
+    std::vector<PendingNewObject> pending_new_objects_;
+    int next_pending_new_id_;
 
     // ---- 库存 ----
     InventoryDB inventory_;
@@ -246,6 +260,18 @@ private:
                                      SettlementResult& result,
                                      std::set<int>& reserved_snap2_indices,
                                      std::set<int>& protected_occluded_item_ids);
+    void process_pending_new_objects(
+        const Snapshot& snap2,
+        SettlementResult& result,
+        const std::vector<int>& disappeared_indices,
+        const std::vector<int>& baseline_item_ids,
+        std::set<int>& consumed_disappeared_indices,
+        std::set<int>& reserved_snap2_indices);
+    bool should_delay_new_object(const VotingItem& item,
+                                 const Snapshot& snap2) const;
+    void create_or_update_pending_new_object(const VotingItem& item,
+                                             int snapshot_id);
+    bool has_same_class_operation_context(int cls_id) const;
     bool apply_relocation_visibility_changes(
         int moved_item_id,
         const BBox& old_box,
