@@ -160,7 +160,7 @@ constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 // =========================================================================
 
 // =========================================================================
-//  新业务流程6：严格原位身份匹配阈值
+//  新业务流程7：严格原位身份匹配阈值
 // -------------------------------------------------------------------------
 //  判断"这个新检测到的东西，是不是库存里那个旧东西"。
 //  原位匹配只用于判断"位置基本没变"：
@@ -176,7 +176,7 @@ constexpr float IDENTITY_IOU_THRESH   = 0.5f;    // ε3: IoU 阈值（从0.7降�
 constexpr float IDENTITY_COLOR_DIFF   = 20.0f;   // 像素颜色差异阈值（每通道 0~255）
 
 // =========================================================================
-//  新业务流程6：整理 / 移动判定阈值
+//  新业务流程7：整理 / 移动判定阈值
 // -------------------------------------------------------------------------
 //  reid_match 只是外观输入，confirmed_relocation 还必须有移动/手/HELD
 //  等 OperationContext 证据，并且候选唯一性足够好。
@@ -188,9 +188,11 @@ constexpr float RELOCATION_EVIDENCE_WEAK     = 0.25f;
 constexpr float RELOCATION_EVIDENCE_STRONG   = 0.75f;
 constexpr int   PENDING_RELOCATION_CONFIRM_FRAMES = 1;
 constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
+constexpr int   PENDING_NEW_CONFIRM_FRAMES = 1;
+constexpr int   PENDING_NEW_EXPIRE_FRAMES  = 3;
 
 // =========================================================================
-//  新业务流程6：多帧快照投票
+//  新业务流程7：多帧快照投票
 // =========================================================================
 constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）
 constexpr float SNAPSHOT_S            = 0.5f;     // 投票阈值百分比（60%，即5帧中至少出现3次）
@@ -199,7 +201,7 @@ constexpr int   SNAPSHOT_HAND_BLOCK_MIN_COUNT = 1; // N帧中至少几帧有阻�
 constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
 
 // =========================================================================
-//  新业务流程6：自适应"附近"距离阈值
+//  新业务流程7：自适应"附近"距离阈值
 // -------------------------------------------------------------------------
 //  normalized_nearby_distance = center_distance / min(对角线A, 对角线B)
 //  小于此值判定为"附近"
@@ -207,7 +209,7 @@ constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定
 constexpr float NEARBY_DISTANCE_THRESH = 1.0f;  // 设计文档建议值，可微调
 
 // =========================================================================
-//  新业务流程6：OperationContext / HELD 证据相关
+//  新业务流程7：OperationContext / HELD 证据相关
 // =========================================================================
 // 连续多少帧没有检测到手 → 确认手离开画面
 constexpr int HAND_LEAVE_FRAMES  = 5;
@@ -226,7 +228,7 @@ constexpr int HELD_CONFIRM_FRAMES = 2;
 constexpr float TRACK_MOVE_DISTANCE_RATIO = 0.50f;
 
 // =========================================================================
-//  新业务流程6：出库物品过期
+//  新业务流程7：出库物品过期
 // -------------------------------------------------------------------------
 //  OUT 状态的物品超过此时间仍未重新出现 → 确认出库，从记录中清除
 // =========================================================================

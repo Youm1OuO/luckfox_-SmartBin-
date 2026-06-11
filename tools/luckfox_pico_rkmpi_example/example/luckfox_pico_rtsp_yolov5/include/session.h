@@ -1,12 +1,12 @@
 // ============================================================================
 //  session.h
-//  会话管理器 — 新业务流程6：统一快照裁决 + OperationContext 辅助证据
+//  会话管理器 — 新业务流程7：整理优先结算 + DiffWorkingSet 交接
 //
 //  核心职责：
 //    1. baseline_snapshot -> stable_snapshot 的单次差异裁决
 //    2. OperationContext 记录手、HELD代理轨迹、ByteTrack移动证据
-//    3. relocation_match 优先于普通出库/入库，避免整理被拆成出库+入库
-//    4. low_confidence_relocation 进入跨快照 PendingRelocation
+//    3. operation_locked item 先做整理结算，再进入普通快照 diff
+//    4. low_confidence_relocation / risky_new 进入跨快照 pending
 //    5. 手不直接产生库存事件，只作为统一裁决的辅助证据
 //
 //  所有操作实时更新进本地库存清单，身份匹配也基于库存清单进行
@@ -98,6 +98,7 @@ struct OperationContext {
     int hand_frame_count = 0;
     bool hand_long_present = false;
     std::set<int> hand_track_ids;
+    std::set<int> touched_item_ids;
     std::map<int, int> candidate_held_items;
     std::set<int> confirmed_held_items;
     std::vector<HeldProxyEvidence> held_proxy_evidences;
@@ -124,6 +125,24 @@ struct PendingRelocation {
     int last_checked_snapshot_id = 0;
     int stable_count = 0;
     int expire_after_stable_count = 2;
+};
+
+struct ConfirmedRelocation {
+    int item_id = -1;
+    int cls_id = -1;
+    BBox old_box;
+    VotingItem new_object;
+};
+
+struct PendingNewItem {
+    int pending_id = 0;
+    int class_id = -1;
+    BBox candidate_bbox;
+    VotingItem snapshot_object;
+    int created_snapshot_id = 0;
+    int last_checked_snapshot_id = 0;
+    int stable_count = 0;
+    int expire_after_stable_count = 3;
 };
 
 class SessionManager {
@@ -188,6 +207,8 @@ private:
     int next_context_id_;
     std::vector<PendingRelocation> pending_relocations_;
     int next_pending_id_;
+    std::vector<PendingNewItem> pending_new_items_;
+    int next_pending_new_id_;
 
     // ---- 库存 ----
     InventoryDB inventory_;
@@ -248,9 +269,10 @@ private:
                                         float* evidence_score) const;
     void process_pending_relocations(const Snapshot& snap2,
                                      SettlementResult& result,
-                                     std::set<int>& reserved_snap2_indices,
+                                     std::set<int>& consumed_snap2_indices,
                                      std::set<int>& protected_occluded_item_ids,
-                                     std::set<int>& anchored_item_ids);
+                                     std::set<int>& settled_item_ids,
+                                     std::vector<ConfirmedRelocation>& confirmed_relocations);
     bool apply_relocation_visibility_changes(
         int moved_item_id,
         const BBox& old_box,

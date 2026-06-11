@@ -1,13 +1,13 @@
 // ============================================================================
 //  session.cc
-//  会话管理器 — 新业务流程6：统一快照裁决 + OperationContext 辅助证据
+//  会话管理器 — 新业务流程7：整理优先结算 + DiffWorkingSet 交接
 //
 //  关键约束：
 //    1. 手不直接产生库存事件，只记录 OperationContext 证据。
 //    2. 库存事件只在 baseline_snapshot vs stable_snapshot 的一次 diff 中裁决。
-//    3. 整理/移动优先于普通出库/入库，避免被拆成 "OUT + IN"。
+//    3. operation_locked item 先做整理结算，再进入普通快照 diff。
 //    4. reid_match 只是外观输入，confirmed_relocation 必须结合移动/手/HELD证据。
-//    5. low_confidence_relocation 进入跨快照 PendingRelocation，本轮冻结 A/B。
+//    5. low_confidence_relocation / risky_new 进入跨快照 pending，避免重复入库。
 // ============================================================================
 #include "session.h"
 #include "fridge_config.h"
@@ -86,6 +86,15 @@ int find_in_snapshot_near(const Snapshot& snap,
     return best_idx;
 }
 
+VotingItem voting_from_inventory(const InventoryItem& item) {
+    VotingItem vi;
+    vi.cls_id = item.cls_id;
+    vi.box = item.box;
+    vi.best_score = item.score;
+    vi.count = 1;
+    return vi;
+}
+
 }  // namespace
 
 void OperationContext::reset(int new_context_id,
@@ -109,6 +118,7 @@ SessionManager::SessionManager()
       no_hand_streak_(0),
       next_context_id_(1),
       next_pending_id_(1),
+      next_pending_new_id_(1),
       backend_status_(BackendStatus::UNKNOWN),
       init_state_(InitState::WAIT_FIRST_STABLE_SNAPSHOT),
       inventory_initialized_(false),
@@ -131,6 +141,9 @@ void SessionManager::start_new_session(long long time_ms) {
     init_state_ = InitState::WAIT_BACKEND;
     inventory_initialized_ = false;
     pending_relocations_.clear();
+    pending_new_items_.clear();
+    next_pending_id_ = 1;
+    next_pending_new_id_ = 1;
     hand_present_ = false;
     no_hand_streak_ = 0;
     reset_snap_state();
@@ -178,6 +191,11 @@ void SessionManager::finish_session(long long time_ms) {
         printf("[SESSION] 关门：清理 %zu 个未确认整理候选，不强行提交 MOVED\n",
                pending_relocations_.size());
         pending_relocations_.clear();
+    }
+    if (!pending_new_items_.empty()) {
+        printf("[SESSION] 关门：清理 %zu 个未确认新物品候选，不强行提交 IN\n",
+               pending_new_items_.size());
+        pending_new_items_.clear();
     }
 
     hand_present_ = false;
@@ -388,15 +406,22 @@ float SessionManager::relocation_evidence_score(int item_id,
     if (operation_context_.moved_item_candidates.count(item_id)) {
         score = std::max(score, 0.35f);
     }
+    if (operation_context_.touched_item_ids.count(item_id)) {
+        score = std::max(score, 0.15f);
+    }
 
     for (const auto& kv : operation_context_.active_track_evidences) {
         const TrackEvidence& ev = kv.second;
         if (ev.associated_item_id != item_id) continue;
         float start_near = normalized_nearby_distance(from, ev.start_box);
         float end_near = normalized_nearby_distance(to, ev.end_box);
-        if (start_near <= 0.75f && end_near <= 0.75f) {
+        float move_ratio = diagonal(ev.start_box) <= 0.0f
+                               ? 0.0f
+                               : center_distance(ev.start_box, ev.end_box) / diagonal(ev.start_box);
+        if (start_near <= 0.75f && end_near <= 0.75f &&
+            move_ratio >= TRACK_MOVE_DISTANCE_RATIO) {
             score = std::max(score, ev.occluded_by_hand ? 0.80f : 0.75f);
-        } else if (start_near <= 0.75f && center_distance(ev.start_box, ev.end_box) > diagonal(from) * TRACK_MOVE_DISTANCE_RATIO) {
+        } else if (start_near <= 0.75f && move_ratio >= TRACK_MOVE_DISTANCE_RATIO) {
             score = std::max(score, 0.45f);
         }
     }
@@ -405,17 +430,24 @@ float SessionManager::relocation_evidence_score(int item_id,
         if (ev.item_id != item_id || ev.proxy_boxes.empty()) continue;
         const BBox& last_proxy = ev.proxy_boxes.back();
         float proxy_near = normalized_nearby_distance(to, last_proxy);
-        if (proxy_near <= 0.75f) {
+        float proxy_move_ratio =
+            diagonal(ev.hand_bbox_at_hold_start) <= 0.0f
+                ? 0.0f
+                : center_distance(ev.hand_bbox_at_hold_start, last_proxy) /
+                      diagonal(ev.hand_bbox_at_hold_start);
+        if (proxy_near <= 0.75f &&
+            proxy_move_ratio >= TRACK_MOVE_DISTANCE_RATIO) {
             score = std::max(score, 0.85f);
-        } else if (proxy_near <= NEARBY_DISTANCE_THRESH) {
+        } else if (proxy_near <= NEARBY_DISTANCE_THRESH &&
+                   proxy_move_ratio >= TRACK_MOVE_DISTANCE_RATIO * 0.5f) {
             score = std::max(score, 0.55f);
         }
     }
 
     if (operation_context_.confirmed_held_items.count(item_id)) {
-        score = std::max(score, operation_context_.hand_long_present ? 0.55f : 0.40f);
+        score = std::max(score, operation_context_.hand_long_present ? 0.35f : 0.25f);
     } else if (operation_context_.candidate_held_items.count(item_id)) {
-        score = std::max(score, 0.20f);
+        score = std::max(score, 0.15f);
     }
 
     return clamp01(score);
@@ -557,6 +589,7 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
             }
 
             if (best_overlap >= HELD_HAND_OVERLAP_THRESH) {
+                operation_context_.touched_item_ids.insert(item.item_id);
                 operation_context_.candidate_held_items[item.item_id]++;
                 touched_candidate_items.insert(item.item_id);
                 candidate_hand_box[item.item_id] = best_hand_box;
@@ -794,38 +827,69 @@ void SessionManager::reset_operation_context(int baseline_snapshot_id, int frame
 
 void SessionManager::process_pending_relocations(const Snapshot& snap2,
                                                  SettlementResult& result,
-                                                 std::set<int>& reserved_snap2_indices,
+                                                 std::set<int>& consumed_snap2_indices,
                                                  std::set<int>& protected_occluded_item_ids,
-                                                 std::set<int>& anchored_item_ids) {
+                                                 std::set<int>& settled_item_ids,
+                                                 std::vector<ConfirmedRelocation>& confirmed_relocations) {
     if (pending_relocations_.empty()) return;
 
     std::vector<PendingRelocation> kept;
     for (auto p : pending_relocations_) {
         std::set<int> no_used;
         int old_idx = find_in_snapshot_near(snap2, p.class_id, p.old_bbox, no_used);
-        if (old_idx >= 0) {
-            printf("[SESSION] pending#%d 取消：item#%d 回到旧位置\n",
-                   p.pending_id, p.item_id_A);
-            continue;
-        }
-
         int new_idx = find_in_snapshot_near(snap2, p.class_id, p.candidate_new_bbox, no_used);
         if (new_idx < 0) {
-            printf("[SESSION] pending#%d 取消：候选新位置不再稳定\n", p.pending_id);
+            if (old_idx >= 0) {
+                printf("[SESSION] pending#%d 取消：item#%d 回到旧位置\n",
+                       p.pending_id, p.item_id_A);
+            } else {
+                printf("[SESSION] pending#%d 取消：候选新位置不再稳定\n", p.pending_id);
+            }
             continue;
         }
 
-        reserved_snap2_indices.insert(new_idx);
+        if (old_idx >= 0 && p.evidence_score < RELOCATION_EVIDENCE_STRONG) {
+            printf("[SESSION] pending#%d 继续冻结：item#%d 旧/新位置同时稳定 "
+                   "(evidence=%.2f)\n",
+                   p.pending_id, p.item_id_A, p.evidence_score);
+            p.stable_count++;
+            p.last_checked_snapshot_id = snap2.frame_id;
+            if (p.stable_count <= p.expire_after_stable_count) {
+                kept.push_back(p);
+            }
+            continue;
+        }
+
+        consumed_snap2_indices.insert(new_idx);
         p.stable_count++;
         p.last_checked_snapshot_id = snap2.frame_id;
 
         const VotingItem& B = snap2.items[new_idx];
+        if (p.evidence_score < RELOCATION_EVIDENCE_STRONG) {
+            if (p.stable_count <= p.expire_after_stable_count) {
+                printf("[SESSION] pending#%d 继续冻结：item#%d 整理证据不足 "
+                       "(evidence=%.2f)\n",
+                       p.pending_id, p.item_id_A, p.evidence_score);
+                kept.push_back(p);
+            } else {
+                printf("[SESSION] pending#%d 取消：item#%d 整理证据不足，避免误确认\n",
+                       p.pending_id, p.item_id_A);
+            }
+            continue;
+        }
+
         if (p.stable_count >= PENDING_RELOCATION_CONFIRM_FRAMES) {
             InventoryItem* item = inventory_.find_by_item(p.item_id_A);
             if (item && item->status != ItemStatus::OUT) {
+                ConfirmedRelocation move;
+                move.item_id = p.item_id_A;
+                move.cls_id = p.class_id;
+                move.old_box = p.old_bbox;
+                move.new_object = B;
+                confirmed_relocations.push_back(move);
                 inventory_.set_status(p.item_id_A, ItemStatus::VISIBLE, current_time_ms_);
                 inventory_.update_item(p.item_id_A, -1, B.box, B.best_score, snap2.frame_id);
-                anchored_item_ids.insert(p.item_id_A);
+                settled_item_ids.insert(p.item_id_A);
                 for (const auto& kv : inventory_.items()) {
                     if (kv.first == p.item_id_A) continue;
                     const InventoryItem& maybe_hidden = kv.second;
@@ -947,6 +1011,7 @@ bool SessionManager::apply_relocation_visibility_changes(
         float best_dist = 999.0f;
         for (const auto& kv : inventory_.items()) {
             if (kv.first == moved_item_id) continue;
+            if (protected_occluded_item_ids.count(kv.first)) continue;
             const InventoryItem& inv = kv.second;
             if (inv.status != ItemStatus::OCCLUDED) continue;
             if (inv.cls_id != D.cls_id) continue;
@@ -987,13 +1052,399 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     (void)frame;
     SettlementResult result;
 
+    // v7 DiffWorkingSet：本轮内部状态，避免同一物品/快照对象被多个分支重复消费。
+    std::set<int> consumed_snap2_indices;
+    std::set<int> settled_item_ids;
+    std::set<int> pending_reserved_item_ids;
+    std::set<int> protected_occluded_item_ids;
+    std::set<int> residual_snap2_indices;
+    std::vector<ConfirmedRelocation> confirmed_relocations;
+
+    std::vector<int> baseline_item_ids(snap1_.items.size(), -1);
+    for (int i = 0; i < (int)snap1_.items.size(); ++i) {
+        const VotingItem& A = snap1_.items[i];
+        baseline_item_ids[i] = find_inventory_item_strict(A.box, A.cls_id, false);
+    }
+
+    // ---------------------------------------------------------------------
+    //  10.1 先处理上一轮 pending_relocation。
+    // ---------------------------------------------------------------------
+    process_pending_relocations(snap2, result, consumed_snap2_indices,
+                                protected_occluded_item_ids, settled_item_ids,
+                                confirmed_relocations);
+
+    for (const auto& p : pending_relocations_) {
+        pending_reserved_item_ids.insert(p.item_id_A);
+        std::set<int> no_used;
+        int idx = find_in_snapshot_near(snap2, p.class_id, p.candidate_new_bbox, no_used);
+        if (idx >= 0) {
+            consumed_snap2_indices.insert(idx);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  10.2 建立 operation_locked_items。
+    // ---------------------------------------------------------------------
+    std::set<int> operation_locked_item_ids;
+    for (int id : operation_context_.touched_item_ids) {
+        operation_locked_item_ids.insert(id);
+    }
+    for (const auto& kv : operation_context_.candidate_held_items) {
+        operation_locked_item_ids.insert(kv.first);
+    }
+    for (int id : operation_context_.confirmed_held_items) {
+        operation_locked_item_ids.insert(id);
+    }
+    for (int id : operation_context_.moved_item_candidates) {
+        operation_locked_item_ids.insert(id);
+    }
+    for (const auto& p : pending_relocations_) {
+        operation_locked_item_ids.insert(p.item_id_A);
+    }
+
+    std::vector<int> invalid_locked_ids;
+    for (int item_id : operation_locked_item_ids) {
+        const InventoryItem* item = inventory_.find_by_item(item_id);
+        if (!item || item->status == ItemStatus::OUT) {
+            invalid_locked_ids.push_back(item_id);
+        }
+    }
+    for (int item_id : invalid_locked_ids) {
+        operation_locked_item_ids.erase(item_id);
+    }
+
+    auto has_real_move_evidence = [this](int item_id) -> bool {
+        if (operation_context_.moved_item_candidates.count(item_id)) return true;
+        for (const auto& ev : operation_context_.held_proxy_evidences) {
+            if (ev.item_id != item_id || ev.proxy_boxes.empty()) continue;
+            const BBox& last_proxy = ev.proxy_boxes.back();
+            float proxy_move_ratio =
+                diagonal(ev.hand_bbox_at_hold_start) <= 0.0f
+                    ? 0.0f
+                    : center_distance(ev.hand_bbox_at_hold_start, last_proxy) /
+                          diagonal(ev.hand_bbox_at_hold_start);
+            if (proxy_move_ratio >= TRACK_MOVE_DISTANCE_RATIO) return true;
+        }
+        for (const auto& kv : operation_context_.active_track_evidences) {
+            const TrackEvidence& ev = kv.second;
+            if (ev.associated_item_id != item_id) continue;
+            float move_dist = center_distance(ev.start_box, ev.end_box);
+            if (diagonal(ev.start_box) > 0.0f &&
+                move_dist / diagonal(ev.start_box) >= TRACK_MOVE_DISTANCE_RATIO) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto upsert_pending = [this, &snap2](int item_id,
+                                         int cls_id,
+                                         const BBox& old_box,
+                                         const VotingItem& B,
+                                         float reid,
+                                         float evidence) {
+        for (auto& p : pending_relocations_) {
+            if (p.item_id_A == item_id) {
+                p.candidate_new_bbox = B.box;
+                p.snapshot_object_B = B;
+                p.reid_score = reid;
+                p.evidence_score = evidence;
+                p.last_checked_snapshot_id = snap2.frame_id;
+                return p.pending_id;
+            }
+        }
+
+        PendingRelocation p;
+        p.pending_id = next_pending_id_++;
+        p.item_id_A = item_id;
+        p.class_id = cls_id;
+        p.old_bbox = old_box;
+        p.candidate_new_bbox = B.box;
+        p.snapshot_object_B = B;
+        p.reid_score = reid;
+        p.evidence_score = evidence;
+        p.created_snapshot_id = snap2.frame_id;
+        p.last_checked_snapshot_id = snap2.frame_id;
+        p.expire_after_stable_count = PENDING_RELOCATION_EXPIRE_FRAMES;
+        pending_relocations_.push_back(p);
+        return p.pending_id;
+    };
+
+    auto upsert_pending_new = [this, &snap2](const VotingItem& B) {
+        int best_idx = -1;
+        float best_dist = 999.0f;
+        for (int i = 0; i < (int)pending_new_items_.size(); ++i) {
+            PendingNewItem& p = pending_new_items_[i];
+            if (p.class_id != B.cls_id) continue;
+            float d = normalized_nearby_distance(p.candidate_bbox, B.box);
+            if (d < best_dist && d <= NEARBY_DISTANCE_THRESH) {
+                best_dist = d;
+                best_idx = i;
+            }
+        }
+
+        if (best_idx >= 0) {
+            PendingNewItem& p = pending_new_items_[best_idx];
+            p.candidate_bbox = B.box;
+            p.snapshot_object = B;
+            p.last_checked_snapshot_id = snap2.frame_id;
+            return p.pending_id;
+        }
+
+        PendingNewItem p;
+        p.pending_id = next_pending_new_id_++;
+        p.class_id = B.cls_id;
+        p.candidate_bbox = B.box;
+        p.snapshot_object = B;
+        p.created_snapshot_id = snap2.frame_id;
+        p.last_checked_snapshot_id = snap2.frame_id;
+        p.expire_after_stable_count = PENDING_NEW_EXPIRE_FRAMES;
+        pending_new_items_.push_back(p);
+        return p.pending_id;
+    };
+
+    auto same_class_operation_risk = [this,
+                                      &operation_locked_item_ids,
+                                      &settled_item_ids,
+                                      &pending_reserved_item_ids](const VotingItem& B) {
+        for (const auto& kv : inventory_.items()) {
+            const InventoryItem& inv = kv.second;
+            if (inv.status == ItemStatus::OUT) continue;
+            if (inv.cls_id != B.cls_id) continue;
+            if (!operation_locked_item_ids.count(inv.item_id)) continue;
+            if (settled_item_ids.count(inv.item_id)) continue;
+            if (pending_reserved_item_ids.count(inv.item_id)) continue;
+
+            VotingItem old_item = voting_from_inventory(inv);
+            float r = reid_score(old_item, B);
+            float evidence = relocation_evidence_score(inv.item_id, inv.box, B.box);
+            if (r >= RELOCATION_REID_MIN && evidence >= RELOCATION_EVIDENCE_WEAK) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    struct RelocationEdge {
+        int item_id = -1;
+        int cls_id = -1;
+        int snap2_idx = -1;
+        BBox old_box;
+        VotingItem old_item;
+        VotingItem new_item;
+        float reid = 0.0f;
+        float evidence = 0.0f;
+        float total = 0.0f;
+        float second_total = -1.0f;
+        RelocationDecision decision = RelocationDecision::NO_RELOCATION;
+    };
+
+    std::vector<RelocationEdge> relocation_edges;
+    for (int item_id : operation_locked_item_ids) {
+        if (settled_item_ids.count(item_id)) continue;
+        if (pending_reserved_item_ids.count(item_id)) continue;
+
+        const InventoryItem* item = inventory_.find_by_item(item_id);
+        if (!item || item->status == ItemStatus::OUT) continue;
+
+        VotingItem old_item = voting_from_inventory(*item);
+        bool has_real_move = has_real_move_evidence(item_id);
+
+        std::vector<RelocationEdge> candidates;
+        for (int b_idx = 0; b_idx < (int)snap2.items.size(); ++b_idx) {
+            if (consumed_snap2_indices.count(b_idx)) continue;
+            const VotingItem& B = snap2.items[b_idx];
+            if (B.cls_id != item->cls_id) continue;
+
+            float r = reid_score(old_item, B);
+            if (r < RELOCATION_REID_MIN) continue;
+
+            float evidence = relocation_evidence_score(item_id, old_item.box, B.box);
+            bool old_position =
+                strict_box_match(old_item.box, old_item.cls_id, B.box, B.cls_id);
+            if (old_position) {
+                continue;
+            }
+            if (!has_real_move && evidence < 0.55f) {
+                continue;
+            }
+
+            RelocationEdge edge;
+            edge.item_id = item_id;
+            edge.cls_id = item->cls_id;
+            edge.snap2_idx = b_idx;
+            edge.old_box = old_item.box;
+            edge.old_item = old_item;
+            edge.new_item = B;
+            edge.reid = r;
+            edge.evidence = evidence;
+            edge.total = r + 1.20f * evidence;
+            candidates.push_back(edge);
+        }
+
+        if (candidates.empty()) continue;
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const RelocationEdge& a, const RelocationEdge& b) {
+                      return a.total > b.total;
+                  });
+
+        RelocationEdge best = candidates[0];
+        best.second_total = candidates.size() > 1 ? candidates[1].total : -1.0f;
+
+        bool unique_by_total =
+            best.second_total < 0.0f ||
+            (best.total - best.second_total) >= RELOCATION_REID_MARGIN;
+        if (has_real_move &&
+            best.reid >= RELOCATION_REID_STRONG &&
+            best.evidence >= RELOCATION_EVIDENCE_STRONG &&
+            unique_by_total) {
+            best.decision = RelocationDecision::CONFIRMED;
+        } else if (best.reid >= RELOCATION_REID_MIN &&
+                   best.evidence >= RELOCATION_EVIDENCE_WEAK &&
+                   (has_real_move || best.evidence >= 0.55f)) {
+            best.decision = RelocationDecision::LOW_CONFIDENCE;
+        }
+
+        if (best.decision != RelocationDecision::NO_RELOCATION) {
+            relocation_edges.push_back(best);
+        }
+    }
+
+    std::sort(relocation_edges.begin(), relocation_edges.end(),
+              [](const RelocationEdge& a, const RelocationEdge& b) {
+                  if (a.decision != b.decision) {
+                      return a.decision == RelocationDecision::CONFIRMED;
+                  }
+                  return a.total > b.total;
+              });
+
+    for (const auto& edge : relocation_edges) {
+        if (settled_item_ids.count(edge.item_id)) continue;
+        if (pending_reserved_item_ids.count(edge.item_id)) continue;
+        if (consumed_snap2_indices.count(edge.snap2_idx)) continue;
+
+        if (edge.decision == RelocationDecision::CONFIRMED) {
+            InventoryItem* item = inventory_.find_by_item(edge.item_id);
+            if (!item || item->status == ItemStatus::OUT) continue;
+
+            ConfirmedRelocation move;
+            move.item_id = edge.item_id;
+            move.cls_id = edge.cls_id;
+            move.old_box = edge.old_box;
+            move.new_object = edge.new_item;
+            confirmed_relocations.push_back(move);
+
+            inventory_.set_status(edge.item_id, ItemStatus::VISIBLE, current_time_ms_);
+            inventory_.update_item(edge.item_id, -1, edge.new_item.box,
+                                   edge.new_item.best_score, snap2.frame_id);
+            consumed_snap2_indices.insert(edge.snap2_idx);
+            settled_item_ids.insert(edge.item_id);
+            printf("\033[1;32m[EVENT]\033[0m 整理: item#%d %s "
+                   "(reid=%.2f evidence=%.2f total=%.2f)\n",
+                   edge.item_id, coco_cls_to_name(edge.cls_id),
+                   edge.reid, edge.evidence, edge.total);
+            result.events.push_back({EventKind::MOVED, edge.item_id, edge.cls_id,
+                                     edge.new_item.box, edge.new_item.best_score});
+            result.happened = true;
+        } else if (edge.decision == RelocationDecision::LOW_CONFIDENCE) {
+            int pending_id = upsert_pending(edge.item_id, edge.cls_id, edge.old_box,
+                                            edge.new_item, edge.reid, edge.evidence);
+            consumed_snap2_indices.insert(edge.snap2_idx);
+            pending_reserved_item_ids.insert(edge.item_id);
+            settled_item_ids.insert(edge.item_id);
+            printf("[SESSION] pending#%d: item#%d %s 可能整理 "
+                   "(reid=%.2f evidence=%.2f total=%.2f)，本轮冻结\n",
+                   pending_id, edge.item_id, coco_cls_to_name(edge.cls_id),
+                   edge.reid, edge.evidence, edge.total);
+        }
+    }
+
+    if (!pending_new_items_.empty()) {
+        std::vector<PendingNewItem> kept_pending_new;
+        for (auto p : pending_new_items_) {
+            std::set<int> used = consumed_snap2_indices;
+            int idx = find_in_snapshot_near(snap2, p.class_id, p.candidate_bbox, used);
+            if (idx < 0) {
+                printf("[SESSION] pending_new#%d 取消：候选新物品不再稳定\n",
+                       p.pending_id);
+                continue;
+            }
+
+            const VotingItem& B = snap2.items[idx];
+            p.candidate_bbox = B.box;
+            p.snapshot_object = B;
+            p.last_checked_snapshot_id = snap2.frame_id;
+
+            int existing_id = find_inventory_item_strict(B.box, B.cls_id, true);
+            if (existing_id >= 0) {
+                const InventoryItem* existing = inventory_.find_by_item(existing_id);
+                ItemStatus old_status = existing ? existing->status : ItemStatus::VISIBLE;
+                inventory_.set_status(existing_id, ItemStatus::VISIBLE, current_time_ms_);
+                inventory_.update_item(existing_id, -1, B.box, B.best_score, snap2.frame_id);
+                consumed_snap2_indices.insert(idx);
+                settled_item_ids.insert(existing_id);
+                printf("[SESSION] pending_new#%d 合并到已有 item#%d %s，不新增库存\n",
+                       p.pending_id, existing_id, coco_cls_to_name(B.cls_id));
+                if (old_status == ItemStatus::OUT) {
+                    printf("[SESSION] item#%d (%s) 从出库恢复为可见\n",
+                           existing_id, coco_cls_to_name(B.cls_id));
+                } else if (old_status == ItemStatus::OCCLUDED) {
+                    printf("[SESSION] item#%d (%s) 从遮挡恢复为可见\n",
+                           existing_id, coco_cls_to_name(B.cls_id));
+                }
+                continue;
+            }
+
+            if (same_class_operation_risk(B)) {
+                p.stable_count++;
+                consumed_snap2_indices.insert(idx);
+                if (p.stable_count <= p.expire_after_stable_count) {
+                    kept_pending_new.push_back(p);
+                } else {
+                    printf("[SESSION] pending_new#%d 继续冻结：同类整理风险仍存在\n",
+                           p.pending_id);
+                    kept_pending_new.push_back(p);
+                }
+                continue;
+            }
+
+            p.stable_count++;
+            if (p.stable_count >= PENDING_NEW_CONFIRM_FRAMES) {
+                int new_id = inventory_.add_item(-1, B.cls_id, B.box, B.best_score,
+                                                 snap2.frame_id, current_time_ms_);
+                consumed_snap2_indices.insert(idx);
+                settled_item_ids.insert(new_id);
+                printf("\033[1;32m[EVENT]\033[0m 放入确认: item#%d %s "
+                       "(pending_new#%d, 置信度 %.0f%%)\n",
+                       new_id, coco_cls_to_name(B.cls_id), p.pending_id,
+                       B.best_score * 100);
+                result.events.push_back({EventKind::IN, new_id, B.cls_id,
+                                         B.box, B.best_score});
+                result.happened = true;
+            } else {
+                consumed_snap2_indices.insert(idx);
+                kept_pending_new.push_back(p);
+            }
+        }
+        pending_new_items_.swap(kept_pending_new);
+    }
+
+    // ---------------------------------------------------------------------
+    //  10.4 对剩余对象执行普通快照 diff。
+    // ---------------------------------------------------------------------
     std::vector<std::pair<int, int>> same_position_pairs;
     std::vector<int> disappeared_indices;
     std::vector<int> appeared_indices;
-    std::set<int> used_snap2_origin_indices;
+    std::set<int> used_snap2_origin_indices = consumed_snap2_indices;
 
     for (int i = 0; i < (int)snap1_.items.size(); ++i) {
         const VotingItem& A = snap1_.items[i];
+        int item_id = baseline_item_ids[i];
+        if (item_id >= 0 &&
+            (settled_item_ids.count(item_id) || pending_reserved_item_ids.count(item_id))) {
+            continue;
+        }
+
         int b_idx = find_in_snapshot_strict(snap2, A.cls_id, A.box, used_snap2_origin_indices);
         if (b_idx >= 0) {
             same_position_pairs.push_back({i, b_idx});
@@ -1009,17 +1460,26 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         }
     }
 
-    std::vector<int> baseline_item_ids(snap1_.items.size(), -1);
-    for (int i = 0; i < (int)snap1_.items.size(); ++i) {
-        const VotingItem& A = snap1_.items[i];
-        baseline_item_ids[i] = find_inventory_item_strict(A.box, A.cls_id, false);
+    std::set<int> consumed_disappeared_indices;
+    std::set<int> consumed_appeared_indices;
+    std::set<int> blocked_appeared_inventory_ids;
+
+    for (const auto& move : confirmed_relocations) {
+        if (apply_relocation_visibility_changes(
+                move.item_id, move.old_box, move.new_object, snap2,
+                disappeared_indices, appeared_indices, baseline_item_ids,
+                consumed_disappeared_indices, consumed_appeared_indices,
+                consumed_snap2_indices, protected_occluded_item_ids, true)) {
+            result.happened = true;
+        }
     }
 
-    std::set<int> anchored_item_ids;
+    std::set<int> anchored_item_ids = settled_item_ids;
     for (const auto& p : same_position_pairs) {
         const VotingItem& B = snap2.items[p.second];
         int item_id = find_inventory_item_strict(B.box, B.cls_id, false);
         if (item_id < 0) continue;
+        if (settled_item_ids.count(item_id) || pending_reserved_item_ids.count(item_id)) continue;
 
         const InventoryItem* item = inventory_.find_by_item(item_id);
         if (!item) continue;
@@ -1030,126 +1490,27 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         anchored_item_ids.insert(item_id);
     }
 
-    std::set<int> consumed_disappeared_indices;
-    std::set<int> consumed_appeared_indices;
-    std::set<int> reserved_snap2_indices;
-    std::set<int> blocked_appeared_inventory_ids;
-    std::set<int> protected_occluded_item_ids;
-
-    process_pending_relocations(snap2, result, reserved_snap2_indices,
-                                protected_occluded_item_ids, anchored_item_ids);
-
-    // ---------------------------------------------------------------------
-    //  10.2 优先处理整理 / 移动
-    // ---------------------------------------------------------------------
-    for (int a_idx : disappeared_indices) {
-        if (consumed_disappeared_indices.count(a_idx)) continue;
-        const VotingItem& A = snap1_.items[a_idx];
-
-        int item_id = find_inventory_item_strict(A.box, A.cls_id, false);
-        if (item_id < 0) continue;
-        const InventoryItem* item = inventory_.find_by_item(item_id);
-        if (!item || item->status != ItemStatus::VISIBLE) continue;
-
-        struct Candidate {
-            int appeared_idx;
-            float reid;
-        };
-        std::vector<Candidate> candidates;
-
-        for (int b_idx : appeared_indices) {
-            if (consumed_appeared_indices.count(b_idx)) continue;
-            if (reserved_snap2_indices.count(b_idx)) continue;
-            const VotingItem& B = snap2.items[b_idx];
-            if (A.cls_id != B.cls_id) continue;
-            float r = reid_score(A, B);
-            if (r >= RELOCATION_REID_MIN) {
-                candidates.push_back({b_idx, r});
-            }
-        }
-
-        if (candidates.empty()) continue;
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& x, const Candidate& y){ return x.reid > y.reid; });
-
-        int best_idx = candidates[0].appeared_idx;
-        float best_reid = candidates[0].reid;
-        float second_reid = candidates.size() > 1 ? candidates[1].reid : -1.0f;
-        const VotingItem& B = snap2.items[best_idx];
-
-        float evidence_score = 0.0f;
-        RelocationDecision decision = relocation_match(item_id, A, B, best_reid,
-                                                       second_reid, &evidence_score);
-        if (decision == RelocationDecision::CONFIRMED) {
-            inventory_.set_status(item_id, ItemStatus::VISIBLE, current_time_ms_);
-            inventory_.update_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
-            anchored_item_ids.insert(item_id);
-            consumed_disappeared_indices.insert(a_idx);
-            consumed_appeared_indices.insert(best_idx);
-            apply_relocation_visibility_changes(
-                item_id, A.box, B, snap2,
-                disappeared_indices, appeared_indices, baseline_item_ids,
-                consumed_disappeared_indices, consumed_appeared_indices,
-                reserved_snap2_indices, protected_occluded_item_ids, true);
-            printf("\033[1;32m[EVENT]\033[0m 整理: item#%d %s "
-                   "(reid=%.2f evidence=%.2f)\n",
-                   item_id, coco_cls_to_name(A.cls_id), best_reid, evidence_score);
-            result.events.push_back({EventKind::MOVED, item_id, A.cls_id, B.box, B.best_score});
-            result.happened = true;
-        } else if (decision == RelocationDecision::LOW_CONFIDENCE) {
-            bool exists = false;
-            for (auto& p : pending_relocations_) {
-                if (p.item_id_A == item_id) {
-                    p.candidate_new_bbox = B.box;
-                    p.snapshot_object_B = B;
-                    p.reid_score = best_reid;
-                    p.evidence_score = evidence_score;
-                    p.last_checked_snapshot_id = snap2.frame_id;
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                PendingRelocation p;
-                p.pending_id = next_pending_id_++;
-                p.item_id_A = item_id;
-                p.class_id = A.cls_id;
-                p.old_bbox = A.box;
-                p.candidate_new_bbox = B.box;
-                p.snapshot_object_B = B;
-                p.reid_score = best_reid;
-                p.evidence_score = evidence_score;
-                p.created_snapshot_id = snap2.frame_id;
-                p.last_checked_snapshot_id = snap2.frame_id;
-                p.expire_after_stable_count = PENDING_RELOCATION_EXPIRE_FRAMES;
-                pending_relocations_.push_back(p);
-                printf("[SESSION] pending#%d: item#%d %s 可能整理 "
-                       "(reid=%.2f evidence=%.2f)，本轮冻结\n",
-                       p.pending_id, item_id, coco_cls_to_name(A.cls_id),
-                       best_reid, evidence_score);
-            }
-            consumed_disappeared_indices.insert(a_idx);
-            consumed_appeared_indices.insert(best_idx);
-            reserved_snap2_indices.insert(best_idx);
-            if (apply_relocation_visibility_changes(
-                    item_id, A.box, B, snap2,
-                    disappeared_indices, appeared_indices, baseline_item_ids,
-                    consumed_disappeared_indices, consumed_appeared_indices,
-                    reserved_snap2_indices, protected_occluded_item_ids, false)) {
-                result.happened = true;
-            }
-        }
-    }
-
     // ---------------------------------------------------------------------
     //  10.3 处理剩余消失物品
     // ---------------------------------------------------------------------
     for (int a_idx : disappeared_indices) {
         if (consumed_disappeared_indices.count(a_idx)) continue;
+        if (a_idx >= 0 && a_idx < (int)baseline_item_ids.size()) {
+            int baseline_item_id = baseline_item_ids[a_idx];
+            if (baseline_item_id >= 0 &&
+                (settled_item_ids.count(baseline_item_id) ||
+                 pending_reserved_item_ids.count(baseline_item_id))) {
+                continue;
+            }
+        }
 
         const VotingItem& A = snap1_.items[a_idx];
         int item_id = find_inventory_item_strict(A.box, A.cls_id, false);
         if (item_id < 0) continue;
+        if (settled_item_ids.count(item_id) ||
+            pending_reserved_item_ids.count(item_id)) {
+            continue;
+        }
 
         const InventoryItem* item = inventory_.find_by_item(item_id);
         if (!item) continue;
@@ -1164,7 +1525,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         bool found_reason = false;
         for (int c_idx : appeared_indices) {
             if (consumed_appeared_indices.count(c_idx)) continue;
-            if (reserved_snap2_indices.count(c_idx)) continue;
+            if (consumed_snap2_indices.count(c_idx)) continue;
 
             const VotingItem& C = snap2.items[c_idx];
             float nearby_dist = normalized_nearby_distance(A.box, C.box);
@@ -1232,7 +1593,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     // ---------------------------------------------------------------------
     for (int b_idx : appeared_indices) {
         if (consumed_appeared_indices.count(b_idx)) continue;
-        if (reserved_snap2_indices.count(b_idx)) continue;
+        if (consumed_snap2_indices.count(b_idx)) continue;
+        if (residual_snap2_indices.count(b_idx)) continue;
 
         const VotingItem& B = snap2.items[b_idx];
 
@@ -1278,6 +1640,14 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                    coco_cls_to_name(B.cls_id), recover_id, item_status_to_str(old_status));
             result.events.push_back({EventKind::MOVED, recover_id, B.cls_id, B.box, B.best_score});
             result.happened = true;
+            continue;
+        }
+
+        if (same_class_operation_risk(B)) {
+            int pending_id = upsert_pending_new(B);
+            residual_snap2_indices.insert(b_idx);
+            printf("[SESSION] pending_new#%d: %s 新出现但同类整理风险较高，本轮暂不入库\n",
+                   pending_id, coco_cls_to_name(B.cls_id));
             continue;
         }
 
