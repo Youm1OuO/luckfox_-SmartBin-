@@ -270,6 +270,11 @@ constexpr float HELD_HAND_OVERLAP_THRESH = 0.30f;
 constexpr int HELD_CONFIRM_FRAMES = 2;
 // 物体 track 移动超过自身对角线多少比例，才作为移动证据
 constexpr float TRACK_MOVE_DISTANCE_RATIO = 0.50f;
+// item 操作时间线的证据分数：只作为排序/低置信整理辅助，不直接提交事件。
+constexpr float OPERATION_EVIDENCE_TOUCH_SCORE = 0.28f;
+constexpr float OPERATION_EVIDENCE_MOVE_SCORE = 0.45f;
+constexpr float OPERATION_EVIDENCE_OCCLUDED_SCORE = 0.40f;
+constexpr float OPERATION_EVIDENCE_HELD_SCORE = 0.55f;
 
 // =========================================================================
 //  新业务流程6：出库物品过期

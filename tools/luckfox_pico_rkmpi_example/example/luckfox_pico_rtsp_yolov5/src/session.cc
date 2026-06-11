@@ -431,6 +431,21 @@ float SessionManager::relocation_evidence_score(int item_id,
                                                 const BBox& to) const {
     float score = 0.0f;
 
+    const ItemOperationEvidence* op = find_item_operation_evidence(item_id);
+    if (op) {
+        float op_score = 0.0f;
+        if (op->evidence_flags & OP_EVIDENCE_HELD) {
+            op_score = std::max(op_score, OPERATION_EVIDENCE_HELD_SCORE);
+        } else if (op->evidence_flags & OP_EVIDENCE_MOVED) {
+            op_score = std::max(op_score, OPERATION_EVIDENCE_MOVE_SCORE);
+        } else if (op->evidence_flags & OP_EVIDENCE_OCCLUDED) {
+            op_score = std::max(op_score, OPERATION_EVIDENCE_OCCLUDED_SCORE);
+        } else if (op->evidence_flags & OP_EVIDENCE_TOUCHED) {
+            op_score = std::max(op_score, OPERATION_EVIDENCE_TOUCH_SCORE);
+        }
+        score = std::max(score, op_score);
+    }
+
     if (operation_context_.moved_item_candidates.count(item_id)) {
         score = std::max(score, 0.35f);
     }
@@ -565,11 +580,18 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
         }
 
         TrackEvidence& ev = it->second;
+        bool track_overlapped_hand = false;
         for (const auto& hb : hand_boxes) {
             if (overlap_ratio_of_smaller(hb, t.box) >= HELD_HAND_OVERLAP_THRESH) {
                 ev.occluded_by_hand = true;
+                track_overlapped_hand = true;
                 break;
             }
+        }
+        if (track_overlapped_hand) {
+            mark_item_operation_evidence(
+                item_id, t.cls_id, frame_id, OP_EVIDENCE_OCCLUDED,
+                OPERATION_EVIDENCE_OCCLUDED_SCORE, &t.box);
         }
 
         float move_dist = center_distance(ev.start_box, ev.end_box);
@@ -578,6 +600,10 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
             ev.confidence = std::max(ev.confidence, clamp01(move_ratio));
             operation_context_.moving_tracks.insert(t.track_id);
             operation_context_.moved_item_candidates.insert(item_id);
+            mark_item_operation_evidence(
+                item_id, t.cls_id, frame_id, OP_EVIDENCE_MOVED,
+                std::max(OPERATION_EVIDENCE_MOVE_SCORE, clamp01(move_ratio)),
+                &t.box);
         }
     }
 
@@ -607,6 +633,10 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
                 touched_candidate_items.insert(item.item_id);
                 candidate_hand_box[item.item_id] = best_hand_box;
                 candidate_hand_track_id[item.item_id] = best_hand_track;
+                mark_item_operation_evidence(
+                    item.item_id, item.cls_id, frame_id, OP_EVIDENCE_TOUCHED,
+                    std::max(OPERATION_EVIDENCE_TOUCH_SCORE, best_overlap),
+                    &item.box);
             }
         }
 
@@ -623,6 +653,12 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
             touched_candidate_items.insert(item_id);
             candidate_hand_box[item_id] = hand_boxes[0];
             candidate_hand_track_id[item_id] = find_best_hand_track_id(hand_boxes[0], tracks);
+            const InventoryItem* item = inventory_.find_by_item(item_id);
+            if (item) {
+                mark_item_operation_evidence(
+                    item_id, item->cls_id, frame_id, OP_EVIDENCE_OCCLUDED,
+                    OPERATION_EVIDENCE_OCCLUDED_SCORE, &item->box);
+            }
         }
 
         for (int item_id : touched_candidate_items) {
@@ -632,6 +668,9 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
             if (operation_context_.candidate_held_items[item_id] < HELD_CONFIRM_FRAMES) continue;
 
             operation_context_.confirmed_held_items.insert(item_id);
+            mark_item_operation_evidence(
+                item_id, item->cls_id, frame_id, OP_EVIDENCE_HELD,
+                OPERATION_EVIDENCE_HELD_SCORE, &item->box);
 
             HeldProxyEvidence* proxy = nullptr;
             for (auto& ev : operation_context_.held_proxy_evidences) {
@@ -823,6 +862,64 @@ void SessionManager::reset_operation_context(int baseline_snapshot_id, int frame
     operation_context_.reset(next_context_id_++, baseline_snapshot_id, frame_id);
 }
 
+const ItemOperationEvidence*
+SessionManager::find_item_operation_evidence(int item_id) const {
+    auto it = operation_context_.item_operation_evidences.find(item_id);
+    if (it == operation_context_.item_operation_evidences.end()) return nullptr;
+    return &it->second;
+}
+
+void SessionManager::mark_item_operation_evidence(int item_id,
+                                                  int cls_id,
+                                                  int frame_id,
+                                                  int evidence_flag,
+                                                  float evidence_score,
+                                                  const BBox* visible_box) {
+    if (item_id < 0) return;
+
+    ItemOperationEvidence& ev =
+        operation_context_.item_operation_evidences[item_id];
+    if (ev.item_id < 0) {
+        ev.item_id = item_id;
+        ev.class_id = cls_id;
+    }
+
+    if (visible_box) {
+        ev.last_visible_box = *visible_box;
+    }
+
+    if (ev.operation_order <= 0) {
+        if (frame_id != operation_context_.last_assigned_operation_frame) {
+            operation_context_.next_operation_order++;
+            operation_context_.last_operation_group++;
+            operation_context_.last_assigned_operation_frame = frame_id;
+        }
+        ev.operation_order = operation_context_.next_operation_order;
+        ev.operation_group = operation_context_.last_operation_group;
+        ev.first_operation_frame = frame_id;
+    }
+
+    ev.evidence_flags |= evidence_flag;
+    ev.evidence_score = std::max(ev.evidence_score, evidence_score);
+
+    if (evidence_flag & OP_EVIDENCE_TOUCHED) {
+        if (ev.first_touch_frame <= 0) ev.first_touch_frame = frame_id;
+        ev.last_touch_frame = frame_id;
+    }
+    if (evidence_flag & OP_EVIDENCE_MOVED) {
+        if (ev.first_move_frame <= 0) ev.first_move_frame = frame_id;
+        ev.last_move_frame = frame_id;
+    }
+    if (evidence_flag & OP_EVIDENCE_OCCLUDED) {
+        if (ev.first_occluded_frame <= 0) ev.first_occluded_frame = frame_id;
+        ev.last_occluded_frame = frame_id;
+    }
+    if (evidence_flag & OP_EVIDENCE_HELD) {
+        if (ev.first_occluded_frame <= 0) ev.first_occluded_frame = frame_id;
+        ev.last_occluded_frame = frame_id;
+    }
+}
+
 bool SessionManager::has_same_class_operation_context(int cls_id) const {
     for (const auto& p : pending_relocations_) {
         if (p.class_id == cls_id) return true;
@@ -847,6 +944,12 @@ bool SessionManager::has_same_class_operation_context(int cls_id) const {
     }
     for (const auto& ev : operation_context_.held_proxy_evidences) {
         if (item_is_same_class(ev.item_id)) return true;
+    }
+    for (const auto& kv : operation_context_.item_operation_evidences) {
+        const ItemOperationEvidence& ev = kv.second;
+        if (ev.class_id == cls_id && ev.evidence_score > 0.0f) {
+            return true;
+        }
     }
     for (const auto& kv : operation_context_.active_track_evidences) {
         const TrackEvidence& ev = kv.second;
@@ -1270,7 +1373,30 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     // ---------------------------------------------------------------------
     //  10.2 优先处理整理 / 移动
     // ---------------------------------------------------------------------
-    for (int a_idx : disappeared_indices) {
+    std::vector<int> relocation_disappeared_order = disappeared_indices;
+    std::stable_sort(relocation_disappeared_order.begin(),
+                     relocation_disappeared_order.end(),
+                     [this, &baseline_item_ids](int lhs, int rhs) {
+        int lhs_item = (lhs >= 0 && lhs < (int)baseline_item_ids.size())
+                     ? baseline_item_ids[lhs] : -1;
+        int rhs_item = (rhs >= 0 && rhs < (int)baseline_item_ids.size())
+                     ? baseline_item_ids[rhs] : -1;
+        const ItemOperationEvidence* lhs_ev =
+            lhs_item >= 0 ? find_item_operation_evidence(lhs_item) : nullptr;
+        const ItemOperationEvidence* rhs_ev =
+            rhs_item >= 0 ? find_item_operation_evidence(rhs_item) : nullptr;
+        bool lhs_has_order = lhs_ev && lhs_ev->operation_order > 0;
+        bool rhs_has_order = rhs_ev && rhs_ev->operation_order > 0;
+
+        if (lhs_has_order != rhs_has_order) return lhs_has_order;
+        if (!lhs_has_order) return false;
+        if (lhs_ev->operation_order != rhs_ev->operation_order) {
+            return lhs_ev->operation_order < rhs_ev->operation_order;
+        }
+        return false;
+    });
+
+    for (int a_idx : relocation_disappeared_order) {
         if (consumed_disappeared_indices.count(a_idx)) continue;
         const VotingItem& A = snap1_.items[a_idx];
 

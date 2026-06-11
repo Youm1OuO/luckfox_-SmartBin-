@@ -91,6 +91,30 @@ struct HeldProxyEvidence {
     float confidence = 0.0f;
 };
 
+enum OperationEvidenceFlag {
+    OP_EVIDENCE_TOUCHED = 1 << 0,
+    OP_EVIDENCE_MOVED = 1 << 1,
+    OP_EVIDENCE_OCCLUDED = 1 << 2,
+    OP_EVIDENCE_HELD = 1 << 3,
+};
+
+struct ItemOperationEvidence {
+    int item_id = -1;
+    int class_id = -1;
+    int operation_order = 0;
+    int operation_group = 0;
+    int first_operation_frame = 0;
+    int first_touch_frame = 0;
+    int last_touch_frame = 0;
+    int first_move_frame = 0;
+    int last_move_frame = 0;
+    int first_occluded_frame = 0;
+    int last_occluded_frame = 0;
+    int evidence_flags = 0;
+    float evidence_score = 0.0f;
+    BBox last_visible_box;
+};
+
 struct OperationContext {
     int context_id = 0;
     int baseline_snapshot_id = 0;
@@ -104,6 +128,10 @@ struct OperationContext {
     std::map<int, TrackEvidence> active_track_evidences;
     std::set<int> moving_tracks;
     std::set<int> moved_item_candidates;
+    std::map<int, ItemOperationEvidence> item_operation_evidences;
+    int next_operation_order = 0;
+    int last_assigned_operation_frame = -1;
+    int last_operation_group = 0;
     int unstable_frame_count = 0;
     int created_frame_id = 0;
     int updated_frame_id = 0;
@@ -236,6 +264,13 @@ private:
     void update_operation_context(const std::vector<BBox>& hand_boxes,
                                   const std::vector<Track>& tracks,
                                   int frame_id);
+    void mark_item_operation_evidence(int item_id,
+                                      int cls_id,
+                                      int frame_id,
+                                      int evidence_flag,
+                                      float evidence_score,
+                                      const BBox* visible_box);
+    const ItemOperationEvidence* find_item_operation_evidence(int item_id) const;
 
     int find_inventory_item_strict(const BBox& box, int cls_id,
                                    bool include_out) const;
