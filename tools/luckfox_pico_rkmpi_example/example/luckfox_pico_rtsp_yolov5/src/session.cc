@@ -131,6 +131,7 @@ void SessionManager::start_new_session(long long time_ms) {
     init_state_ = InitState::WAIT_BACKEND;
     inventory_initialized_ = false;
     pending_relocations_.clear();
+    pending_new_objects_.clear();
     hand_present_ = false;
     no_hand_streak_ = 0;
     reset_snap_state();
@@ -178,6 +179,11 @@ void SessionManager::finish_session(long long time_ms) {
         printf("[SESSION] 关门：清理 %zu 个未确认整理候选，不强行提交 MOVED\n",
                pending_relocations_.size());
         pending_relocations_.clear();
+    }
+    if (!pending_new_objects_.empty()) {
+        printf("[SESSION] 关门：清理 %zu 个未确认新物品候选，不强行提交 IN\n",
+               pending_new_objects_.size());
+        pending_new_objects_.clear();
     }
 
     hand_present_ = false;
@@ -699,6 +705,7 @@ void SessionManager::reset_snap_state() {
     snap1_ = {{}, 0, false, false};
     contrast_ = {{}, 0, false, false};
     current_ = {{}, 0, false, false};
+    pending_new_objects_.clear();
     reset_operation_context(0, 0);
     printf("[SESSION] 快照状态机已重置，等待新快照\n");
 }
@@ -774,6 +781,244 @@ void SessionManager::process_pending_relocations(const Snapshot& snap2,
     }
 
     pending_relocations_.swap(kept);
+}
+
+int SessionManager::find_existing_item_for_pending_new(const VotingItem& item) const {
+    int best_id = -1;
+    float best_score = 0.0f;
+
+    for (const auto& kv : inventory_.items()) {
+        const InventoryItem& inv = kv.second;
+        if (inv.status == ItemStatus::OUT) continue;
+        if (inv.cls_id != item.cls_id) continue;
+
+        float box_iou = iou(inv.box, item.box);
+        float overlap = overlap_ratio_of_smaller(inv.box, item.box);
+        float center_norm = normalized_nearby_distance(inv.box, item.box);
+        bool merge =
+            strict_box_match(inv.box, inv.cls_id, item.box, item.cls_id) ||
+            box_iou >= PENDING_NEW_MERGE_IOU_THRESH ||
+            overlap >= PENDING_NEW_MERGE_OVERLAP_THRESH ||
+            center_norm <= PENDING_NEW_CENTER_NORM_THRESH;
+        if (!merge) continue;
+
+        float score = std::max(box_iou, overlap);
+        score = std::max(score, 1.0f - std::min(center_norm, 1.0f));
+        if (score > best_score) {
+            best_score = score;
+            best_id = kv.first;
+        }
+    }
+
+    return best_id;
+}
+
+bool SessionManager::should_defer_new_object(const VotingItem& item,
+                                             const Snapshot& snap2,
+                                             std::set<int>& related_item_ids) const {
+    related_item_ids.clear();
+
+    for (const auto& kv : inventory_.items()) {
+        const InventoryItem& inv = kv.second;
+        if (inv.status == ItemStatus::OUT) continue;
+        if (inv.cls_id == item.cls_id) {
+            related_item_ids.insert(kv.first);
+        }
+    }
+
+    if (related_item_ids.empty()) {
+        return false;
+    }
+
+    if (find_existing_item_for_pending_new(item) >= 0) {
+        return true;
+    }
+
+    for (int item_id : related_item_ids) {
+        if (operation_context_.candidate_held_items.count(item_id) ||
+            operation_context_.confirmed_held_items.count(item_id) ||
+            operation_context_.moved_item_candidates.count(item_id)) {
+            return true;
+        }
+    }
+
+    for (const auto& kv : operation_context_.active_track_evidences) {
+        const TrackEvidence& ev = kv.second;
+        if (ev.cls_id != item.cls_id) continue;
+        if (operation_context_.moving_tracks.count(ev.track_id) ||
+            ev.confidence > 0.0f ||
+            ev.occluded_by_hand) {
+            return true;
+        }
+    }
+
+    int old_class_count = 0;
+    for (const auto& old_item : snap1_.items) {
+        if (old_item.cls_id == item.cls_id) old_class_count++;
+    }
+    int new_class_count = 0;
+    for (const auto& new_item : snap2.items) {
+        if (new_item.cls_id == item.cls_id) new_class_count++;
+    }
+
+    if (operation_context_.hand_seen && new_class_count > old_class_count) {
+        return true;
+    }
+
+    return false;
+}
+
+void SessionManager::create_or_update_pending_new_object(
+        const VotingItem& item,
+        const Snapshot& snap2,
+        const std::set<int>& related_item_ids) {
+    for (auto& pending : pending_new_objects_) {
+        if (pending.class_id != item.cls_id) continue;
+        if (normalized_nearby_distance(pending.candidate_bbox, item.box) > 0.75f &&
+            iou(pending.candidate_bbox, item.box) < 0.20f) {
+            continue;
+        }
+
+        pending.candidate_bbox = item.box;
+        pending.snapshot_object_B = item;
+        pending.last_checked_snapshot_id = snap2.frame_id;
+        pending.related_existing_item_ids.insert(related_item_ids.begin(),
+                                                 related_item_ids.end());
+        printf("[SESSION] pending_new#%d 更新: %s 候选继续待确认\n",
+               pending.pending_id, coco_cls_to_name(item.cls_id));
+        return;
+    }
+
+    PendingNewObject pending;
+    pending.pending_id = next_pending_id_++;
+    pending.class_id = item.cls_id;
+    pending.candidate_bbox = item.box;
+    pending.snapshot_object_B = item;
+    pending.created_snapshot_id = snap2.frame_id;
+    pending.last_checked_snapshot_id = snap2.frame_id;
+    pending.expire_after_stable_count = PENDING_NEW_OBJECT_EXPIRE_FRAMES;
+    pending.related_existing_item_ids = related_item_ids;
+    pending_new_objects_.push_back(pending);
+
+    printf("[SESSION] pending_new#%d: %s 新出现但同类操作风险较高，本轮暂不入库\n",
+           pending.pending_id, coco_cls_to_name(item.cls_id));
+}
+
+void SessionManager::process_pending_new_objects(
+        const Snapshot& snap2,
+        SettlementResult& result,
+        std::set<int>& reserved_snap2_indices,
+        std::set<int>& protected_item_ids) {
+    if (pending_new_objects_.empty()) return;
+
+    std::vector<PendingNewObject> kept;
+    std::set<int> used_indices = reserved_snap2_indices;
+
+    for (auto pending : pending_new_objects_) {
+        int b_idx = find_in_snapshot_near(snap2, pending.class_id,
+                                          pending.candidate_bbox, used_indices);
+        if (b_idx < 0) {
+            printf("[SESSION] pending_new#%d 取消：候选新物品不再稳定\n",
+                   pending.pending_id);
+            continue;
+        }
+
+        used_indices.insert(b_idx);
+        reserved_snap2_indices.insert(b_idx);
+        const VotingItem& B = snap2.items[b_idx];
+
+        int existing_id = find_existing_item_for_pending_new(B);
+        if (existing_id >= 0) {
+            InventoryItem* existing = inventory_.find_by_item(existing_id);
+            if (existing && existing->status != ItemStatus::OUT) {
+                inventory_.update_item(existing_id, -1, B.box, B.best_score, snap2.frame_id);
+                inventory_.set_status(existing_id, ItemStatus::VISIBLE, current_time_ms_);
+                printf("[SESSION] pending_new#%d 合并到已有 item#%d %s，不新增库存\n",
+                       pending.pending_id, existing_id, coco_cls_to_name(B.cls_id));
+            }
+            continue;
+        }
+
+        int missing_related_id = -1;
+        for (int item_id : pending.related_existing_item_ids) {
+            const InventoryItem* related = inventory_.find_by_item(item_id);
+            if (!related || related->status != ItemStatus::VISIBLE) continue;
+
+            std::set<int> exclude_candidate;
+            exclude_candidate.insert(b_idx);
+            int old_idx = find_in_snapshot_near(snap2, related->cls_id,
+                                                related->box, exclude_candidate);
+            if (old_idx < 0) {
+                missing_related_id = item_id;
+                break;
+            }
+        }
+
+        if (missing_related_id >= 0) {
+            InventoryItem* related = inventory_.find_by_item(missing_related_id);
+            if (related) {
+                bool exists = false;
+                for (auto& p : pending_relocations_) {
+                    if (p.item_id_A == missing_related_id) {
+                        p.candidate_new_bbox = B.box;
+                        p.snapshot_object_B = B;
+                        p.last_checked_snapshot_id = snap2.frame_id;
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    PendingRelocation p;
+                    p.pending_id = next_pending_id_++;
+                    p.item_id_A = missing_related_id;
+                    p.class_id = related->cls_id;
+                    p.old_bbox = related->box;
+                    p.candidate_new_bbox = B.box;
+                    p.snapshot_object_B = B;
+                    p.created_snapshot_id = snap2.frame_id;
+                    p.last_checked_snapshot_id = snap2.frame_id;
+                    p.expire_after_stable_count = PENDING_RELOCATION_EXPIRE_FRAMES;
+                    pending_relocations_.push_back(p);
+                }
+                protected_item_ids.insert(missing_related_id);
+                printf("[SESSION] pending_new#%d 转为整理候选: item#%d -> 新位置\n",
+                       pending.pending_id, missing_related_id);
+            }
+            continue;
+        }
+
+        pending.candidate_bbox = B.box;
+        pending.snapshot_object_B = B;
+        pending.last_checked_snapshot_id = snap2.frame_id;
+        pending.stable_count++;
+
+        if (pending.stable_count >= PENDING_NEW_OBJECT_CONFIRM_FRAMES) {
+            int new_id = inventory_.add_item(-1, B.cls_id, B.box, B.best_score,
+                                             snap2.frame_id, current_time_ms_);
+            InventoryItem* new_item = inventory_.find_by_item(new_id);
+            if (new_item && NEW_ITEM_PROBATION_FRAMES > 0) {
+                new_item->probation_until_frame =
+                    snap2.frame_id + NEW_ITEM_PROBATION_FRAMES * SNAPSHOT_N;
+            }
+            printf("\033[1;32m[EVENT]\033[0m 放入确认: item#%d %s "
+                   "(pending_new#%d, 置信度 %.0f%%)\n",
+                   new_id, coco_cls_to_name(B.cls_id), pending.pending_id,
+                   B.best_score * 100);
+            result.events.push_back({EventKind::IN, new_id, B.cls_id, B.box, B.best_score});
+            result.happened = true;
+            continue;
+        }
+
+        if (pending.stable_count > pending.expire_after_stable_count) {
+            printf("[SESSION] pending_new#%d 过期：不强行新增库存\n",
+                   pending.pending_id);
+            continue;
+        }
+
+        kept.push_back(pending);
+    }
+
+    pending_new_objects_.swap(kept);
 }
 
 bool SessionManager::apply_relocation_visibility_changes(
@@ -926,9 +1171,12 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     std::set<int> reserved_snap2_indices;
     std::set<int> blocked_appeared_inventory_ids;
     std::set<int> protected_occluded_item_ids;
+    std::set<int> protected_pending_new_item_ids;
 
     process_pending_relocations(snap2, result, reserved_snap2_indices,
                                 protected_occluded_item_ids);
+    process_pending_new_objects(snap2, result, reserved_snap2_indices,
+                                protected_pending_new_item_ids);
 
     // ---------------------------------------------------------------------
     //  10.2 优先处理整理 / 移动
@@ -941,6 +1189,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (item_id < 0) continue;
         const InventoryItem* item = inventory_.find_by_item(item_id);
         if (!item || item->status != ItemStatus::VISIBLE) continue;
+        if (protected_pending_new_item_ids.count(item_id)) continue;
+        if (item->probation_until_frame > snap2.frame_id) continue;
 
         struct Candidate {
             int appeared_idx;
@@ -1040,6 +1290,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         const VotingItem& A = snap1_.items[a_idx];
         int item_id = find_inventory_item_strict(A.box, A.cls_id, false);
         if (item_id < 0) continue;
+        if (protected_pending_new_item_ids.count(item_id)) continue;
 
         const InventoryItem* item = inventory_.find_by_item(item_id);
         if (!item) continue;
@@ -1151,6 +1402,13 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                        out_id, coco_cls_to_name(B.cls_id));
                 continue;
             }
+        }
+
+        std::set<int> related_item_ids;
+        if (should_defer_new_object(B, snap2, related_item_ids)) {
+            create_or_update_pending_new_object(B, snap2, related_item_ids);
+            reserved_snap2_indices.insert(b_idx);
+            continue;
         }
 
         int new_id = inventory_.add_item(-1, B.cls_id, B.box, B.best_score,

@@ -34,6 +34,7 @@ struct InventoryItem {
     ItemStatus status;        // 当前状态
     int created_frame;        // 入库帧号
     int updated_frame;        // 最近更新帧号
+    int probation_until_frame; // 刚确认的新物品在此帧前不作为整理源
     long long created_time_ms;// 入库时间戳
     long long out_time_ms;    // 出库时间戳（仅OUT状态有效，用于过期清理）
 };

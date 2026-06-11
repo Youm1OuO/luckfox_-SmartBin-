@@ -7,7 +7,8 @@
 //    2. OperationContext 记录手、HELD代理轨迹、ByteTrack移动证据
 //    3. relocation_match 优先于普通出库/入库，避免整理被拆成出库+入库
 //    4. low_confidence_relocation 进入跨快照 PendingRelocation
-//    5. 手不直接产生库存事件，只作为统一裁决的辅助证据
+//    5. 高风险新出现同类物品进入跨快照 PendingNewObject
+//    6. 手不直接产生库存事件，只作为统一裁决的辅助证据
 //
 //  所有操作实时更新进本地库存清单，身份匹配也基于库存清单进行
 // ============================================================================
@@ -126,6 +127,18 @@ struct PendingRelocation {
     int expire_after_stable_count = 2;
 };
 
+struct PendingNewObject {
+    int pending_id = 0;
+    int class_id = -1;
+    BBox candidate_bbox;
+    VotingItem snapshot_object_B;
+    int created_snapshot_id = 0;
+    int last_checked_snapshot_id = 0;
+    int stable_count = 0;
+    int expire_after_stable_count = 2;
+    std::set<int> related_existing_item_ids;
+};
+
 class SessionManager {
 public:
     SessionManager();
@@ -187,6 +200,7 @@ private:
     OperationContext operation_context_;
     int next_context_id_;
     std::vector<PendingRelocation> pending_relocations_;
+    std::vector<PendingNewObject> pending_new_objects_;
     int next_pending_id_;
 
     // ---- 库存 ----
@@ -246,6 +260,17 @@ private:
                                      SettlementResult& result,
                                      std::set<int>& reserved_snap2_indices,
                                      std::set<int>& protected_occluded_item_ids);
+    void process_pending_new_objects(const Snapshot& snap2,
+                                     SettlementResult& result,
+                                     std::set<int>& reserved_snap2_indices,
+                                     std::set<int>& protected_item_ids);
+    bool should_defer_new_object(const VotingItem& item,
+                                 const Snapshot& snap2,
+                                 std::set<int>& related_item_ids) const;
+    void create_or_update_pending_new_object(const VotingItem& item,
+                                             const Snapshot& snap2,
+                                             const std::set<int>& related_item_ids);
+    int find_existing_item_for_pending_new(const VotingItem& item) const;
     bool apply_relocation_visibility_changes(
         int moved_item_id,
         const BBox& old_box,

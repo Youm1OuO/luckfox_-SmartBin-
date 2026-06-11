@@ -190,6 +190,18 @@ constexpr int   PENDING_RELOCATION_CONFIRM_FRAMES = 1;
 constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
 
 // =========================================================================
+//  新业务流程6：待确认新物品
+// -------------------------------------------------------------------------
+//  只在同类整理/重影风险较高时延迟入库；普通干净的新物品仍立即入库。
+// =========================================================================
+constexpr int   PENDING_NEW_OBJECT_CONFIRM_FRAMES = 1;
+constexpr int   PENDING_NEW_OBJECT_EXPIRE_FRAMES  = 2;
+constexpr int   NEW_ITEM_PROBATION_FRAMES         = 1;
+constexpr float PENDING_NEW_MERGE_IOU_THRESH      = 0.45f;
+constexpr float PENDING_NEW_MERGE_OVERLAP_THRESH  = 0.65f;
+constexpr float PENDING_NEW_CENTER_NORM_THRESH    = 0.25f;
+
+// =========================================================================
 //  新业务流程6：多帧快照投票
 // =========================================================================
 constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）

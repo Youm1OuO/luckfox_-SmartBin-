@@ -32,6 +32,7 @@ int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
     it.status = ItemStatus::VISIBLE;  // 新入库默认"可见"
     it.created_frame = frame_id;
     it.updated_frame = frame_id;
+    it.probation_until_frame = 0;
     it.created_time_ms = time_ms;
     it.out_time_ms = 0;
     items_[it.item_id] = it;
