@@ -248,6 +248,87 @@ int SessionManager::find_inventory_item_relaxed(const BBox& box,
     return best_id;
 }
 
+int SessionManager::find_recoverable_moved_item_for_appeared(
+        const VotingItem& appeared,
+        const std::set<int>& anchored_item_ids,
+        const std::set<int>& blocked_item_ids) const {
+    int best_id = -1;
+    float best_score = -1.0f;
+
+    for (const auto& kv : inventory_.items()) {
+        const InventoryItem& it = kv.second;
+        if (it.cls_id != appeared.cls_id) continue;
+        if (blocked_item_ids.count(it.item_id)) continue;
+
+        bool operation_link =
+            operation_context_.confirmed_held_items.count(it.item_id) ||
+            operation_context_.candidate_held_items.count(it.item_id) ||
+            operation_context_.moved_item_candidates.count(it.item_id);
+        bool anchored = anchored_item_ids.count(it.item_id) > 0;
+        if (anchored && !operation_link) continue;
+
+        float nearby_dist = normalized_nearby_distance(it.box, appeared.box);
+        float overlap = overlap_ratio_of_smaller(it.box, appeared.box);
+        bool spatially_related =
+            nearby_dist <= NEARBY_DISTANCE_THRESH ||
+            overlap >= RELOCATION_OCCLUSION_OVERLAP_THRESH;
+        if (anchored && !spatially_related) continue;
+
+        bool just_marked_out =
+            it.status == ItemStatus::OUT &&
+            it.out_time_ms > 0 &&
+            it.out_time_ms == current_time_ms_;
+        bool recoverable_status =
+            it.status == ItemStatus::OCCLUDED ||
+            just_marked_out ||
+            (it.status == ItemStatus::VISIBLE && operation_link);
+        if (!recoverable_status) continue;
+
+        VotingItem old_item;
+        old_item.cls_id = it.cls_id;
+        old_item.box = it.box;
+        old_item.best_score = it.score;
+        old_item.count = 1;
+
+        float reid = reid_score(old_item, appeared);
+        float evidence = relocation_evidence_score(it.item_id, it.box, appeared.box);
+
+        bool near_occluded =
+            it.status == ItemStatus::OCCLUDED &&
+            relaxed_box_match(appeared.box, appeared.cls_id, it.box, it.cls_id);
+        bool moved_by_operation =
+            operation_link &&
+            spatially_related &&
+            reid >= RELOCATION_REID_MIN &&
+            evidence >= RELOCATION_EVIDENCE_WEAK;
+        bool operated_occluded_move =
+            it.status == ItemStatus::OCCLUDED &&
+            operation_link &&
+            reid >= RELOCATION_REID_MIN &&
+            evidence >= RELOCATION_EVIDENCE_WEAK;
+        bool current_operation_out =
+            just_marked_out &&
+            operation_link &&
+            reid >= RELOCATION_REID_MIN;
+
+        if (!near_occluded && !moved_by_operation &&
+            !operated_occluded_move && !current_operation_out) {
+            continue;
+        }
+
+        float score = reid + evidence;
+        if (moved_by_operation || operated_occluded_move || current_operation_out) {
+            score += 1.0f;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best_id = it.item_id;
+        }
+    }
+
+    return best_id;
+}
+
 int SessionManager::find_inventory_item_for_track(const Track& track) const {
     for (const auto& kv : inventory_.items()) {
         const InventoryItem& it = kv.second;
@@ -714,7 +795,8 @@ void SessionManager::reset_operation_context(int baseline_snapshot_id, int frame
 void SessionManager::process_pending_relocations(const Snapshot& snap2,
                                                  SettlementResult& result,
                                                  std::set<int>& reserved_snap2_indices,
-                                                 std::set<int>& protected_occluded_item_ids) {
+                                                 std::set<int>& protected_occluded_item_ids,
+                                                 std::set<int>& anchored_item_ids) {
     if (pending_relocations_.empty()) return;
 
     std::vector<PendingRelocation> kept;
@@ -743,6 +825,7 @@ void SessionManager::process_pending_relocations(const Snapshot& snap2,
             if (item && item->status != ItemStatus::OUT) {
                 inventory_.set_status(p.item_id_A, ItemStatus::VISIBLE, current_time_ms_);
                 inventory_.update_item(p.item_id_A, -1, B.box, B.best_score, snap2.frame_id);
+                anchored_item_ids.insert(p.item_id_A);
                 for (const auto& kv : inventory_.items()) {
                     if (kv.first == p.item_id_A) continue;
                     const InventoryItem& maybe_hidden = kv.second;
@@ -808,6 +891,30 @@ bool SessionManager::apply_relocation_visibility_changes(
         float box_iou = iou(new_object.box, C.box);
         if (overlap < RELOCATION_OCCLUSION_OVERLAP_THRESH &&
             box_iou < RELOCATION_OCCLUSION_IOU_THRESH) {
+            continue;
+        }
+
+        bool c_has_operation_link =
+            operation_context_.confirmed_held_items.count(c_item_id) ||
+            operation_context_.candidate_held_items.count(c_item_id) ||
+            operation_context_.moved_item_candidates.count(c_item_id);
+        bool c_has_move_candidate = false;
+        if (c_has_operation_link) {
+            for (int d_idx : appeared_indices) {
+                if (consumed_appeared_indices.count(d_idx)) continue;
+                if (reserved_snap2_indices.count(d_idx)) continue;
+                const VotingItem& D = snap2.items[d_idx];
+                if (D.cls_id != C.cls_id) continue;
+                float r = reid_score(C, D);
+                if (r < RELOCATION_REID_MIN) continue;
+                float evidence = relocation_evidence_score(c_item_id, C.box, D.box);
+                if (evidence >= RELOCATION_EVIDENCE_WEAK) {
+                    c_has_move_candidate = true;
+                    break;
+                }
+            }
+        }
+        if (c_has_move_candidate) {
             continue;
         }
 
@@ -908,6 +1015,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         baseline_item_ids[i] = find_inventory_item_strict(A.box, A.cls_id, false);
     }
 
+    std::set<int> anchored_item_ids;
     for (const auto& p : same_position_pairs) {
         const VotingItem& B = snap2.items[p.second];
         int item_id = find_inventory_item_strict(B.box, B.cls_id, false);
@@ -919,6 +1027,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             inventory_.set_status(item_id, ItemStatus::VISIBLE, current_time_ms_);
         }
         inventory_.update_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
+        anchored_item_ids.insert(item_id);
     }
 
     std::set<int> consumed_disappeared_indices;
@@ -928,7 +1037,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     std::set<int> protected_occluded_item_ids;
 
     process_pending_relocations(snap2, result, reserved_snap2_indices,
-                                protected_occluded_item_ids);
+                                protected_occluded_item_ids, anchored_item_ids);
 
     // ---------------------------------------------------------------------
     //  10.2 优先处理整理 / 移动
@@ -974,6 +1083,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (decision == RelocationDecision::CONFIRMED) {
             inventory_.set_status(item_id, ItemStatus::VISIBLE, current_time_ms_);
             inventory_.update_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
+            anchored_item_ids.insert(item_id);
             consumed_disappeared_indices.insert(a_idx);
             consumed_appeared_indices.insert(best_idx);
             apply_relocation_visibility_changes(
@@ -1138,6 +1248,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                        local_id, coco_cls_to_name(B.cls_id));
             }
             inventory_.update_item(local_id, -1, B.box, B.best_score, snap2.frame_id);
+            anchored_item_ids.insert(local_id);
             continue;
         }
 
@@ -1147,10 +1258,27 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             if (out_item && out_item->status == ItemStatus::OUT) {
                 inventory_.set_status(out_id, ItemStatus::VISIBLE, current_time_ms_);
                 inventory_.update_item(out_id, -1, B.box, B.best_score, snap2.frame_id);
+                anchored_item_ids.insert(out_id);
                 printf("[SESSION] item#%d (%s) 从出库恢复为可见\n",
                        out_id, coco_cls_to_name(B.cls_id));
                 continue;
             }
+        }
+
+        int recover_id = find_recoverable_moved_item_for_appeared(
+            B, anchored_item_ids, blocked_appeared_inventory_ids);
+        if (recover_id >= 0) {
+            const InventoryItem* recover_item = inventory_.find_by_item(recover_id);
+            ItemStatus old_status = recover_item ? recover_item->status : ItemStatus::VISIBLE;
+            inventory_.set_status(recover_id, ItemStatus::VISIBLE, current_time_ms_);
+            inventory_.update_item(recover_id, -1, B.box, B.best_score, snap2.frame_id);
+            anchored_item_ids.insert(recover_id);
+            printf("[SESSION] 新出现 %s 合并到已有 item#%d，不新增库存"
+                   "（旧状态=%s）\n",
+                   coco_cls_to_name(B.cls_id), recover_id, item_status_to_str(old_status));
+            result.events.push_back({EventKind::MOVED, recover_id, B.cls_id, B.box, B.best_score});
+            result.happened = true;
+            continue;
         }
 
         int new_id = inventory_.add_item(-1, B.cls_id, B.box, B.best_score,

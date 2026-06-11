@@ -227,6 +227,10 @@ private:
                                    bool include_out) const;
     int find_inventory_item_relaxed(const BBox& box, int cls_id,
                                     bool include_out) const;
+    int find_recoverable_moved_item_for_appeared(
+        const VotingItem& appeared,
+        const std::set<int>& anchored_item_ids,
+        const std::set<int>& blocked_item_ids) const;
     int find_inventory_item_for_track(const Track& track) const;
     int find_best_hand_track_id(const BBox& hand_box,
                                 const std::vector<Track>& tracks) const;
@@ -245,7 +249,8 @@ private:
     void process_pending_relocations(const Snapshot& snap2,
                                      SettlementResult& result,
                                      std::set<int>& reserved_snap2_indices,
-                                     std::set<int>& protected_occluded_item_ids);
+                                     std::set<int>& protected_occluded_item_ids,
+                                     std::set<int>& anchored_item_ids);
     bool apply_relocation_visibility_changes(
         int moved_item_id,
         const BBox& old_box,
