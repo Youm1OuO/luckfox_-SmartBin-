@@ -88,6 +88,19 @@ fridge_config.h — 新增阈值常量
     if (fridge::is_hand(r.cls_id) && d.score >= 0.30f) {
         hand_boxes.push_back(d.box);
     }
+
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+
+
+
+    快照的阈值设置
+路径：
+    /home/muyou/Projects/workspace/luckfox_demo/tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/include/fridge_config.h
+内容：
+    constexpr int   SNAPSHOT_N  = 5;        // N帧为一个快照（必须为奇数）
+    constexpr float SNAPSHOT_S  = 0.6f;     // 投票阈值百分比（60%，即5帧中至少出现3次）
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
 

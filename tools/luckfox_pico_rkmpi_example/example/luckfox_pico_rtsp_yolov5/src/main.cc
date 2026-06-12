@@ -1,13 +1,13 @@
 // ============================================================================
 //  main.cc
-//  冰箱视觉系统 — 新业务流程6 主循环
+//  冰箱视觉系统 — 新业务流程7 主循环
 //
 //  每帧流水线：
 //    1. 摄像头采集 + YOLO推理 + 坐标映射
 //    2. ByteTrack-Lite 每帧更新
 //    3. OperationContext 收集手/HELD/ByteTrack移动证据
-//    4. 每帧推入 SnapshotBuffer（3帧投票缓冲区，快照含 has_hand 标记）
-//    5. 攒满3帧 → 生成 Snapshot → 送入 SessionManager 统一裁决
+//    4. 每帧推入 SnapshotBuffer（多帧投票缓冲区，快照含 has_hand 标记）
+//    5. 攒满配置帧数 → 生成 Snapshot → 送入 SessionManager 统一裁决
 //    6. 事件上报 + 画面绘制 + RTSP推流
 // ============================================================================
 #include <assert.h>
@@ -226,7 +226,7 @@ int main(int argc, char *argv[]) {
 	// ============================================================
 	fridge::ByteTrackLite tracker;
 	fridge::SessionManager session;
-	fridge::SnapshotBuffer snap_buffer(fridge::SNAPSHOT_N, fridge::SNAPSHOT_S);
+	fridge::SnapshotBuffer snap_buffer(fridge::SNAPSHOT_N, fridge::SNAPSHOT_OBJECT_STABLE_RATIO);
 	fridge::CloudUploader cloud;
 	cloud.start();
 	int g_frame_id = 0;

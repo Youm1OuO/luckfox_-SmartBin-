@@ -1,10 +1,12 @@
 // ============================================================================
 //  snapshot.h
-//  多帧投票快照 — 新业务流程6
+//  多帧投票快照 — 新业务流程7
 //
 //  设计要点:
 //    - 不使用单帧作为快照，而是用 N 帧的综合结果（投票过滤）
-//    - N 帧内同一个物品必须出现 >= N*s 次，才被写入快照
+//    - N 帧内同一个物品必须达到物体稳定阈值，才被写入快照
+//    - 同一位置、同一大小、高 IoU 的跨类别抖动会先聚成一个 spatial cluster
+//    - spatial cluster 内再做类别投票，类别不稳定的候选不写入快照
 //    - SnapshotBuffer 负责收集 N 帧的检测结果，满了就生成快照
 //    - 快照包含 has_hand 标记：有手的快照不用于对比
 // ============================================================================
@@ -36,7 +38,7 @@ struct Snapshot {
 // 多帧投票缓冲区
 class SnapshotBuffer {
 public:
-    SnapshotBuffer(int N = 3, float s = 0.6f);
+    SnapshotBuffer(int N = 3, float object_stable_ratio = 0.6f);
 
     // 每帧调用：推入一帧的检测结果（只含食物检测，不含手）
     // has_hand: 当前帧是否检测到手
@@ -53,7 +55,7 @@ public:
 
 private:
     int N_;
-    float s_;
+    float object_stable_ratio_;
     std::vector<std::vector<Detection>> frames_;
     std::vector<int> frame_ids_;
     std::vector<bool> hand_flags_;

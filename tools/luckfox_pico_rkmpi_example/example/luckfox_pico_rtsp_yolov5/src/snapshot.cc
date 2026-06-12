@@ -1,12 +1,14 @@
 // ============================================================================
 //  snapshot.cc
-//  多帧投票快照实现 — 新业务流程6
+//  多帧投票快照实现 — 新业务流程7
 // ============================================================================
 #include "snapshot.h"
 #include "fridge_config.h"
 
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <map>
 
 namespace fridge {
 
@@ -19,16 +21,32 @@ constexpr float CLUSTER_OVERLAP_ENOUGH = 0.25f;
 constexpr float CLUSTER_SCORE_MIN = 0.22f;
 constexpr float CLUSTER_MOTION_NORM_FOR_LAST_BOX = 0.35f;
 
+struct ClassVote {
+    int count = 0;
+    float best_score = 0.0f;
+};
+
 struct SnapshotCluster {
     VotingItem item;
     BBox first_box;
     BBox last_box;
     int last_frame_index = -1;
+    std::map<int, ClassVote> class_votes;
 };
 
-float snapshot_cluster_score(const SnapshotCluster& cluster,
-                             const Detection& det) {
-    if (cluster.item.cls_id != det.cls_id) return -1.0f;
+void update_class_vote(SnapshotCluster& cluster, const Detection& det) {
+    ClassVote& vote = cluster.class_votes[det.cls_id];
+    vote.count++;
+    if (det.score > vote.best_score) {
+        vote.best_score = det.score;
+    }
+}
+
+float same_class_cluster_score(const SnapshotCluster& cluster,
+                               const Detection& det) {
+    if (cluster.class_votes.find(det.cls_id) == cluster.class_votes.end()) {
+        return -1.0f;
+    }
 
     float area_diff = area_ratio_diff(cluster.last_box, det.box);
     if (area_diff > CLUSTER_AREA_DIFF_MAX) return -1.0f;
@@ -53,6 +71,32 @@ float snapshot_cluster_score(const SnapshotCluster& cluster,
            0.15f * area_score;
 }
 
+float class_conflict_cluster_score(const SnapshotCluster& cluster,
+                                   const Detection& det) {
+    if (cluster.class_votes.find(det.cls_id) != cluster.class_votes.end()) {
+        return -1.0f;
+    }
+
+    float area_diff = area_ratio_diff(cluster.last_box, det.box);
+    if (area_diff > SNAPSHOT_CLASS_CONFLICT_AREA_RATIO) return -1.0f;
+
+    float center_norm = normalized_nearby_distance(cluster.last_box, det.box);
+    if (center_norm > SNAPSHOT_CLASS_CONFLICT_CENTER_RATIO) return -1.0f;
+
+    float box_iou = iou(cluster.last_box, det.box);
+    if (box_iou < SNAPSHOT_CLASS_CONFLICT_IOU) return -1.0f;
+
+    float motion_norm = normalized_nearby_distance(cluster.first_box, det.box);
+    if (motion_norm > SNAPSHOT_CLASS_CONFLICT_MOTION_RATIO) return -1.0f;
+
+    float distance_score = 1.0f - std::min(center_norm / SNAPSHOT_CLASS_CONFLICT_CENTER_RATIO, 1.0f);
+    float area_score = 1.0f - std::min(area_diff / SNAPSHOT_CLASS_CONFLICT_AREA_RATIO, 1.0f);
+
+    return 0.50f * box_iou +
+           0.30f * distance_score +
+           0.20f * area_score;
+}
+
 void update_cluster(SnapshotCluster& cluster,
                     const Detection& det,
                     int frame_index) {
@@ -69,6 +113,7 @@ void update_cluster(SnapshotCluster& cluster,
     }
     cluster.last_box = det.box;
     cluster.last_frame_index = frame_index;
+    update_class_vote(cluster, det);
 }
 
 SnapshotCluster make_cluster(const Detection& det, int frame_index) {
@@ -80,16 +125,65 @@ SnapshotCluster make_cluster(const Detection& det, int frame_index) {
     cluster.first_box = det.box;
     cluster.last_box = det.box;
     cluster.last_frame_index = frame_index;
+    update_class_vote(cluster, det);
     return cluster;
 }
 
-VotingItem finalize_cluster(const SnapshotCluster& cluster) {
+bool finalize_cluster(const SnapshotCluster& cluster, VotingItem* out_item) {
+    if (!out_item || cluster.class_votes.empty()) return false;
+
+    int best_cls = -1;
+    int best_count = -1;
+    float best_score = 0.0f;
+    int second_cls = -1;
+    int second_count = 0;
+
+    for (std::map<int, ClassVote>::const_iterator it = cluster.class_votes.begin();
+         it != cluster.class_votes.end(); ++it) {
+        int cls = it->first;
+        int count = it->second.count;
+        float score = it->second.best_score;
+
+        if (count > best_count ||
+            (count == best_count && score > best_score)) {
+            second_cls = best_cls;
+            second_count = best_count < 0 ? 0 : best_count;
+            best_cls = cls;
+            best_count = count;
+            best_score = score;
+        } else if (count > second_count) {
+            second_cls = cls;
+            second_count = count;
+        }
+    }
+
+    bool has_class_conflict = cluster.class_votes.size() > 1;
+    if (has_class_conflict) {
+        float class_ratio = (float)best_count / (float)std::max(1, cluster.item.count);
+        int class_margin = best_count - second_count;
+        if (class_ratio < SNAPSHOT_CLASS_STABLE_RATIO ||
+            class_margin < SNAPSHOT_CLASS_COUNT_MARGIN) {
+            std::printf("[SNAPSHOT] 类别不稳定，丢弃候选: best_cls=%d count=%d second_cls=%d count=%d total=%d ratio=%.2f\n",
+                        best_cls, best_count, second_cls, second_count,
+                        cluster.item.count, class_ratio);
+            return false;
+        }
+
+        std::printf("[SNAPSHOT] 类别抖动已投票稳定: cls=%d count=%d second_cls=%d count=%d total=%d\n",
+                    best_cls, best_count, second_cls, second_count,
+                    cluster.item.count);
+    }
+
     VotingItem item = cluster.item;
+    item.cls_id = best_cls;
+    item.best_score = best_score;
+
     float motion_norm = normalized_nearby_distance(cluster.first_box, cluster.last_box);
     if (motion_norm >= CLUSTER_MOTION_NORM_FOR_LAST_BOX) {
         item.box = cluster.last_box;
     }
-    return item;
+    *out_item = item;
+    return true;
 }
 
 }  // namespace
@@ -98,7 +192,8 @@ VotingItem finalize_cluster(const SnapshotCluster& cluster) {
 //  SnapshotBuffer
 // ============================================================================
 
-SnapshotBuffer::SnapshotBuffer(int N, float s) : N_(N), s_(s) {
+SnapshotBuffer::SnapshotBuffer(int N, float object_stable_ratio)
+    : N_(N), object_stable_ratio_(object_stable_ratio) {
     frames_.reserve(N);
     frame_ids_.reserve(N);
     hand_flags_.reserve(N);
@@ -142,13 +237,14 @@ Snapshot SnapshotBuffer::take_snapshot() {
     // ================================================================
     //  多帧投票算法
     //  对每一帧的每个 detection，与投票表中的候选物品做宽松聚合匹配：
-    //    匹配上 → count++，位置取加权平均
+    //    同类别匹配上 → count++，位置取加权平均
+    //    同类别没匹配上 → 严格判断是否为同一位置同一大小的跨类别抖动
     //    没匹配上 → 新增到投票表
     //  同一帧内每个候选物品最多接收一个 detection，避免相邻同类物品被合并。
-    //  N帧结束后，保留 count >= N*s 的物品
+    //  N帧结束后，先保留达到物体稳定阈值的候选，再做类别稳定投票。
     // ================================================================
     std::vector<SnapshotCluster> clusters;
-    int min_count = (int)std::ceil(N_ * s_);
+    int min_count = (int)std::ceil(N_ * object_stable_ratio_);
 
     for (int fi = 0; fi < (int)frames_.size(); fi++) {
         const auto& dets = frames_[fi];
@@ -160,7 +256,7 @@ Snapshot SnapshotBuffer::take_snapshot() {
             float best_score = -1.0f;
             for (int ci = 0; ci < (int)clusters.size(); ++ci) {
                 if (used_clusters[ci]) continue;
-                float score = snapshot_cluster_score(clusters[ci], det);
+                float score = same_class_cluster_score(clusters[ci], det);
                 if (score > best_score) {
                     best_score = score;
                     best_idx = ci;
@@ -171,16 +267,36 @@ Snapshot SnapshotBuffer::take_snapshot() {
                 update_cluster(clusters[best_idx], det, fi);
                 used_clusters[best_idx] = true;
             } else {
-                clusters.push_back(make_cluster(det, fi));
-                used_clusters.push_back(true);
+                int conflict_idx = -1;
+                float conflict_score = -1.0f;
+                for (int ci = 0; ci < (int)clusters.size(); ++ci) {
+                    if (used_clusters[ci]) continue;
+                    float score = class_conflict_cluster_score(clusters[ci], det);
+                    if (score > conflict_score) {
+                        conflict_score = score;
+                        conflict_idx = ci;
+                    }
+                }
+
+                if (conflict_idx >= 0) {
+                    update_cluster(clusters[conflict_idx], det, fi);
+                    used_clusters[conflict_idx] = true;
+                } else {
+                    clusters.push_back(make_cluster(det, fi));
+                    used_clusters.push_back(true);
+                }
             }
         }
     }
 
-    // 过滤：只保留 count >= N*s 的物品
+    // 过滤：物体出现要稳定；如果同一 spatial cluster 内出现过类别冲突，
+    // 还必须通过类别投票，避免把短暂误识别写入库存。
     for (const auto& cluster : clusters) {
         if (cluster.item.count >= min_count) {
-            snap.items.push_back(finalize_cluster(cluster));
+            VotingItem item;
+            if (finalize_cluster(cluster, &item)) {
+                snap.items.push_back(item);
+            }
         }
     }
 

@@ -195,10 +195,22 @@ constexpr int   PENDING_NEW_EXPIRE_FRAMES  = 3;
 //  新业务流程7：多帧快照投票
 // =========================================================================
 constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）
-constexpr float SNAPSHOT_S            = 0.5f;     // 投票阈值百分比（60%，即5帧中至少出现3次）
+constexpr float SNAPSHOT_OBJECT_STABLE_RATIO = 0.6f; // 物体出现稳定阈值（5帧中至少3帧）
 constexpr float SNAPSHOT_MIN_SCORE    = 0.3f;     // 最低检测分数（低于此分数的不进快照）
 constexpr int   SNAPSHOT_HAND_BLOCK_MIN_COUNT = 1; // N帧中至少几帧有阻塞手，快照才算带手
 constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
+
+// 跨类别 spatial cluster：只处理同一位置、同一大小、同一框形状的类别抖动。
+// 注意：这些阈值和 SNAPSHOT_OBJECT_STABLE_RATIO 解耦。
+//   - OBJECT_STABLE 判断“这个物体是否稳定出现”
+//   - CLASS_STABLE 判断“同一个 spatial cluster 的类别投票是否稳定”
+// 即便两个阈值当前数值相同，也不要共用一个变量。
+constexpr float SNAPSHOT_CLASS_CONFLICT_IOU = 0.75f;          // 跨类别归并要求的最小 IoU
+constexpr float SNAPSHOT_CLASS_CONFLICT_CENTER_RATIO = 0.25f; // 中心距离 / 小框对角线
+constexpr float SNAPSHOT_CLASS_CONFLICT_AREA_RATIO = 0.35f;   // 面积差异比例
+constexpr float SNAPSHOT_CLASS_CONFLICT_MOTION_RATIO = 0.35f; // 整个cluster移动过大则不做类别抖动归并
+constexpr float SNAPSHOT_CLASS_STABLE_RATIO = 0.6f;           // 最终类别票数 / cluster总票数
+constexpr int   SNAPSHOT_CLASS_COUNT_MARGIN = 1;              // 第一名类别至少比第二名多几票
 
 // =========================================================================
 //  新业务流程7：自适应"附近"距离阈值
