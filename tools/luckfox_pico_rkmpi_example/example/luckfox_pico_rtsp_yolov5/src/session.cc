@@ -276,12 +276,13 @@ int SessionManager::find_recoverable_moved_item_for_appeared(
     for (const auto& kv : inventory_.items()) {
         const InventoryItem& it = kv.second;
         if (it.cls_id != appeared.cls_id) continue;
-        if (blocked_item_ids.count(it.item_id)) continue;
 
         bool operation_link =
             operation_context_.confirmed_held_items.count(it.item_id) ||
             operation_context_.candidate_held_items.count(it.item_id) ||
             operation_context_.moved_item_candidates.count(it.item_id);
+        if (blocked_item_ids.count(it.item_id) && !operation_link) continue;
+
         bool anchored = anchored_item_ids.count(it.item_id) > 0;
         if (anchored && !operation_link) continue;
 
@@ -316,9 +317,9 @@ int SessionManager::find_recoverable_moved_item_for_appeared(
             relaxed_box_match(appeared.box, appeared.cls_id, it.box, it.cls_id);
         bool moved_by_operation =
             operation_link &&
-            spatially_related &&
             reid >= RELOCATION_REID_MIN &&
-            evidence >= RELOCATION_EVIDENCE_WEAK;
+            evidence >= RELOCATION_EVIDENCE_WEAK &&
+            (spatially_related || evidence >= 0.55f || blocked_item_ids.count(it.item_id));
         bool operated_occluded_move =
             it.status == ItemStatus::OCCLUDED &&
             operation_link &&
@@ -746,6 +747,11 @@ SettlementResult SessionManager::push_snapshot(const Snapshot& snap, const cv::M
     if (snap.has_hand) {
         return SettlementResult();
     }
+    if (operation_context_.hand_seen && no_hand_streak_ < HAND_LEAVE_FRAMES) {
+        printf("[SESSION] 手刚离开 %d/%d 帧，等待无手稳定后再裁决库存\n",
+               no_hand_streak_, HAND_LEAVE_FRAMES);
+        return SettlementResult();
+    }
 
     SettlementResult result;
 
@@ -1170,7 +1176,10 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         return p.pending_id;
     };
 
-    auto upsert_pending_new = [this, &snap2](const VotingItem& B) {
+    auto upsert_pending_new = [this, &snap2](const VotingItem& B,
+                                             int source_item_id,
+                                             float source_reid,
+                                             float source_evidence) {
         int best_idx = -1;
         float best_dist = 999.0f;
         for (int i = 0; i < (int)pending_new_items_.size(); ++i) {
@@ -1188,6 +1197,12 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             p.candidate_bbox = B.box;
             p.snapshot_object = B;
             p.last_checked_snapshot_id = snap2.frame_id;
+            if (source_item_id >= 0) {
+                p.risk_type = PendingNewRiskType::RISKY_MOVE;
+                p.source_item_id = source_item_id;
+                p.source_reid_score = std::max(p.source_reid_score, source_reid);
+                p.source_evidence_score = std::max(p.source_evidence_score, source_evidence);
+            }
             return p.pending_id;
         }
 
@@ -1199,14 +1214,30 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         p.created_snapshot_id = snap2.frame_id;
         p.last_checked_snapshot_id = snap2.frame_id;
         p.expire_after_stable_count = PENDING_NEW_EXPIRE_FRAMES;
+        if (source_item_id >= 0) {
+            p.risk_type = PendingNewRiskType::RISKY_MOVE;
+            p.source_item_id = source_item_id;
+            p.source_reid_score = source_reid;
+            p.source_evidence_score = source_evidence;
+        }
         pending_new_items_.push_back(p);
         return p.pending_id;
     };
 
-    auto same_class_operation_risk = [this,
-                                      &operation_locked_item_ids,
-                                      &settled_item_ids,
-                                      &pending_reserved_item_ids](const VotingItem& B) {
+    struct OperationRiskSource {
+        bool found = false;
+        int item_id = -1;
+        float reid = 0.0f;
+        float evidence = 0.0f;
+        float total = -1.0f;
+    };
+
+    auto find_same_class_operation_risk = [this,
+                                           &operation_locked_item_ids,
+                                           &settled_item_ids,
+                                           &pending_reserved_item_ids](const VotingItem& B)
+                                           -> OperationRiskSource {
+        OperationRiskSource best;
         for (const auto& kv : inventory_.items()) {
             const InventoryItem& inv = kv.second;
             if (inv.status == ItemStatus::OUT) continue;
@@ -1219,10 +1250,17 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             float r = reid_score(old_item, B);
             float evidence = relocation_evidence_score(inv.item_id, inv.box, B.box);
             if (r >= RELOCATION_REID_MIN && evidence >= RELOCATION_EVIDENCE_WEAK) {
-                return true;
+                float total = r + 1.20f * evidence;
+                if (!best.found || total > best.total) {
+                    best.found = true;
+                    best.item_id = inv.item_id;
+                    best.reid = r;
+                    best.evidence = evidence;
+                    best.total = total;
+                }
             }
         }
-        return false;
+        return best;
     };
 
     struct RelocationEdge {
@@ -1375,6 +1413,74 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             p.snapshot_object = B;
             p.last_checked_snapshot_id = snap2.frame_id;
 
+            if (p.risk_type == PendingNewRiskType::RISKY_MOVE && p.source_item_id >= 0) {
+                InventoryItem* source = inventory_.find_by_item(p.source_item_id);
+                if (source && source->status != ItemStatus::OUT &&
+                    source->cls_id == B.cls_id) {
+                    BBox old_box = source->box;
+                    VotingItem source_item = voting_from_inventory(*source);
+                    float r = std::max(p.source_reid_score, reid_score(source_item, B));
+                    float evidence = std::max(p.source_evidence_score,
+                                              relocation_evidence_score(source->item_id,
+                                                                        source->box,
+                                                                        B.box));
+                    std::set<int> used_for_old;
+                    used_for_old.insert(idx);
+                    int old_idx = find_in_snapshot_near(snap2, p.class_id,
+                                                        source->box, used_for_old);
+                    bool source_old_position_still_stable = old_idx >= 0;
+                    bool can_merge_to_source =
+                        r >= RELOCATION_REID_MIN &&
+                        evidence >= RELOCATION_EVIDENCE_WEAK &&
+                        (source->status == ItemStatus::OCCLUDED ||
+                         !source_old_position_still_stable ||
+                         evidence >= RELOCATION_EVIDENCE_STRONG);
+
+                    if (can_merge_to_source) {
+                        ConfirmedRelocation move;
+                        move.item_id = source->item_id;
+                        move.cls_id = source->cls_id;
+                        move.old_box = old_box;
+                        move.new_object = B;
+                        confirmed_relocations.push_back(move);
+
+                        ItemStatus old_status = source->status;
+                        inventory_.set_status(source->item_id, ItemStatus::VISIBLE,
+                                              current_time_ms_);
+                        inventory_.update_item(source->item_id, -1, B.box, B.best_score,
+                                               snap2.frame_id);
+                        consumed_snap2_indices.insert(idx);
+                        settled_item_ids.insert(source->item_id);
+                        printf("\033[1;32m[EVENT]\033[0m 整理确认: item#%d %s "
+                               "(pending_new#%d 合并, reid=%.2f evidence=%.2f, 旧状态=%s)\n",
+                               source->item_id, coco_cls_to_name(B.cls_id), p.pending_id,
+                               r, evidence, item_status_to_str(old_status));
+                        result.events.push_back({EventKind::MOVED, source->item_id,
+                                                 B.cls_id, B.box, B.best_score});
+                        result.happened = true;
+                        continue;
+                    }
+
+                    p.stable_count++;
+                    consumed_snap2_indices.insert(idx);
+                    if (p.stable_count <= p.expire_after_stable_count) {
+                        printf("[SESSION] pending_new#%d 继续冻结：候选可能来自 item#%d %s "
+                               "(reid=%.2f evidence=%.2f)\n",
+                               p.pending_id, source->item_id, coco_cls_to_name(B.cls_id),
+                               r, evidence);
+                        kept_pending_new.push_back(p);
+                    } else {
+                        printf("[SESSION] pending_new#%d 转普通新物品候选：source item#%d "
+                               "旧位置仍稳定，整理关系未确认\n",
+                               p.pending_id, source->item_id);
+                        p.risk_type = PendingNewRiskType::NORMAL_NEW;
+                        p.source_item_id = -1;
+                        kept_pending_new.push_back(p);
+                    }
+                    continue;
+                }
+            }
+
             int existing_id = find_inventory_item_strict(B.box, B.cls_id, true);
             if (existing_id >= 0) {
                 const InventoryItem* existing = inventory_.find_by_item(existing_id);
@@ -1395,10 +1501,19 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 continue;
             }
 
-            if (same_class_operation_risk(B)) {
+            OperationRiskSource risk = find_same_class_operation_risk(B);
+            if (risk.found) {
+                p.risk_type = PendingNewRiskType::RISKY_MOVE;
+                p.source_item_id = risk.item_id;
+                p.source_reid_score = std::max(p.source_reid_score, risk.reid);
+                p.source_evidence_score = std::max(p.source_evidence_score, risk.evidence);
                 p.stable_count++;
                 consumed_snap2_indices.insert(idx);
                 if (p.stable_count <= p.expire_after_stable_count) {
+                    printf("[SESSION] pending_new#%d 继续冻结：可能来自 item#%d %s "
+                           "(reid=%.2f evidence=%.2f)\n",
+                           p.pending_id, risk.item_id, coco_cls_to_name(B.cls_id),
+                           risk.reid, risk.evidence);
                     kept_pending_new.push_back(p);
                 } else {
                     printf("[SESSION] pending_new#%d 继续冻结：同类整理风险仍存在\n",
@@ -1643,11 +1758,14 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             continue;
         }
 
-        if (same_class_operation_risk(B)) {
-            int pending_id = upsert_pending_new(B);
+        OperationRiskSource risk = find_same_class_operation_risk(B);
+        if (risk.found) {
+            int pending_id = upsert_pending_new(B, risk.item_id, risk.reid, risk.evidence);
             residual_snap2_indices.insert(b_idx);
-            printf("[SESSION] pending_new#%d: %s 新出现但同类整理风险较高，本轮暂不入库\n",
-                   pending_id, coco_cls_to_name(B.cls_id));
+            printf("[SESSION] pending_new#%d: %s 新出现但可能来自 item#%d "
+                   "(reid=%.2f evidence=%.2f)，本轮暂不入库\n",
+                   pending_id, coco_cls_to_name(B.cls_id), risk.item_id,
+                   risk.reid, risk.evidence);
             continue;
         }
 

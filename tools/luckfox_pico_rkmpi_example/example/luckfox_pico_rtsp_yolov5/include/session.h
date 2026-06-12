@@ -66,6 +66,11 @@ enum class RelocationDecision {
     CONFIRMED,
 };
 
+enum class PendingNewRiskType {
+    NORMAL_NEW,
+    RISKY_MOVE,
+};
+
 struct TrackEvidence {
     int track_id = -1;
     int cls_id = -1;
@@ -143,6 +148,10 @@ struct PendingNewItem {
     int last_checked_snapshot_id = 0;
     int stable_count = 0;
     int expire_after_stable_count = 3;
+    PendingNewRiskType risk_type = PendingNewRiskType::NORMAL_NEW;
+    int source_item_id = -1;
+    float source_reid_score = 0.0f;
+    float source_evidence_score = 0.0f;
 };
 
 class SessionManager {
