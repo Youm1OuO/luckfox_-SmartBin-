@@ -102,14 +102,15 @@ python3 convert_fridge.py \
 
 
 
-
 //跑板子 (在MobaXterm中)
     cd luckfox_pico_rtsp_yolov5_demo/
     ./luckfox_pico_rtsp_yolov5 model/yolov5.rknn
 
 
+
 //查看板子的 NPU 使用情况
     cat /proc/rknpu/load
+
 
 
 //打开摄像头

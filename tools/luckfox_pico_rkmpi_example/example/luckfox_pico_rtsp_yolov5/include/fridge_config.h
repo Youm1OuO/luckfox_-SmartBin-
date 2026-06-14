@@ -61,6 +61,7 @@ inline const char* coarse_category(int cls_id) {
         case 15: case 16: case 17:
         case 34: case 35: case 36: case 37: case 38: case 39: case 40:
         case 41: case 42:
+        case 43: case 44: case 45: case 46: case 47:
             return "fruit_veg";
         // 肉蛋生鲜类: egg, meat_pack, fish_pack(18..20)
         case 18: case 19: case 20:
@@ -192,10 +193,10 @@ constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
 // =========================================================================
 //  新业务流程6：多帧快照投票
 // =========================================================================
-constexpr int   SNAPSHOT_N            = 3;        // N帧为一个快照（必须为奇数）
+constexpr int   SNAPSHOT_N            = 4;        // N帧为一个快照（必须为奇数）
 constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（60%，即3帧中至少出现2次）
-constexpr float SNAPSHOT_MIN_SCORE    = 0.3f;     // 最低检测分数（低于此分数的不进快照）
-constexpr int   SNAPSHOT_HAND_BLOCK_MIN_COUNT = 2; // N帧中至少几帧有阻塞手，快照才算带手
+constexpr float SNAPSHOT_MIN_SCORE    = 0.5f;     // 最低检测分数（低于此分数的不进快照）
+constexpr int   SNAPSHOT_HAND_BLOCK_MIN_COUNT = 1; // N帧中至少几帧有阻塞手，快照才算带手
 constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
 
 // =========================================================================

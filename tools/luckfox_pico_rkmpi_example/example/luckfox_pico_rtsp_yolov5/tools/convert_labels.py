@@ -30,6 +30,7 @@ CLASSES = [
     'hand',
     'mushroom', 'pumpkin', 'garlic', 'ginger', 'radish', 'sweet_potato',
     'walnut', 'coriander', 'okra',
+    'chinese_cabbage', 'green_beans', 'lettuce', 'cabbage', 'bitter_gourd',
 ]
 
 

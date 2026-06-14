@@ -68,6 +68,13 @@ classes:
   - coriander      # 41  香菜/芫荽
   - okra           # 42  秋葵
 
+  # 新增的类
+  - chinese_cabbage  # 43  白菜
+  - green_beans      # 44  豆角
+  - lettuce          # 45  生菜
+  - cabbage          # 46  卷心菜
+  - bitter_gourd     # 47  苦瓜
+
 # ---- 2. 粗粒度映射(推理后处理用,不参与训练)----------------------------
 # 这一段的目的:即使细类识别错了(比如把 apple 认成 pear),
 # 只要粗类对(都属于 fruit_veg),库存粗分类展示仍然正确。
@@ -100,6 +107,11 @@ coarse_grained:
     - walnut
     - coriander
     - okra
+    - chinese_cabbage
+    - green_beans
+    - lettuce
+    - cabbage
+    - bitter_gourd
   meat_seafood:             # 肉蛋生鲜类
     - egg
     - meat_pack
@@ -165,8 +177,8 @@ aliases:
   onion: onion                          # 洋葱
   "bell pepper": bell_pepper            # 彩椒
   bell_pepper: bell_pepper
-  cabbage: leafy_green                  # 卷心菜 → 绿叶菜
-  lettuce: leafy_green                  # 生菜 → 绿叶菜
+  # cabbage: leafy_green                  # 卷心菜 → 绿叶菜
+  # lettuce: leafy_green                  # 生菜 → 绿叶菜
   "bayam merah": leafy_green            # 红苋菜(印尼语,vegetable 数据集)
   "chinese lettuce": leafy_green        # 油麦菜/莴笋(vegetable 数据集)
 
