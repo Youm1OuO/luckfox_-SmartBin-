@@ -106,7 +106,7 @@ python export.py \
 
 python export.py \
     --rknpu \
-    --weight runs/train/fridge_self_704_unfreeze/weights/best.pt \
+    --weight runs/train/fridge_self_s1_704_unfreeze/weights/best.pt \
     --imgsz 704
 
 

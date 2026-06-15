@@ -8,13 +8,13 @@ set -e
 cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
 
 DATA_YAML="/home/muyou/Projects/workspace/luckfox_demo/tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset/data.yaml"
-BASE_WEIGHTS="runs/train/hand_plus_v1/weights/best.pt"
+BASE_WEIGHTS="runs/train/fridge_self_704_unfreeze/weights/best.pt"
 IMGSZ=704
 BATCH_SIZE=32
 WORKERS=8
 
-STAGE1_NAME="fridge_self_704_freeze10"
-STAGE2_NAME="fridge_self_704_unfreeze"
+STAGE1_NAME="fridge_self_s1_704_freeze10"
+STAGE2_NAME="fridge_self_s1_704_unfreeze"
 
 echo "== Stage 1: freeze 10, train fridge head/domain =="
 python fridge_project/scripts/train.py stage-c \
