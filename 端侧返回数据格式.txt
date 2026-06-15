@@ -1,30 +1,73 @@
-// 物品出入库事件
-不要实时传送json数据，要在S4差异对比”出明确结果时，才发送一次 JSON
-{
-  "device_id": "luckfox",             // 设备唯一标识
-  "timestamp": 1716466178000,         // 事件发生的时间戳（毫秒）
-  "event_type": "ITEM_IN",            // 明确事件类型：ITEM_IN (放入) / ITEM_OUT (取出) / ITEM_MOVED (挪位) [cite: 116]
-  "data": [
+入库示例
+
+  {
+    "device_id": "luckfox-pico-01",
+    "timestamp": 1781488800000,
+    "event_type": "ITEM_IN",
+    "data": [
+      {
+        "local_track_id": 101,
+        "category": "苹果",
+        "confidence": 0.91,
+        "bbox": [88, 120, 140, 132],
+        "crop_image": "/9j/4AAQSkZJRgABAQ..."
+      }
+    ]
+  }
+
+  入库时 crop_image 强烈建议带上，因为后端会用它做云端复核、图片保存、去重。
+
+  出库示例
+
+  {
+    "device_id": "luckfox-pico-01",
+    "timestamp": 1781488860000,
+    "event_type": "ITEM_OUT",
+    "data": [
+      {
+        "local_track_id": 101,
+        "category": "苹果",
+        "confidence": 0.88,
+        "bbox": [90, 118, 138, 130],
+        "crop_image": "/9j/4AAQSkZJRgABAQ..."
+      }
+    ]
+  }
+
+  当前后端出库主要按 device_id + category 找库存，所以 category 要尽量准确。crop_image 可选，但联调期建议带，方便排查。
+
+  整理 / 移动示例
+
+  整理货架、物体位置变化，可以发 ITEM_MOVED：
+
+  {
+    "device_id": "luckfox-pico-01",
+    "timestamp": 1781488920000,
+    "event_type": "ITEM_MOVED",
+    "data": [
+      {
+        "local_track_id": 101,
+        "category": "苹果",
+        "confidence": 0.93,
+        "bbox": [220, 100, 142, 136],
+        "crop_image": ""
+      }
+    ]
+  }
+
+  整理事件主要更新位置，所以关键是 local_track_id / category / bbox。
+
+  后端成功返回一般是库存记录数组，例如：
+
+  [
     {
-      "local_track_id": 1002,         // 端侧追踪分配的临时ID（用于防抖去重）
-      "category": "fruit",            // 粗粒度分类（如：fruit, drink, meat） [cite: 11]
-      "confidence": 0.89,             // YOLO模型的识别置信度
-      "bbox": [120, 45, 60, 60],      // 物品边界框 [x, y, w, h]，方便后端在大屏上画框
-      "crop_image": "/9j/4AAQSk..."   // 仅传输该物品 BBox 区域的局部截图（Base64编码）。这对于后端 Agents 重新识别“拿出去放回来是不是同一个物品”
+      "id": "b3f0b4f2-8a4e-4b5e-9e1c-xxxx",
+      "device_id": "luckfox-pico-01",
+      "category": "苹果",
+      "status": "IN_STOCK",
+      "remain_ratio": 1.0,
+      "bbox": [88, 120, 140, 132],
+      "snapshot_path": "uploads/luckfox-pico-01_101_1781488800.jpg",
+      "created_at": "2026-06-15T10:00:00"
     }
   ]
-}
-
-
-//包装标签读取
-{
-  "device_id": "fridge_rv1106_01",
-  "timestamp": 1716466205000,
-  "event_type": "TRIGGER_OCR",        // 触发云端 VLM (视觉大模型) Agent
-  "data": [
-    {
-      "bbox": [200, 150, 100, 80],
-      "crop_image": "/9j/4AAQSk..."   // 传输悬停区域的高清局部截图，交给后端 Agent 去读保质期、品牌等标签信息 
-    }
-  ]
-}
