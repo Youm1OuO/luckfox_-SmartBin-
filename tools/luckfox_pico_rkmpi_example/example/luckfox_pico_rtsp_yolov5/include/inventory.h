@@ -36,6 +36,7 @@ struct InventoryItem {
     int updated_frame;        // 最近更新帧号
     long long created_time_ms;// 入库时间戳
     long long out_time_ms;    // 出库时间戳（仅OUT状态有效，用于过期清理）
+    int stable_frames;        // 连续未被YOLO识别到的快照周期数（仅VISIBLE有效，>=9时删除）
 };
 
 class InventoryDB {
@@ -60,6 +61,7 @@ public:
     void remove_item(int item_id);
 
     const std::map<int, InventoryItem>& items() const { return items_; }
+    std::map<int, InventoryItem>& items() { return items_; }
     size_t size() const { return items_.size(); }
     size_t count_by_status(ItemStatus s) const;
 

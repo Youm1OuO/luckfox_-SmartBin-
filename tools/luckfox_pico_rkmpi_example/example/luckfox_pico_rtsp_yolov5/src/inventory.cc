@@ -34,6 +34,7 @@ int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
     it.updated_frame = frame_id;
     it.created_time_ms = time_ms;
     it.out_time_ms = 0;
+    it.stable_frames = 0;
     items_[it.item_id] = it;
     return it.item_id;
 }

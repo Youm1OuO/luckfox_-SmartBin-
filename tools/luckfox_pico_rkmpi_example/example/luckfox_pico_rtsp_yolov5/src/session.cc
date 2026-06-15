@@ -180,6 +180,41 @@ void SessionManager::finish_session(long long time_ms) {
         pending_relocations_.clear();
     }
 
+    // 方案 C：关门时结合盘点和 stable_frames 机制
+    // 用最后一份稳定快照（snap1_）进行盘点
+    if (has_snap1_) {
+        // 构建 snap1_ 中被识别到的物品类别+位置集合
+        std::set<int> final_detected_ids;
+        for (const auto& item : snap1_.items) {
+            int id = find_inventory_item_strict(item.box, item.cls_id, false);
+            if (id >= 0) {
+                const InventoryItem* it = inventory_.find_by_item(id);
+                if (it && it->status == ItemStatus::VISIBLE) {
+                    final_detected_ids.insert(id);
+                }
+            }
+        }
+
+        // 遍历所有 VISIBLE 物品
+        std::vector<int> to_remove;
+        for (auto& kv : inventory_.items()) {
+            if (kv.second.status != ItemStatus::VISIBLE) continue;
+            if (final_detected_ids.count(kv.first)) {
+                // 盘点中识别到，重置计数
+                kv.second.stable_frames = 0;
+            } else if (kv.second.stable_frames > 0) {
+                // 盘点中未识别到且 stable_frames > 0，立即删除
+                to_remove.push_back(kv.first);
+            }
+        }
+        for (int id : to_remove) {
+            printf("[SESSION] 关门盘点: item#%d %s 未识别到且 stable_frames=%d，删除\n",
+                   id, coco_cls_to_name(inventory_.find_by_item(id)->cls_id),
+                   inventory_.find_by_item(id)->stable_frames);
+            inventory_.remove_item(id);
+        }
+    }
+
     hand_present_ = false;
     no_hand_streak_ = 0;
 
@@ -1118,10 +1153,9 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     }
 
     // ---------------------------------------------------------------------
-    //  10.4 处理剩余新出现物品
+    //  10.4 处理新出现物品（使用 stable_snapshot 中的所有物品）
     // ---------------------------------------------------------------------
-    for (int b_idx : appeared_indices) {
-        if (consumed_appeared_indices.count(b_idx)) continue;
+    for (int b_idx = 0; b_idx < (int)snap2.items.size(); ++b_idx) {
         if (reserved_snap2_indices.count(b_idx)) continue;
 
         const VotingItem& B = snap2.items[b_idx];
@@ -1198,6 +1232,40 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
     }
     for (int id : occluded_to_remove) {
         printf("[SESSION] 清理冗余 OCCLUDED item#%d\n", id);
+        inventory_.remove_item(id);
+    }
+
+    // ---------------------------------------------------------------------
+    //  10.5.4 stable_frames 超时清理（辅助机制）
+    // ---------------------------------------------------------------------
+    // 构建本轮快照中被 YOLO 识别到的库存物品 ID 集合
+    std::set<int> detected_item_ids;
+    for (int b_idx = 0; b_idx < (int)snap2.items.size(); ++b_idx) {
+        const VotingItem& B = snap2.items[b_idx];
+        int id = find_inventory_item_strict(B.box, B.cls_id, false);
+        if (id >= 0) {
+            const InventoryItem* it = inventory_.find_by_item(id);
+            if (it && it->status == ItemStatus::VISIBLE) {
+                detected_item_ids.insert(id);
+            }
+        }
+    }
+
+    std::vector<int> stable_timeout_remove;
+    for (auto& kv : inventory_.items()) {
+        if (kv.second.status != ItemStatus::VISIBLE) continue;
+        if (detected_item_ids.count(kv.first)) {
+            kv.second.stable_frames = 0;
+        } else {
+            kv.second.stable_frames++;
+            if (kv.second.stable_frames >= 9) {
+                stable_timeout_remove.push_back(kv.first);
+            }
+        }
+    }
+    for (int id : stable_timeout_remove) {
+        printf("[SESSION] stable_frames 超时: item#%d %s 连续9帧未识别，删除\n",
+               id, coco_cls_to_name(inventory_.find_by_item(id)->cls_id));
         inventory_.remove_item(id);
     }
 
