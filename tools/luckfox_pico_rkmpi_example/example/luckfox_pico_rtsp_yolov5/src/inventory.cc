@@ -27,7 +27,8 @@ int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
     it.item_id = next_item_id_++;
     it.track_id = track_id;
     it.cls_id = cls_id;
-    it.box = box;
+    it.box = box;                    // 被动 bbox
+    it.active_box = box;             // 主动 bbox（初始化时与被动 bbox 相同）
     it.score = score;
     it.status = ItemStatus::VISIBLE;  // 新入库默认"可见"
     it.created_frame = frame_id;

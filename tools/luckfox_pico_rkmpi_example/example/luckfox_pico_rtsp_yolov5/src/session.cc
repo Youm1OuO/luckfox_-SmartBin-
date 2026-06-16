@@ -37,19 +37,45 @@ float aspect_ratio(const BBox& b) {
     return std::max(1.0f, b.w()) / h;
 }
 
-bool strict_box_match(const BBox& a, int cls_a, const BBox& b, int cls_b) {
-    if (cls_a != cls_b) return false;
+// 单个 bbox 的严格匹配
+bool strict_box_match_single(const BBox& a, const BBox& b) {
     if (center_distance(a, b) >= IDENTITY_CENTER_DIST) return false;
     if (area_ratio_diff(a, b) >= IDENTITY_AREA_RATIO) return false;
     if (iou(a, b) < IDENTITY_IOU_THRESH) return false;
     return true;
 }
 
-bool relaxed_box_match(const BBox& a, int cls_a, const BBox& b, int cls_b) {
+// 严格匹配（同时检查 active_box 和 passive_box）
+bool strict_box_match(const BBox& a, int cls_a, const BBox& b, int cls_b) {
     if (cls_a != cls_b) return false;
+    return strict_box_match_single(a, b);
+}
+
+bool strict_box_match(const BBox& a, int cls_a, const InventoryItem& inv) {
+    if (cls_a != inv.cls_id) return false;
+    // 分别用 active_box 和 passive_box 匹配，取最好的结果
+    return strict_box_match_single(a, inv.active_box) ||
+           strict_box_match_single(a, inv.box);
+}
+
+// 单个 bbox 的宽松匹配
+bool relaxed_box_match_single(const BBox& a, const BBox& b) {
     if (area_ratio_diff(a, b) >= 0.40f) return false;
     if (normalized_nearby_distance(a, b) > NEARBY_DISTANCE_THRESH) return false;
     return true;
+}
+
+// 宽松匹配（同时检查 active_box 和 passive_box）
+bool relaxed_box_match(const BBox& a, int cls_a, const BBox& b, int cls_b) {
+    if (cls_a != cls_b) return false;
+    return relaxed_box_match_single(a, b);
+}
+
+bool relaxed_box_match(const BBox& a, int cls_a, const InventoryItem& inv) {
+    if (cls_a != inv.cls_id) return false;
+    // 分别用 active_box 和 passive_box 匹配，取最好的结果
+    return relaxed_box_match_single(a, inv.active_box) ||
+           relaxed_box_match_single(a, inv.box);
 }
 
 int find_in_snapshot_strict(const Snapshot& snap,
@@ -257,7 +283,8 @@ int SessionManager::find_inventory_item_strict(const BBox& box,
     for (const auto& kv : inventory_.items()) {
         const InventoryItem& it = kv.second;
         if (!include_out && it.status == ItemStatus::OUT) continue;
-        if (strict_box_match(box, cls_id, it.box, it.cls_id)) {
+        // 同时检查 active_box 和 passive_box
+        if (strict_box_match(box, cls_id, it)) {
             return kv.first;
         }
     }
@@ -273,8 +300,12 @@ int SessionManager::find_inventory_item_relaxed(const BBox& box,
         const InventoryItem& it = kv.second;
         if (!include_out && it.status == ItemStatus::OUT) continue;
         if (it.cls_id != cls_id) continue;
-        if (!relaxed_box_match(box, cls_id, it.box, it.cls_id)) continue;
-        float d = normalized_nearby_distance(box, it.box);
+        // 同时检查 active_box 和 passive_box
+        if (!relaxed_box_match(box, cls_id, it)) continue;
+        // 取两个 bbox 中距离最近的
+        float d1 = normalized_nearby_distance(box, it.active_box);
+        float d2 = normalized_nearby_distance(box, it.box);
+        float d = std::min(d1, d2);
         if (d < best_dist) {
             best_dist = d;
             best_id = kv.first;
@@ -778,6 +809,8 @@ void SessionManager::process_pending_relocations(const Snapshot& snap2,
             if (item && item->status != ItemStatus::OUT) {
                 inventory_.set_status(p.item_id_A, ItemStatus::VISIBLE, current_time_ms_);
                 inventory_.update_item(p.item_id_A, -1, B.box, B.best_score, snap2.frame_id);
+                // 整理确认时同时更新 active_box（主动移动）
+                item->active_box = B.box;
                 for (const auto& kv : inventory_.items()) {
                     if (kv.first == p.item_id_A) continue;
                     const InventoryItem& maybe_hidden = kv.second;
@@ -1009,6 +1042,11 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (decision == RelocationDecision::CONFIRMED) {
             inventory_.set_status(item_id, ItemStatus::VISIBLE, current_time_ms_);
             inventory_.update_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
+            // 整理时同时更新 active_box（主动移动）
+            InventoryItem* item_ptr = inventory_.find_by_item(item_id);
+            if (item_ptr) {
+                item_ptr->active_box = B.box;
+            }
             consumed_disappeared_indices.insert(a_idx);
             consumed_appeared_indices.insert(best_idx);
             apply_relocation_visibility_changes(
@@ -1087,68 +1125,83 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         }
 
         bool found_reason = false;
+        // 从稳定快照中找 C
+        int best_c_idx = -1;
+        float best_c_dist = 999.0f;
         for (int c_idx : appeared_indices) {
             if (consumed_appeared_indices.count(c_idx)) continue;
             if (reserved_snap2_indices.count(c_idx)) continue;
-
             const VotingItem& C = snap2.items[c_idx];
             float nearby_dist = normalized_nearby_distance(A.box, C.box);
             if (nearby_dist >= NEARBY_DISTANCE_THRESH) continue;
-
-            int inventory_c_id = -1;
-            float best_c_dist = 999.0f;
-            for (const auto& kv : inventory_.items()) {
-                if (kv.first == item_id) continue;
-                const InventoryItem& inv = kv.second;
-                if (inv.status == ItemStatus::OUT) continue;
-                bool matched_inventory_c =
-                    inv.status == ItemStatus::OCCLUDED
-                        ? relaxed_box_match(C.box, C.cls_id, inv.box, inv.cls_id)
-                        : strict_box_match(C.box, C.cls_id, inv.box, inv.cls_id);
-                if (!matched_inventory_c) continue;
-                float d = normalized_nearby_distance(C.box, inv.box);
-                if (d < best_c_dist) {
-                    best_c_dist = d;
-                    inventory_c_id = kv.first;
-                }
+            if (nearby_dist < best_c_dist) {
+                best_c_dist = nearby_dist;
+                best_c_idx = c_idx;
             }
-            const InventoryItem* inventory_c =
-                inventory_c_id >= 0 ? inventory_.find_by_item(inventory_c_id) : nullptr;
-
-            if (inventory_c && inventory_c->status == ItemStatus::OCCLUDED) {
-                inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
-                inventory_.set_status(inventory_c_id, ItemStatus::VISIBLE, current_time_ms_);
-                inventory_.update_item(inventory_c_id, -1, C.box, C.best_score, snap2.frame_id);
-                consumed_appeared_indices.insert(c_idx);
-                printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
-                       "(旧物品 item#%d 露出)\n",
-                       item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
-                result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
-                result.happened = true;
-                found_reason = true;
-                break;
-            }
-
-            if (inventory_c && inventory_c->status == ItemStatus::VISIBLE) {
-                found_reason = true;
-                break;
-            }
-
-            inventory_.set_status(item_id, ItemStatus::OCCLUDED, current_time_ms_);
-            blocked_appeared_inventory_ids.insert(item_id);
-            protected_occluded_item_ids.insert(item_id);
-            printf("[SESSION] item#%d (%s) 可能被新物品遮挡，C 留给新物品流程处理\n",
-                   item_id, coco_cls_to_name(A.cls_id));
-            found_reason = true;
-            break;
         }
 
-        if (!found_reason) {
+        if (best_c_idx < 0) {
+            // 不存在物体 C：A 被拿走
             inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
             printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (位置空了)\n",
                    item_id, coco_cls_to_name(A.cls_id));
             result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
             result.happened = true;
+        } else {
+            // 存在物体 C，检查 C 在库存中的状态
+            const VotingItem& C = snap2.items[best_c_idx];
+            int inventory_c_id = -1;
+            float best_match_dist = 999.0f;
+            for (const auto& kv : inventory_.items()) {
+                if (kv.first == item_id) continue;
+                const InventoryItem& inv = kv.second;
+                if (inv.status == ItemStatus::OUT) continue;
+                // 对【遮挡】和【可见】物品都使用 relaxed_box_match（同时检查 active_box 和 passive_box）
+                bool matched = relaxed_box_match(C.box, C.cls_id, inv);
+                if (!matched) continue;
+                float d = normalized_nearby_distance(C.box, inv.box);
+                if (d < best_match_dist) {
+                    best_match_dist = d;
+                    inventory_c_id = kv.first;
+                }
+            }
+
+            if (inventory_c_id >= 0) {
+                const InventoryItem* inventory_c = inventory_.find_by_item(inventory_c_id);
+                if (inventory_c && inventory_c->status == ItemStatus::OCCLUDED) {
+                    // C 能匹配本地库存中的【遮挡】物品：A 被拿走，C 露出
+                    inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
+                    inventory_.set_status(inventory_c_id, ItemStatus::VISIBLE, current_time_ms_);
+                    inventory_.update_item(inventory_c_id, -1, C.box, C.best_score, snap2.frame_id);
+                    consumed_appeared_indices.insert(best_c_idx);
+                    printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
+                           "(旧物品 item#%d 露出)\n",
+                           item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
+                    result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
+                    result.happened = true;
+                } else if (inventory_c && inventory_c->status == ItemStatus::VISIBLE) {
+                    // C 能匹配本地库存中的【可见】物品：A 被拿走，C 保持可见
+                    inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
+                    printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (附近有可见物品 item#%d)\n",
+                           item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
+                    result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
+                    result.happened = true;
+                } else {
+                    // 兜底：A 被拿走
+                    inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
+                    printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (位置空了)\n",
+                           item_id, coco_cls_to_name(A.cls_id));
+                    result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
+                    result.happened = true;
+                }
+            } else {
+                // C 不在当前库存中：C 可能是新放入的物品，C 挡住了 A
+                inventory_.set_status(item_id, ItemStatus::OCCLUDED, current_time_ms_);
+                blocked_appeared_inventory_ids.insert(item_id);
+                protected_occluded_item_ids.insert(item_id);
+                printf("[SESSION] item#%d (%s) 可能被新物品遮挡，C 留给新物品流程处理\n",
+                       item_id, coco_cls_to_name(A.cls_id));
+            }
         }
     }
 
@@ -1181,6 +1234,11 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             if (out_item && out_item->status == ItemStatus::OUT) {
                 inventory_.set_status(out_id, ItemStatus::VISIBLE, current_time_ms_);
                 inventory_.update_item(out_id, -1, B.box, B.best_score, snap2.frame_id);
+                // 从出库恢复时同时更新 active_box（重新入库）
+                InventoryItem* item_ptr = inventory_.find_by_item(out_id);
+                if (item_ptr) {
+                    item_ptr->active_box = B.box;
+                }
                 printf("[SESSION] item#%d (%s) 从出库恢复为可见\n",
                        out_id, coco_cls_to_name(B.cls_id));
                 continue;
@@ -1205,8 +1263,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (kv.second.status != ItemStatus::OUT) continue;
         for (const auto& kv2 : inventory_.items()) {
             if (kv2.second.status == ItemStatus::OUT) continue;
-            if (strict_box_match(kv.second.box, kv.second.cls_id,
-                                 kv2.second.box, kv2.second.cls_id)) {
+            if (strict_box_match(kv.second.box, kv.second.cls_id, kv2.second)) {
                 out_to_remove.push_back(kv.first);
                 break;
             }
@@ -1223,8 +1280,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         if (protected_occluded_item_ids.count(kv.first)) continue;
         for (const auto& kv2 : inventory_.items()) {
             if (kv2.second.status != ItemStatus::VISIBLE) continue;
-            if (strict_box_match(kv.second.box, kv.second.cls_id,
-                                 kv2.second.box, kv2.second.cls_id)) {
+            if (strict_box_match(kv.second.box, kv.second.cls_id, kv2.second)) {
                 occluded_to_remove.push_back(kv.first);
                 break;
             }

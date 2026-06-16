@@ -29,7 +29,8 @@ struct InventoryItem {
     int item_id;              // 稳定身份ID，永不变
     int track_id;             // 当前绑定的ByteTrack ID（-1表示未绑定）
     int cls_id;               // 物品类别
-    BBox box;                 // 当前位置（最新检测到的bbox）
+    BBox box;                 // 当前位置（被动bbox，会因为遮挡等原因被动变化）
+    BBox active_box;          // 主动bbox（物品刚拿进来或整理后的bbox，只有主动移动时才更新）
     float score;              // 最新检测分数
     ItemStatus status;        // 当前状态
     int created_frame;        // 入库帧号
