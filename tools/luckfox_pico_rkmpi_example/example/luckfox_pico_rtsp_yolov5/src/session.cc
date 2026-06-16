@@ -759,7 +759,8 @@ void SessionManager::process_pending_relocations(const Snapshot& snap2,
                        p.item_id_A, coco_cls_to_name(p.class_id), p.pending_id,
                        p.reid_score, p.evidence_score);
                 result.events.push_back({EventKind::MOVED, p.item_id_A,
-                                          p.class_id, B.box, B.best_score});
+                                          p.class_id, B.box,
+                                          p.old_bbox, B.box, B.best_score});
                 result.happened = true;
             }
             continue;
@@ -984,7 +985,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             printf("\033[1;32m[EVENT]\033[0m 整理: item#%d %s "
                    "(reid=%.2f evidence=%.2f)\n",
                    item_id, coco_cls_to_name(A.cls_id), best_reid, evidence_score);
-            result.events.push_back({EventKind::MOVED, item_id, A.cls_id, B.box, B.best_score});
+            result.events.push_back({EventKind::MOVED, item_id, A.cls_id,
+                                     B.box, A.box, B.box, B.best_score});
             result.happened = true;
         } else if (decision == RelocationDecision::LOW_CONFIDENCE) {
             bool exists = false;
@@ -1088,7 +1090,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
                        "(旧物品 item#%d 露出)\n",
                        item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
-                result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
+                result.events.push_back({EventKind::OUT, item_id, A.cls_id,
+                                         A.box, A.box, A.box, A.best_score});
                 result.happened = true;
                 found_reason = true;
                 break;
@@ -1112,7 +1115,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
             printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (位置空了)\n",
                    item_id, coco_cls_to_name(A.cls_id));
-            result.events.push_back({EventKind::OUT, item_id, A.cls_id, A.box, A.best_score});
+            result.events.push_back({EventKind::OUT, item_id, A.cls_id,
+                                     A.box, A.box, A.box, A.best_score});
             result.happened = true;
         }
     }
@@ -1159,7 +1163,8 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
                new_id, coco_cls_to_name(B.cls_id), B.best_score * 100,
                B.box.x1, B.box.y1, B.box.x2, B.box.y2);
-        result.events.push_back({EventKind::IN, new_id, B.cls_id, B.box, B.best_score});
+        result.events.push_back({EventKind::IN, new_id, B.cls_id,
+                                 B.box, B.box, B.box, B.best_score});
         result.happened = true;
     }
 

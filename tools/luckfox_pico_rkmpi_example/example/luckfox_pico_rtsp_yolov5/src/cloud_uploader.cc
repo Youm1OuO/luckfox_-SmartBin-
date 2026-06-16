@@ -6,8 +6,9 @@
 //    - HTTP 用最朴素的 POSIX socket 手写 POST，不引第三方库（板子是 uClibc，
 //      链接 curl/openssl 很麻烦）。云端用明文 HTTP 即可，演示足够。
 //    - JSON 自己手拼，零依赖。
-//    - 输出 JSON 严格对应《端侧返回数据格式.txt》出入库事件格式。
-//    - 端侧不解析返回（标签识别/配对在后端做），只关心 HTTP 是否连通。
+//    - 输出 JSON 严格对应后端接口文档。
+//    - 支持 Token 登录鉴权（Authorization: Bearer <token>）。
+//    - 支持设备心跳（每30秒）。
 //    - 后台单线程串行发送：事件不是高频，串行够用，避免并发 socket 复杂度。
 // ============================================================================
 #include "cloud_uploader.h"
@@ -73,14 +74,34 @@ std::string base64_encode(const unsigned char* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
+//  简易 JSON 解析（只提取顶层 string/int 字段，不引第三方库）
+// ---------------------------------------------------------------------------
+static std::string json_extract_string(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos = json.find(':', pos + search.size());
+    if (pos == std::string::npos) return "";
+    pos = json.find('"', pos + 1);
+    if (pos == std::string::npos) return "";
+    size_t end = json.find('"', pos + 1);
+    if (end == std::string::npos) return "";
+    return json.substr(pos + 1, end - pos - 1);
+}
+
+// ---------------------------------------------------------------------------
 CloudUploader::CloudUploader()
-    : running_(false), sent_ok_(0), sent_fail_(0) {
+    : running_(false), logged_in_(false), sent_ok_(0), sent_fail_(0) {
     // 默认配置来自 fridge_config.h；环境变量可覆盖（方便现场改 IP 不用重编译）
-    host       = CLOUD_HOST;
-    port       = CLOUD_PORT;
-    item_path  = CLOUD_ITEM_PATH;
+    host           = CLOUD_HOST;
+    port           = CLOUD_PORT;
+    item_path      = CLOUD_ITEM_PATH;
+    heartbeat_path = CLOUD_HEARTBEAT_PATH;
+    login_path     = CLOUD_LOGIN_PATH;
     inventory_path = CLOUD_INVENTORY_PATH;
-    device_id  = CLOUD_DEVICE_ID;
+    device_id      = CLOUD_DEVICE_ID;
+    username       = CLOUD_USERNAME;
+    password       = CLOUD_PASSWORD;
 
     if (const char* h = getenv("FRIDGE_CLOUD_HOST"))   host = h;
     if (const char* p = getenv("FRIDGE_CLOUD_PORT"))   port = atoi(p);
@@ -91,12 +112,50 @@ CloudUploader::CloudUploader()
 
 CloudUploader::~CloudUploader() { stop(); }
 
+// ---------------------------------------------------------------------------
+//  登录获取 Token
+// ---------------------------------------------------------------------------
+bool CloudUploader::login() {
+    char body[512];
+    snprintf(body, sizeof(body),
+             "{\"username\":\"%s\",\"password\":\"%s\"}",
+             username.c_str(), password.c_str());
+
+    std::string resp;
+    // 登录接口不需要 token
+    bool ok = http_post(login_path, body, resp, false);
+    if (!ok) {
+        printf("[CLOUD] 登录失败\n");
+        return false;
+    }
+
+    // 从响应中提取 token
+    std::string t = json_extract_string(resp, "token");
+    if (t.empty()) {
+        printf("[CLOUD] 登录响应中没有 token: %s\n", resp.c_str());
+        return false;
+    }
+
+    token = t;
+    logged_in_.store(true);
+    printf("[CLOUD] 登录成功，token=%s...\n", token.substr(0, 20).c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 void CloudUploader::start() {
     if (running_.load()) return;
+
+    // 先登录获取 token
+    if (!login()) {
+        printf("[CLOUD] 警告：登录失败，事件上报可能失败\n");
+    }
+
     running_.store(true);
     thread_ = std::thread(&CloudUploader::worker_loop, this);
-    printf("[CLOUD] uploader started → http://%s:%d%s, inventory=%s (device=%s)\n",
-           host.c_str(), port, item_path.c_str(), inventory_path.c_str(),
+    heartbeat_thread_ = std::thread(&CloudUploader::heartbeat_loop, this);
+    printf("[CLOUD] uploader started → http://%s:%d%s, heartbeat=%s, device=%s\n",
+           host.c_str(), port, item_path.c_str(), heartbeat_path.c_str(),
            device_id.c_str());
 }
 
@@ -105,6 +164,32 @@ void CloudUploader::stop() {
     running_.store(false);
     in_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
+}
+
+// ---------------------------------------------------------------------------
+//  心跳线程：每30秒发送一次心跳
+// ---------------------------------------------------------------------------
+void CloudUploader::heartbeat_loop() {
+    while (running_.load()) {
+        char body[256];
+        snprintf(body, sizeof(body),
+                 "{\"device_id\":\"%s\",\"event\":\"heartbeat\",\"payload\":null}",
+                 device_id.c_str());
+
+        std::string resp;
+        bool ok = http_post(heartbeat_path, body, resp);
+        if (ok) {
+            // 心跳成功，不打印日志（太频繁）
+        } else {
+            printf("[CLOUD] 心跳失败\n");
+        }
+
+        // 等待30秒（分段等待，便于快速退出）
+        for (int i = 0; i < HEARTBEAT_INTERVAL_SEC && running_.load(); i++) {
+            sleep(1);
+        }
+    }
 }
 
 void CloudUploader::enqueue(const UploadJob& job) {
@@ -127,10 +212,11 @@ void CloudUploader::enqueue_inventory_snapshot(const std::string& json,
 }
 
 // ---------------------------------------------------------------------------
-//  组装 JSON —— 严格对应《端侧返回数据格式.txt》出入库事件：
+//  组装 JSON —— 严格对应后端接口文档：
 //    {"device_id","timestamp","event_type","data":[
-//       {"local_track_id","category","confidence","bbox":[x,y,w,h],"crop_image"}]}
-//  crop_image 仅 ITEM_IN 带（jpeg 非空时）；ITEM_OUT/MOVED 为空字符串。
+//       {"local_track_id","category","confidence","bbox":[x1,y1,x2,y2],"crop_image"}]}
+//  ITEM_MOVED 额外带 before_bbox / before_position / after_bbox /
+//  after_position / after_image。
 // ---------------------------------------------------------------------------
 std::string CloudUploader::build_json(const UploadJob& job) {
     if (job.kind == UploadKind::DOOR_CLOSE && !job.raw_json.empty()) {
@@ -141,25 +227,56 @@ std::string CloudUploader::build_json(const UploadJob& job) {
     if (!job.jpeg.empty()) b64 = base64_encode(job.jpeg.data(), job.jpeg.size());
 
     std::string s;
-    s.reserve(b64.size() + 320);
+    s.reserve(b64.size() + 480);
     char head[640];
     snprintf(head, sizeof(head),
              "{\"device_id\":\"%s\",\"timestamp\":%lld,"
              "\"event_type\":\"%s\",\"data\":[{"
              "\"local_track_id\":%d,\"category\":\"%s\","
-             "\"confidence\":%.2f,\"bbox\":[%d,%d,%d,%d],\"crop_image\":\"",
+             "\"confidence\":%.2f,\"bbox\":[%d,%d,%d,%d]",
              device_id.c_str(), job.timestamp_ms,
              upload_kind_to_str(job.kind),
              job.local_track_id, job.category.c_str(), job.confidence,
-             job.x, job.y, job.w, job.h);
+             job.x1, job.y1, job.x2, job.y2);
     s += head;
-    s += b64;   // 可能为空字符串
-    s += "\"}]}";
+
+    if (job.kind == UploadKind::ITEM_MOVED && job.has_before_bbox) {
+        int before_cx = (job.before_x1 + job.before_x2) / 2;
+        int before_cy = (job.before_y1 + job.before_y2) / 2;
+        int after_cx = (job.x1 + job.x2) / 2;
+        int after_cy = (job.y1 + job.y2) / 2;
+        char moved_fields[384];
+        snprintf(moved_fields, sizeof(moved_fields),
+                 ",\"before_bbox\":[%d,%d,%d,%d],"
+                 "\"before_position\":[%d,%d],"
+                 "\"after_bbox\":[%d,%d,%d,%d],"
+                 "\"after_position\":[%d,%d]",
+                 job.before_x1, job.before_y1, job.before_x2, job.before_y2,
+                 before_cx, before_cy,
+                 job.x1, job.y1, job.x2, job.y2,
+                 after_cx, after_cy);
+        s += moved_fields;
+    }
+
+    if (job.kind == UploadKind::ITEM_MOVED) {
+        s += ",\"after_image\":\"";
+        s += b64;
+        s += "\"";
+    } else {
+        s += ",\"crop_image\":\"";
+        s += b64;   // ITEM_IN 有图；ITEM_OUT 为空字符串
+        s += "\"";
+    }
+
+    s += "}]}";
     return s;
 }
 
+// ---------------------------------------------------------------------------
+//  HTTP POST（支持可选的 Authorization 请求头）
+// ---------------------------------------------------------------------------
 bool CloudUploader::http_post(const std::string& path, const std::string& body,
-                              std::string& resp_body) {
+                              std::string& resp_body, bool use_auth) {
     resp_body.clear();
 
     // 1) 解析主机：先按点分 IP，失败再 DNS
@@ -194,15 +311,27 @@ bool CloudUploader::http_post(const std::string& path, const std::string& body,
     }
 
     // 3) 拼 HTTP 请求头 + body
-    char header[512];
-    snprintf(header, sizeof(header),
-             "POST %s HTTP/1.1\r\n"
-             "Host: %s:%d\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: close\r\n"
-             "\r\n",
-             path.c_str(), host.c_str(), port, body.size());
+    char header[1024];
+    if (use_auth && !token.empty()) {
+        snprintf(header, sizeof(header),
+                 "POST %s HTTP/1.1\r\n"
+                 "Host: %s:%d\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Authorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: close\r\n"
+                 "\r\n",
+                 path.c_str(), host.c_str(), port, token.c_str(), body.size());
+    } else {
+        snprintf(header, sizeof(header),
+                 "POST %s HTTP/1.1\r\n"
+                 "Host: %s:%d\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: close\r\n"
+                 "\r\n",
+                 path.c_str(), host.c_str(), port, body.size());
+    }
 
     std::string req = header;
     req += body;
@@ -241,6 +370,9 @@ bool CloudUploader::http_post(const std::string& path, const std::string& body,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+//  后台线程：串行发送上传任务
+// ---------------------------------------------------------------------------
 void CloudUploader::worker_loop() {
     while (running_.load()) {
         UploadJob job;

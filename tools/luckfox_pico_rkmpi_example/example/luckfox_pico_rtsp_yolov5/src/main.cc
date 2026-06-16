@@ -418,11 +418,11 @@ int main(int argc, char *argv[]) {
 						case fridge::EventKind::MOVED: job.kind = fridge::UploadKind::ITEM_MOVED; break;
 					}
 					job.local_track_id = ev.item_id;
-					job.category       = fridge::coarse_category(ev.cls_id);
+					job.category       = fridge::cls_id_to_chinese(ev.cls_id);  // 中文细粒度
 					job.confidence     = ev.score;
 					job.timestamp_ms   = now_ms;
 
-					// 放入(IN) 带截图
+					// 放入(IN) 带物品框截图
 					if (ev.kind == fridge::EventKind::IN) {
 						int rx1 = std::max(0, (int)ev.box.x1 - 8);
 						int ry1 = std::max(0, (int)ev.box.y1 - 8);
@@ -436,8 +436,8 @@ int main(int argc, char *argv[]) {
 							std::vector<unsigned char> jpeg;
 							if (cv::imencode(".jpg", crop, jpeg, enc_param)) {
 								job.jpeg = std::move(jpeg);
-								job.x = rx1; job.y = ry1;
-								job.w = rx2 - rx1; job.h = ry2 - ry1;
+								job.x1 = rx1; job.y1 = ry1;
+								job.x2 = rx2; job.y2 = ry2;
 
 								// 本地落盘
 								char fname[160];
@@ -454,11 +454,48 @@ int main(int argc, char *argv[]) {
 								}
 							}
 						}
+					} else if (ev.kind == fridge::EventKind::MOVED) {
+						job.x1 = (int)ev.after_box.x1;
+						job.y1 = (int)ev.after_box.y1;
+						job.x2 = (int)ev.after_box.x2;
+						job.y2 = (int)ev.after_box.y2;
+						job.has_before_bbox = true;
+						job.before_x1 = (int)ev.before_box.x1;
+						job.before_y1 = (int)ev.before_box.y1;
+						job.before_x2 = (int)ev.before_box.x2;
+						job.before_y2 = (int)ev.before_box.y2;
+
+						int rx1 = std::max(0, (int)ev.after_box.x1 - 8);
+						int ry1 = std::max(0, (int)ev.after_box.y1 - 8);
+						int rx2 = std::min(width, (int)ev.after_box.x2 + 8);
+						int ry2 = std::min(height, (int)ev.after_box.y2 + 8);
+						if (rx2 > rx1 && ry2 > ry1) {
+							cv::Rect roi(rx1, ry1, rx2 - rx1, ry2 - ry1);
+							cv::Mat crop = frame(roi).clone();
+							cv::cvtColor(crop, crop, cv::COLOR_BGR2RGB);
+							std::vector<int> enc_param = {cv::IMWRITE_JPEG_QUALITY, 80};
+							std::vector<unsigned char> jpeg;
+							if (cv::imencode(".jpg", crop, jpeg, enc_param)) {
+								job.jpeg = std::move(jpeg);
+
+								char fname[176];
+								snprintf(fname, sizeof(fname),
+								         "./captures/item%d_moved_after_crop_%lld.jpg",
+								         ev.item_id, (long long)now_ms);
+								FILE* fp = fopen(fname, "wb");
+								if (fp) {
+									fwrite(job.jpeg.data(), 1, job.jpeg.size(), fp);
+									fclose(fp);
+									printf("\033[1;36m[CAPTURE]\033[0m 整理后框截图: %s (%zu 字节)\n",
+									       fname, job.jpeg.size());
+								}
+							}
+						}
 					} else {
-						job.x = (int)ev.box.x1;
-						job.y = (int)ev.box.y1;
-						job.w = (int)(ev.box.x2 - ev.box.x1);
-						job.h = (int)(ev.box.y2 - ev.box.y1);
+						job.x1 = (int)ev.box.x1;
+						job.y1 = (int)ev.box.y1;
+						job.x2 = (int)ev.box.x2;
+						job.y2 = (int)ev.box.y2;
 					}
 					cloud.enqueue(job);
 				}

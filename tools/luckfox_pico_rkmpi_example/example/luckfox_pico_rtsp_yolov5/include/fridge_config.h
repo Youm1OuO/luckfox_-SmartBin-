@@ -81,6 +81,29 @@ inline const char* coarse_category(int cls_id) {
 }
 
 // =========================================================================
+//  中文类别映射 — 对应后端接口要求的 category 字段
+// -------------------------------------------------------------------------
+//  后端要求中文细粒度（如"苹果"），端侧 labels_list.txt 是英文。
+//  此函数将 cls_id 映射为中文类别名，用于上报给后端。
+// =========================================================================
+inline const char* cls_id_to_chinese(int cls_id) {
+    static const char* cn_names[] = {
+        "苹果", "香蕉", "橙子", "番茄", "柠檬",
+        "梨", "葡萄", "草莓", "西瓜", "哈密瓜",
+        "木瓜", "牛油果", "黄瓜", "胡萝卜", "土豆",
+        "洋葱", "甜椒", "叶菜", "鸡蛋", "包装肉",
+        "包装鱼", "盒装牛奶", "瓶装牛奶", "酸奶杯",
+        "果汁瓶", "苏打罐", "水瓶", "袋装食品",
+        "盒装食品", "罐头", "玻璃罐", "保鲜膜",
+        "保鲜盒", "手", "蘑菇", "南瓜", "大蒜",
+        "姜", "萝卜", "红薯", "核桃", "香菜",
+        "秋葵", "白菜", "豆角", "生菜", "卷心菜", "苦瓜"
+    };
+    if (cls_id >= 0 && cls_id < 48) return cn_names[cls_id];
+    return "未知";
+}
+
+// =========================================================================
 //  标签扫描 — 哪些类别"可能有包装标签值得扫"
 // -------------------------------------------------------------------------
 //  "内容不易直接辨识"的包装类食品(袋装/盒装/罐装/瓶装/保鲜盒)。
@@ -109,18 +132,23 @@ inline bool has_label(int cls_id) {
 //  端云协同 — 云端服务默认配置（可被环境变量覆盖，见 cloud_uploader.cc）
 // -------------------------------------------------------------------------
 //  现场改 IP 不想重新编译时，直接设环境变量：
-//    export FRIDGE_CLOUD_HOST=192.168.168.1
+//    export FRIDGE_CLOUD_HOST=192.168.5.6
 //    export FRIDGE_CLOUD_PORT=8000
 //  上报端点：
-//    POST /events/item      单个事件 ITEM_IN/OUT/MOVED
-//    POST /inventory/close  关门时最终库存快照
-//  放入(ITEM_IN) 带物品框内截图，后端拿到图后自行决定要不要跑云端 AI。
+//    POST /api/v1/admin/device-ingest      单个事件 ITEM_IN/OUT/MOVED
+//    POST /api/v1/admin/events/heartbeat    设备心跳（每30秒）
+//  鉴权：所有接口均需 Authorization: Bearer <token> 请求头
 // =========================================================================
-constexpr const char* CLOUD_HOST       = "192.168.168.1";   // 云端/网关主机
-constexpr int         CLOUD_PORT       = 8000;              // 端口
-constexpr const char* CLOUD_ITEM_PATH  = "/events/item";    // 出入库事件端点
+constexpr const char* CLOUD_HOST       = "192.168.168.1";     // 板子通过 USB 网络访问宿主机，由宿主机转发到后端
+constexpr int         CLOUD_PORT       = 8000;                // 端口
+constexpr const char* CLOUD_ITEM_PATH  = "/api/v1/admin/device-ingest"; // 出入库事件端点
+constexpr const char* CLOUD_HEARTBEAT_PATH = "/api/v1/admin/events/heartbeat"; // 心跳端点
+constexpr const char* CLOUD_LOGIN_PATH = "/api/v1/admin/auth/login"; // 登录端点
 constexpr const char* CLOUD_INVENTORY_PATH = "/inventory/close"; // 关门库存端点
-constexpr const char* CLOUD_DEVICE_ID  = "luckfox";         // 设备 ID
+constexpr const char* CLOUD_DEVICE_ID  = "luckfox-001";       // 设备 ID
+constexpr const char* CLOUD_USERNAME   = "admin";              // 登录用户名
+constexpr const char* CLOUD_PASSWORD   = "admin123";           // 登录密码
+constexpr int         HEARTBEAT_INTERVAL_SEC = 30;             // 心跳间隔（秒）
 
 // =========================================================================
 //  推理输入颜色顺序开关（已实测定论）

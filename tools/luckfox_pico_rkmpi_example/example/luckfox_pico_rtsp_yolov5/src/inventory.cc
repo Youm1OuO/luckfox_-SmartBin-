@@ -156,15 +156,13 @@ std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms,
         const auto& it = kv.second;
         // 只上报 VISIBLE + OCCLUDED（在冰箱中的物品）
         if (it.status == ItemStatus::OUT) continue;
-        float bw = it.box.x2 - it.box.x1;
-        float bh = it.box.y2 - it.box.y1;
         snprintf(buf, sizeof(buf),
-                 "%s{\"item_id\":%d,\"category\":\"%s\",\"fine_class\":\"%s\","
+                 "%s{\"item_id\":%d,\"category\":\"%s\","
                  "\"status\":\"%s\",\"bbox\":[%.0f,%.0f,%.0f,%.0f]}",
                  first ? "" : ",",
-                 it.item_id, coarse_category(it.cls_id), coco_cls_to_name(it.cls_id),
+                 it.item_id, cls_id_to_chinese(it.cls_id),
                  item_status_to_str(it.status),
-                 it.box.x1, it.box.y1, bw, bh);
+                 it.box.x1, it.box.y1, it.box.x2, it.box.y2);
         s += buf;
         first = false;
     }

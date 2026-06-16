@@ -32,7 +32,9 @@ struct InventoryEvent {
     EventKind kind;
     int       item_id;
     int       cls_id;
-    BBox      box;
+    BBox      box;          // IN/OUT: 事件框；MOVED: 整理后的框
+    BBox      before_box;   // MOVED: 整理前的框
+    BBox      after_box;    // MOVED: 整理后的框
     float     score;
 };
 

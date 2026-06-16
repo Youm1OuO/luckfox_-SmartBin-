@@ -4,7 +4,10 @@
       "Bash(codegraph init *)",
       "Bash(codegraph index *)",
       "Bash(codegraph sync *)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(ping *)",
+      "Bash(curl *)",
+      "Bash(netsh interface *)"
     ]
   }
 }
