@@ -1098,6 +1098,13 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             }
 
             if (inventory_c && inventory_c->status == ItemStatus::VISIBLE) {
+                // A 被拿走，C 是原本就存在的物品
+                inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
+                printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (附近有可见物品 item#%d)\n",
+                       item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
+                result.events.push_back({EventKind::OUT, item_id, A.cls_id,
+                                         A.box, A.box, A.box, A.best_score});
+                result.happened = true;
                 found_reason = true;
                 break;
             }
