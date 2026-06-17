@@ -30,6 +30,7 @@ enum class UploadKind {
     ITEM_IN,       // 放入（带截图）
     ITEM_OUT,      // 取出（不带图）
     ITEM_MOVED,    // 挪位（带整理前后框 + 整理后截图）
+    NO_EVENT_SNAPSHOT, // 无事件稳定时的整柜截图
     DOOR_CLOSE,    // 关门时最终库存快照
 };
 
@@ -42,8 +43,10 @@ struct UploadJob {
     int          x1 = 0, y1 = 0, x2 = 0, y2 = 0;  // bbox [x1, y1, x2, y2]（原图像素）
     bool         has_before_bbox = false;
     int          before_x1 = 0, before_y1 = 0, before_x2 = 0, before_y2 = 0;
+    float        pixel_diff = 0.0f;     // NO_EVENT_SNAPSHOT 使用：稳定画面平均像素差
+    std::string  snapshot_reason;       // NO_EVENT_SNAPSHOT 使用
     long long    timestamp_ms = 0;      // 事件发生时间戳（毫秒）
-    std::vector<unsigned char> jpeg;    // ITEM_IN: 物品框截图；ITEM_MOVED: 整理后整帧截图
+    std::vector<unsigned char> jpeg;    // 事件相关 JPEG 图
     std::string  raw_json;              // DOOR_CLOSE 使用：完整库存 JSON
     int          attempts = 0;           // 后台线程重试计数
     int          max_attempts = 3;       // 网络临时失败时最多尝试次数

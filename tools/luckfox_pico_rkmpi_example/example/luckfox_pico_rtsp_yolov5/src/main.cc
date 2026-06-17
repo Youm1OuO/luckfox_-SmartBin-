@@ -134,6 +134,25 @@ static bool covered_by_track(const fridge::Detection& det,
 	return false;
 }
 
+static double update_no_event_pixel_diff(const cv::Mat& frame,
+                                         cv::Mat& last_gray_small) {
+	cv::Mat gray;
+	cv::Mat small;
+	cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+	cv::resize(gray, small, cv::Size(64, 36), 0, 0, cv::INTER_AREA);
+
+	if (last_gray_small.empty()) {
+		small.copyTo(last_gray_small);
+		return 0.0;
+	}
+
+	cv::Mat diff;
+	cv::absdiff(small, last_gray_small, diff);
+	double mean_diff = cv::mean(diff)[0];
+	small.copyTo(last_gray_small);
+	return mean_diff;
+}
+
 
 int main(int argc, char *argv[]) {
   // 抑制 Rockchip MPP 硬件编码器的调试日志
@@ -241,6 +260,12 @@ int main(int argc, char *argv[]) {
 	const int DOOR_CONFIRM = 5;
 	int door_session_seq = 0;
 	char door_session_id[96] = "";
+	const double NO_EVENT_PIXEL_DIFF_THRESH = 2.0;
+	const int NO_EVENT_STABLE_CONFIRM = 3;
+	const long long NO_EVENT_SNAPSHOT_COOLDOWN_MS = 30000;
+	cv::Mat no_event_last_gray_small;
+	int no_event_stable_count = 0;
+	long long last_no_event_upload_ms = 0;
 
   	while(1)
 	{
@@ -276,6 +301,9 @@ int main(int argc, char *argv[]) {
 					printf("%s\n", json.c_str());
 					cloud.enqueue_inventory_snapshot(json, (long long)ts);
 					snap_buffer.reset();
+					no_event_last_gray_small.release();
+					no_event_stable_count = 0;
+					last_no_event_upload_ms = 0;
 				} else if (!door_open && bright_streak >= DOOR_CONFIRM) {
 					door_open = true;
 					printf("\n\033[1;33m[DOOR]\033[0m 开门 (亮度=%.0f)\n", mean_y);
@@ -287,6 +315,9 @@ int main(int argc, char *argv[]) {
 
 					session.start_new_session((long long)ts);
 					snap_buffer.reset();
+					no_event_last_gray_small.release();
+					no_event_stable_count = 0;
+					last_no_event_upload_ms = 0;
 
 					std::vector<fridge::InventoryItem> backend_items;
 					bool authoritative_empty = false;
@@ -498,6 +529,55 @@ int main(int argc, char *argv[]) {
 						job.y2 = (int)ev.box.y2;
 					}
 					cloud.enqueue(job);
+				}
+
+				if (!res.events.empty()) {
+					no_event_last_gray_small.release();
+					no_event_stable_count = 0;
+					last_no_event_upload_ms = 0;
+				} else if (!snap.has_hand && !session.hand_present() && session.ready()) {
+					double pixel_diff =
+						update_no_event_pixel_diff(frame, no_event_last_gray_small);
+					if (pixel_diff <= NO_EVENT_PIXEL_DIFF_THRESH) {
+						no_event_stable_count++;
+					} else {
+						no_event_stable_count = 0;
+					}
+
+					bool cooldown_ok =
+						last_no_event_upload_ms == 0 ||
+						now_ms - last_no_event_upload_ms >= NO_EVENT_SNAPSHOT_COOLDOWN_MS;
+					if (no_event_stable_count >= NO_EVENT_STABLE_CONFIRM && cooldown_ok) {
+						cv::Mat full_image = frame.clone();
+						cv::cvtColor(full_image, full_image, cv::COLOR_BGR2RGB);
+						std::vector<int> enc_param = {cv::IMWRITE_JPEG_QUALITY, 80};
+						std::vector<unsigned char> jpeg;
+						if (cv::imencode(".jpg", full_image, jpeg, enc_param)) {
+							fridge::UploadJob job;
+							job.kind = fridge::UploadKind::NO_EVENT_SNAPSHOT;
+							job.timestamp_ms = now_ms;
+							job.pixel_diff = (float)pixel_diff;
+							job.snapshot_reason = "stable_no_event";
+							job.jpeg = std::move(jpeg);
+
+							char fname[160];
+							snprintf(fname, sizeof(fname),
+							         "./captures/no_event_snapshot_%lld.jpg",
+							         (long long)now_ms);
+							FILE* fp = fopen(fname, "wb");
+							if (fp) {
+								fwrite(job.jpeg.data(), 1, job.jpeg.size(), fp);
+								fclose(fp);
+							}
+
+							cloud.enqueue(job);
+							last_no_event_upload_ms = now_ms;
+							printf("\033[1;36m[CAPTURE]\033[0m 无事件整体图: %s "
+							       "(diff=%.2f, stable=%d, %zu 字节)\n",
+							       fname, pixel_diff, no_event_stable_count,
+							       job.jpeg.size());
+						}
+					}
 				}
 
 				if (res.happened && !res.events.empty()) {

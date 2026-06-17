@@ -33,6 +33,7 @@ const char* upload_kind_to_str(UploadKind k) {
         case UploadKind::ITEM_IN:    return "ITEM_IN";
         case UploadKind::ITEM_OUT:   return "ITEM_OUT";
         case UploadKind::ITEM_MOVED: return "ITEM_MOVED";
+        case UploadKind::NO_EVENT_SNAPSHOT: return "NO_EVENT_SNAPSHOT";
         case UploadKind::DOOR_CLOSE: return "DOOR_CLOSE";
     }
     return "UNKNOWN";
@@ -225,6 +226,24 @@ std::string CloudUploader::build_json(const UploadJob& job) {
 
     std::string b64;
     if (!job.jpeg.empty()) b64 = base64_encode(job.jpeg.data(), job.jpeg.size());
+
+    if (job.kind == UploadKind::NO_EVENT_SNAPSHOT) {
+        std::string reason = job.snapshot_reason.empty()
+            ? "stable_no_event" : job.snapshot_reason;
+        std::string s;
+        s.reserve(b64.size() + 320);
+        char head[512];
+        snprintf(head, sizeof(head),
+                 "{\"device_id\":\"%s\",\"timestamp\":%lld,"
+                 "\"event_type\":\"%s\",\"data\":[{"
+                 "\"reason\":\"%s\",\"pixel_diff\":%.2f,\"image\":\"",
+                 device_id.c_str(), job.timestamp_ms,
+                 upload_kind_to_str(job.kind), reason.c_str(), job.pixel_diff);
+        s += head;
+        s += b64;
+        s += "\"}]}";
+        return s;
+    }
 
     std::string s;
     s.reserve(b64.size() + 480);
