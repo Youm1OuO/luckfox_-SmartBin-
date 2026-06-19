@@ -467,7 +467,7 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
             BBox best_hand_box;
             int best_hand_track = -1;
             for (const auto& hb : hand_boxes) {
-                float v = overlap_ratio_of_smaller(hb, item.box);
+                float v = overlap_ratio_of_smaller(hb, item.visible_box);
                 if (v > best_overlap) {
                     best_overlap = v;
                     best_hand_box = hb;
@@ -518,7 +518,7 @@ void SessionManager::update_operation_context(const std::vector<BBox>& hand_boxe
                 ev.item_id = item_id;
                 ev.original_object_track_id = find_original_object_track_id(item_id);
                 ev.held_by_hand_track_id = candidate_hand_track_id[item_id];
-                ev.last_visible_box = item->box;
+                ev.last_visible_box = item->visible_box;
                 ev.hand_bbox_at_hold_start = candidate_hand_box[item_id];
                 ev.held_start_frame_id = frame_id;
                 ev.confidence = 0.60f;
@@ -741,8 +741,9 @@ void SessionManager::process_pending_relocations(const Snapshot& snap2,
         if (p.stable_count >= PENDING_RELOCATION_CONFIRM_FRAMES) {
             InventoryItem* item = inventory_.find_by_item(p.item_id_A);
             if (item && item->status != ItemStatus::OUT) {
+                BBox old_anchor = item->box;
                 inventory_.set_status(p.item_id_A, ItemStatus::VISIBLE, current_time_ms_);
-                inventory_.update_item(p.item_id_A, -1, B.box, B.best_score, snap2.frame_id);
+                inventory_.update_anchor_item(p.item_id_A, -1, B.box, B.best_score, snap2.frame_id);
                 for (const auto& kv : inventory_.items()) {
                     if (kv.first == p.item_id_A) continue;
                     const InventoryItem& maybe_hidden = kv.second;
@@ -760,7 +761,7 @@ void SessionManager::process_pending_relocations(const Snapshot& snap2,
                        p.reid_score, p.evidence_score);
                 result.events.push_back({EventKind::MOVED, p.item_id_A,
                                           p.class_id, B.box,
-                                          p.old_bbox, B.box, B.best_score});
+                                          old_anchor, B.box, B.best_score});
                 result.happened = true;
             }
             continue;
@@ -973,8 +974,9 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
         RelocationDecision decision = relocation_match(item_id, A, B, best_reid,
                                                        second_reid, &evidence_score);
         if (decision == RelocationDecision::CONFIRMED) {
+            BBox old_anchor = item->box;
             inventory_.set_status(item_id, ItemStatus::VISIBLE, current_time_ms_);
-            inventory_.update_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
+            inventory_.update_anchor_item(item_id, -1, B.box, B.best_score, snap2.frame_id);
             consumed_disappeared_indices.insert(a_idx);
             consumed_appeared_indices.insert(best_idx);
             apply_relocation_visibility_changes(
@@ -986,7 +988,7 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                    "(reid=%.2f evidence=%.2f)\n",
                    item_id, coco_cls_to_name(A.cls_id), best_reid, evidence_score);
             result.events.push_back({EventKind::MOVED, item_id, A.cls_id,
-                                     B.box, A.box, B.box, B.best_score});
+                                     B.box, old_anchor, B.box, B.best_score});
             result.happened = true;
         } else if (decision == RelocationDecision::LOW_CONFIDENCE) {
             bool exists = false;
@@ -1053,7 +1055,11 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             continue;
         }
 
-        bool found_reason = false;
+        int occluding_c_idx = -1;
+        int reveal_c_idx = -1;
+        int reveal_inventory_id = -1;
+        int visible_inventory_id = -1;
+
         for (int c_idx : appeared_indices) {
             if (consumed_appeared_indices.count(c_idx)) continue;
             if (reserved_snap2_indices.count(c_idx)) continue;
@@ -1068,12 +1074,14 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 if (kv.first == item_id) continue;
                 const InventoryItem& inv = kv.second;
                 if (inv.status == ItemStatus::OUT) continue;
-                bool matched_inventory_c =
-                    inv.status == ItemStatus::OCCLUDED
-                        ? relaxed_box_match(C.box, C.cls_id, inv.box, inv.cls_id)
-                        : strict_box_match(C.box, C.cls_id, inv.box, inv.cls_id);
-                if (!matched_inventory_c) continue;
-                float d = normalized_nearby_distance(C.box, inv.box);
+                bool anchor_match = strict_box_match(C.box, C.cls_id, inv.box, inv.cls_id);
+                bool visible_match =
+                    !anchor_match && inv.status == ItemStatus::OCCLUDED &&
+                    relaxed_box_match(C.box, C.cls_id, inv.visible_box, inv.cls_id);
+                if (!anchor_match && !visible_match) continue;
+                float d = anchor_match
+                    ? normalized_nearby_distance(C.box, inv.box)
+                    : normalized_nearby_distance(C.box, inv.visible_box);
                 if (d < best_c_dist) {
                     best_c_dist = d;
                     inventory_c_id = kv.first;
@@ -1083,47 +1091,55 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
                 inventory_c_id >= 0 ? inventory_.find_by_item(inventory_c_id) : nullptr;
 
             if (inventory_c && inventory_c->status == ItemStatus::OCCLUDED) {
-                inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
-                inventory_.set_status(inventory_c_id, ItemStatus::VISIBLE, current_time_ms_);
-                inventory_.update_item(inventory_c_id, -1, C.box, C.best_score, snap2.frame_id);
-                consumed_appeared_indices.insert(c_idx);
-                printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
-                       "(旧物品 item#%d 露出)\n",
-                       item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
-                result.events.push_back({EventKind::OUT, item_id, A.cls_id,
-                                         A.box, A.box, A.box, A.best_score});
-                result.happened = true;
-                found_reason = true;
-                break;
+                if (reveal_c_idx < 0) {
+                    reveal_c_idx = c_idx;
+                    reveal_inventory_id = inventory_c_id;
+                }
+                continue;
             }
 
             if (inventory_c && inventory_c->status == ItemStatus::VISIBLE) {
-                // A 被拿走，C 是原本就存在的物品
-                inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
-                printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (附近有可见物品 item#%d)\n",
-                       item_id, coco_cls_to_name(A.cls_id), inventory_c_id);
-                result.events.push_back({EventKind::OUT, item_id, A.cls_id,
-                                         A.box, A.box, A.box, A.best_score});
-                result.happened = true;
-                found_reason = true;
-                break;
+                if (visible_inventory_id < 0) {
+                    visible_inventory_id = inventory_c_id;
+                }
+                continue;
             }
 
+            occluding_c_idx = c_idx;
+            break;
+        }
+
+        if (occluding_c_idx >= 0) {
             inventory_.set_status(item_id, ItemStatus::OCCLUDED, current_time_ms_);
             blocked_appeared_inventory_ids.insert(item_id);
             protected_occluded_item_ids.insert(item_id);
             printf("[SESSION] item#%d (%s) 可能被新物品遮挡，C 留给新物品流程处理\n",
                    item_id, coco_cls_to_name(A.cls_id));
-            found_reason = true;
-            break;
-        }
-
-        if (!found_reason) {
+        } else if (reveal_c_idx >= 0 && reveal_inventory_id >= 0) {
+            const VotingItem& C = snap2.items[reveal_c_idx];
+            inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
+            inventory_.set_status(reveal_inventory_id, ItemStatus::VISIBLE, current_time_ms_);
+            inventory_.update_item(reveal_inventory_id, -1, C.box, C.best_score, snap2.frame_id);
+            consumed_appeared_indices.insert(reveal_c_idx);
+            printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
+                   "(旧物品 item#%d 露出)\n",
+                   item_id, coco_cls_to_name(A.cls_id), reveal_inventory_id);
+            result.events.push_back({EventKind::OUT, item_id, A.cls_id,
+                                     item->box, item->box, item->box, item->score});
+            result.happened = true;
+        } else if (visible_inventory_id >= 0) {
+            inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
+            printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (附近有可见物品 item#%d)\n",
+                   item_id, coco_cls_to_name(A.cls_id), visible_inventory_id);
+            result.events.push_back({EventKind::OUT, item_id, A.cls_id,
+                                     item->box, item->box, item->box, item->score});
+            result.happened = true;
+        } else {
             inventory_.set_status(item_id, ItemStatus::OUT, current_time_ms_);
             printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s (位置空了)\n",
                    item_id, coco_cls_to_name(A.cls_id));
             result.events.push_back({EventKind::OUT, item_id, A.cls_id,
-                                     A.box, A.box, A.box, A.best_score});
+                                     item->box, item->box, item->box, item->score});
             result.happened = true;
         }
     }
@@ -1157,9 +1173,14 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
             const InventoryItem* out_item = inventory_.find_by_item(out_id);
             if (out_item && out_item->status == ItemStatus::OUT) {
                 inventory_.set_status(out_id, ItemStatus::VISIBLE, current_time_ms_);
-                inventory_.update_item(out_id, -1, B.box, B.best_score, snap2.frame_id);
-                printf("[SESSION] item#%d (%s) 从出库恢复为可见\n",
-                       out_id, coco_cls_to_name(B.cls_id));
+                inventory_.update_anchor_item(out_id, -1, B.box, B.best_score, snap2.frame_id);
+                printf("\033[1;32m[EVENT]\033[0m 放入: item#%d %s "
+                       "(从出库恢复为可见, 置信度 %.0f%%) 位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+                       out_id, coco_cls_to_name(B.cls_id), B.best_score * 100,
+                       B.box.x1, B.box.y1, B.box.x2, B.box.y2);
+                result.events.push_back({EventKind::IN, out_id, B.cls_id,
+                                         B.box, B.box, B.box, B.best_score});
+                result.happened = true;
                 continue;
             }
         }
@@ -1224,7 +1245,6 @@ SettlementResult SessionManager::compare_snapshots(const Snapshot& snap2,
 void SessionManager::print_inventory() {
     size_t n_visible = inventory_.count_by_status(ItemStatus::VISIBLE);
     size_t n_occluded = inventory_.count_by_status(ItemStatus::OCCLUDED);
-    size_t n_out = inventory_.count_by_status(ItemStatus::OUT);
     size_t n_in = n_visible + n_occluded;
 
     printf("\n");
@@ -1245,25 +1265,6 @@ void SessionManager::print_inventory() {
     }
 
     printf("  └────┴──────────────┴────────┴───────────────────────┘\n");
-
-    if (n_out > 0) {
-        printf("\n");
-        printf("  ┌──────────────────────────────────────────────────┐\n");
-        printf("  │  出库记录 │ 共: %-3zu                               │\n", n_out);
-        printf("  ├────┬──────────────┬───────────────────────────────┤\n");
-        printf("  │ #  │ 类别         │ 原位置 (中心)                 │\n");
-        printf("  ├────┼──────────────┼───────────────────────────────┤\n");
-
-        for (const auto& kv : inventory_.items()) {
-            const auto& it = kv.second;
-            if (it.status != ItemStatus::OUT) continue;
-            printf("  │ %-2d │ %-12s │ (%4.0f,%4.0f)                │\n",
-                   it.item_id, coco_cls_to_name(it.cls_id),
-                   it.box.cx(), it.box.cy());
-        }
-
-        printf("  └────┴──────────────┴───────────────────────────────┘\n");
-    }
     printf("\n");
 }
 

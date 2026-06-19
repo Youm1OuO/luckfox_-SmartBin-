@@ -29,7 +29,8 @@ struct InventoryItem {
     int item_id;              // 稳定身份ID，永不变
     int track_id;             // 当前绑定的ByteTrack ID（-1表示未绑定）
     int cls_id;               // 物品类别
-    BBox box;                 // 当前位置（最新检测到的bbox）
+    BBox box;                 // anchor_box：库存主位置框 / 身份框 / 上传给后端的bbox
+    BBox visible_box;         // visible_box：YOLO 当前可见框 / 被动检测框
     float score;              // 最新检测分数
     ItemStatus status;        // 当前状态
     int created_frame;        // 入库帧号
@@ -53,8 +54,12 @@ public:
     // 标记某个物品为指定状态
     void set_status(int item_id, ItemStatus new_status, long long time_ms = 0);
 
-    // 更新某个物品的位置和信息
+    // 更新某个物品的当前可见框和信息，不修改 anchor_box
     void update_item(int item_id, int track_id, const BBox& box, float score, int frame_id);
+
+    // 主动位置变化时调用：更新 anchor_box 和 visible_box
+    void update_anchor_item(int item_id, int track_id, const BBox& box,
+                            float score, int frame_id);
 
     // 删除某个物品（按 item_id）
     void remove_item(int item_id);

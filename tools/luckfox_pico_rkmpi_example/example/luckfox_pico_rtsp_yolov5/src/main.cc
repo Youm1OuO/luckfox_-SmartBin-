@@ -153,6 +153,26 @@ static double update_no_event_pixel_diff(const cv::Mat& frame,
 	return mean_diff;
 }
 
+static cv::Scalar display_color_for_class(int cls_id) {
+	static const cv::Scalar colors[] = {
+		cv::Scalar(  0, 255,   0),
+		cv::Scalar(255,   0,   0),
+		cv::Scalar(  0, 165, 255),
+		cv::Scalar(255,   0, 255),
+		cv::Scalar(255, 255,   0),
+		cv::Scalar(  0, 255, 255),
+		cv::Scalar(128, 255,   0),
+		cv::Scalar(255, 128,   0),
+		cv::Scalar(128,   0, 255),
+		cv::Scalar(  0, 128, 255),
+		cv::Scalar(255,   0, 128),
+		cv::Scalar(  0, 255, 128),
+	};
+	int n = (int)(sizeof(colors) / sizeof(colors[0]));
+	int idx = cls_id >= 0 ? cls_id % n : 0;
+	return colors[idx];
+}
+
 
 int main(int argc, char *argv[]) {
   // 抑制 Rockchip MPP 硬件编码器的调试日志
@@ -590,19 +610,16 @@ int main(int argc, char *argv[]) {
 			//  画面绘制：bbox + 系统状态
 			// ============================================================
 			for (const auto& d : detections) {
+				if (fridge::is_hand(d.cls_id)) continue;
 				bool should_display_raw =
-					fridge::is_hand(d.cls_id)
-						? d.score >= fridge::HAND_CONTEXT_SCORE_THRESH
-						: d.score >= fridge::SNAPSHOT_MIN_SCORE;
+					d.score >= fridge::SNAPSHOT_MIN_SCORE;
 				if (!should_display_raw || covered_by_track(d, tracks)) continue;
 
 				int x1 = (int)d.box.x1;
 				int y1 = (int)d.box.y1;
 				int x2 = (int)d.box.x2;
 				int y2 = (int)d.box.y2;
-				cv::Scalar color = fridge::is_hand(d.cls_id)
-					? cv::Scalar(0, 0, 255)
-					: cv::Scalar(0, 255, 0);
+				cv::Scalar color = display_color_for_class(d.cls_id);
 				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 1);
 
 				char label[64];
@@ -613,14 +630,13 @@ int main(int argc, char *argv[]) {
 			}
 
 			for (const auto& t : tracks) {
+				if (fridge::is_hand(t.cls_id)) continue;
 				int x1 = (int)t.box.x1;
 				int y1 = (int)t.box.y1;
 				int x2 = (int)t.box.x2;
 				int y2 = (int)t.box.y2;
 
-				cv::Scalar color = fridge::is_hand(t.cls_id)
-					? cv::Scalar(0, 0, 255)      // 红 = 手
-					: cv::Scalar(0, 255, 0);     // 绿 = 物品
+				cv::Scalar color = display_color_for_class(t.cls_id);
 
 				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
 

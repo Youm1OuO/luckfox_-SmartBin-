@@ -28,6 +28,7 @@ int InventoryDB::add_item(int track_id, int cls_id, const BBox& box,
     it.track_id = track_id;
     it.cls_id = cls_id;
     it.box = box;
+    it.visible_box = box;
     it.score = score;
     it.status = ItemStatus::VISIBLE;  // 新入库默认"可见"
     it.created_frame = frame_id;
@@ -64,7 +65,18 @@ void InventoryDB::update_item(int item_id, int track_id, const BBox& box,
     auto it = items_.find(item_id);
     if (it == items_.end()) return;
     it->second.track_id = track_id;
+    it->second.visible_box = box;
+    it->second.score = score;
+    it->second.updated_frame = frame_id;
+}
+
+void InventoryDB::update_anchor_item(int item_id, int track_id, const BBox& box,
+                                     float score, int frame_id) {
+    auto it = items_.find(item_id);
+    if (it == items_.end()) return;
+    it->second.track_id = track_id;
     it->second.box = box;
+    it->second.visible_box = box;
     it->second.score = score;
     it->second.updated_frame = frame_id;
 }
@@ -102,10 +114,11 @@ void InventoryDB::print(const char* prefix) const {
         const auto& it = kv.second;
         if (it.status != ItemStatus::VISIBLE) continue;
         printf("%s  - item#%d cls=%d(%s) [可见] "
-               "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
+               "anchor=(%.0f,%.0f)~(%.0f,%.0f) visible=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
                prefix,
                it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
                it.box.x1, it.box.y1, it.box.x2, it.box.y2,
+               it.visible_box.x1, it.visible_box.y1, it.visible_box.x2, it.visible_box.y2,
                it.score, it.track_id);
     }
     // 再打印遮挡物品
@@ -113,30 +126,14 @@ void InventoryDB::print(const char* prefix) const {
         const auto& it = kv.second;
         if (it.status != ItemStatus::OCCLUDED) continue;
         printf("%s  - item#%d cls=%d(%s) [遮挡] "
-               "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
+               "anchor=(%.0f,%.0f)~(%.0f,%.0f) visible=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
                prefix,
                it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
                it.box.x1, it.box.y1, it.box.x2, it.box.y2,
+               it.visible_box.x1, it.visible_box.y1, it.visible_box.x2, it.visible_box.y2,
                it.score, it.track_id);
     }
-    // 再打印出库物品
-    bool has_out = false;
-    for (const auto& kv : items_) {
-        if (kv.second.status == ItemStatus::OUT) { has_out = true; break; }
-    }
-    if (has_out) {
-        printf("%s  --- 出库（临时记录）---\n", prefix);
-        for (const auto& kv : items_) {
-            const auto& it = kv.second;
-            if (it.status != ItemStatus::OUT) continue;
-            printf("%s  - item#%d cls=%d(%s) [出库] "
-                   "pos=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f tid=%d\n",
-                   prefix,
-                   it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
-                   it.box.x1, it.box.y1, it.box.x2, it.box.y2,
-                   it.score, it.track_id);
-        }
-    }
+    // OUT 状态仅作为内部恢复匹配的临时记录，不在库存列表里展示。
 }
 
 std::string InventoryDB::to_json(const char* device_id, long long timestamp_ms,
