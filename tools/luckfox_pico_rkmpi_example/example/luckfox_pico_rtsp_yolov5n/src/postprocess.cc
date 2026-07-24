@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "yolov5.h"
+#include "yolov5n.h"
 #include "fridge_config.h"
 
 #include <math.h>

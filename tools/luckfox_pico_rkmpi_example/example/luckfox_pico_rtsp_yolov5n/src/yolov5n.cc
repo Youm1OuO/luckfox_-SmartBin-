@@ -17,7 +17,7 @@
 #include <string.h>
 #include <math.h>
 
-#include "yolov5.h"
+#include "yolov5n.h"
 #include "fridge_config.h"
 
 static void dump_tensor_attr(rknn_tensor_attr *attr)
@@ -29,7 +29,7 @@ static void dump_tensor_attr(rknn_tensor_attr *attr)
            get_qnt_type_string(attr->qnt_type), attr->zp, attr->scale);
 }
 
-int init_yolov5_model(const char *model_path, rknn_app_context_t *app_ctx)
+int init_yolov5n_model(const char *model_path, rknn_app_context_t *app_ctx)
 {
     int ret;
     int model_len = 0;
@@ -150,7 +150,7 @@ int init_yolov5_model(const char *model_path, rknn_app_context_t *app_ctx)
     return 0;
 }
 
-int release_yolov5_model(rknn_app_context_t *app_ctx)
+int release_yolov5n_model(rknn_app_context_t *app_ctx)
 {
     if (app_ctx->input_attrs != NULL)
     {
@@ -183,7 +183,7 @@ int release_yolov5_model(rknn_app_context_t *app_ctx)
     return 0;
 }
 
-int inference_yolov5_model(rknn_app_context_t *app_ctx,  object_detect_result_list *od_results)
+int inference_yolov5n_model(rknn_app_context_t *app_ctx,  object_detect_result_list *od_results)
 {
     int ret;
     const float nms_threshold = NMS_THRESH;

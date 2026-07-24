@@ -61,7 +61,7 @@ echo.
 
 python "%YOLOV5_DIR%\train.py" ^
   --data "%YAML_FILE%" ^
-  --weights "%YOLOV5_DIR%\yolov5s.pt" ^
+  --weights "%YOLOV5_DIR%\yolov5n.pt" ^
   --epochs 100 ^
   --batch-size 16 ^
   --img 704 ^

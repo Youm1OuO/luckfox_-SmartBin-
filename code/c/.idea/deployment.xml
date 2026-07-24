@@ -5,7 +5,7 @@
       <paths name="Luckfox Board">
         <serverdata>
           <mappings>
-            <mapping deploy="/root/luckfox_pico_rtsp_yolov5_demo" local="$PROJECT_DIR$/../../tools/luckfox_pico_rkmpi_example/install/uclibc/luckfox_pico_rtsp_yolov5_demo" web="/" />
+            <mapping deploy="/root/luckfox_pico_rtsp_yolov5n_demo" local="$PROJECT_DIR$/../../tools/luckfox_pico_rkmpi_example/install/uclibc/luckfox_pico_rtsp_yolov5n_demo" web="/" />
           </mappings>
         </serverdata>
       </paths>

@@ -18,8 +18,8 @@
 ### luckfox_pico_rtsp_retinaface_osd 
 <img src="images/luckfox_pico_rtsp_retinaface_osd.jpg" alt="luckfox_pico_rtsp_retinaface_osd" width="300">
 
-### luckfox_pico_rtsp_yolov5        
-<img src="images/luckfox_pico_rtsp_yolov5.jpg" alt="luckfox_pico_rtsp_yolov5" width="300">
+### luckfox_pico_rtsp_yolov5n        
+<img src="images/luckfox_pico_rtsp_yolov5.jpg" alt="luckfox_pico_rtsp_yolov5n" width="300">
 
 ## 平台支持
  DEMO                           | CPU | Libc
@@ -28,7 +28,7 @@ luckfox_pico_rtsp_opencv        | RV1103(需修改分辨率)、RV1106 | buildroo
 luckfox_pico_rtsp_opencv_capture| RV1103、RV1106 | buildroot | uclibc / glibc 
 luckfox_pico_rtsp_retinaface    | RV1103、RV1106 | buildroot | uclibc / glibc
 luckfox_pico_rtsp_retinaface_osd| RV1103、RV1106 | buildroot | uclibc / glibc
-luckfox_pico_rtsp_yolov5        | RV1106         | buildroot | uclibc / glibc
+luckfox_pico_rtsp_yolov5n        | RV1106         | buildroot | uclibc / glibc
 
 + **RV1103**：`Luckfox Pico` `Luckfox Pico Mini A` `Luckfpx Pico Miini B` `Luckfox Pico Plus`
 + **RV1106**：`Luckfox Pico Pro` `Luckfox Pico Max` `Luckfox Pico Ultra` `Luckfox Pico Ultra W` `Luckfox Pico Pi` `Luckfox Pico Pi W`
@@ -59,7 +59,7 @@ luckfox_pico_rtsp_yolov5        | RV1106         | buildroot | uclibc / glibc
     2) luckfox_pico_rtsp_opencv_capture
     3) luckfox_pico_rtsp_retinaface
     4) luckfox_pico_rtsp_retinaface_osd
-    5) luckfox_pico_rtsp_yolov5
+    5) luckfox_pico_rtsp_yolov5n
     Enter your choice [1-5]:
     ```
 
@@ -70,7 +70,7 @@ luckfox_pico_rtsp_yolov5        | RV1106         | buildroot | uclibc / glibc
     luckfox_pico_rtsp_opencv_capture_demo  
     luckfox_pico_rtsp_retinaface_demo
     luckfox_pico_rtsp_retinaface_osd_demo
-    luckfox_pico_rtsp_yolov5_demo 
+    luckfox_pico_rtsp_yolov5n_demo 
     ```
 + 将生成的部署文件夹完整上传到 Luckfox Pico 上 (可使用adb ssh等方式) ，板端进入文件夹运行
     ```

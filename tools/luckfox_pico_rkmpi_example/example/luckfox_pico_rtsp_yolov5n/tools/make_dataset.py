@@ -271,7 +271,7 @@ def main():
     print()
     print("  5. 开始训练 YOLOv5:")
     print(f"     cd /path/to/yolov5")
-    print(f"     python train.py --data {os.path.abspath(yaml_path)} --weights yolov5s.pt --epochs 100")
+    print(f"     python train.py --data {os.path.abspath(yaml_path)} --weights yolov5n.pt --epochs 100")
     print()
     print("  提示:")
     print("     - 每个类别至少标注 100-200 张，效果才好")

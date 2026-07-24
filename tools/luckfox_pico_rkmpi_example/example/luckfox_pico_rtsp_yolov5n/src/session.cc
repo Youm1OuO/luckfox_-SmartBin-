@@ -11,7 +11,7 @@
 // ============================================================================
 #include "session.h"
 #include "fridge_config.h"
-#include "yolov5.h"
+#include "yolov5n.h"
 
 #include <algorithm>
 #include <cmath>

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 
-#ifndef _RKNN_DEMO_YOLOV5_H_
-#define _RKNN_DEMO_YOLOV5_H_
+#ifndef _RKNN_DEMO_YOLOV5N_H_
+#define _RKNN_DEMO_YOLOV5N_H_
 
 #include "rknn_api.h"
 
@@ -47,10 +47,10 @@ typedef struct {
 #include "postprocess.h"
 
 
-int init_yolov5_model(const char* model_path, rknn_app_context_t* app_ctx);
+int init_yolov5n_model(const char* model_path, rknn_app_context_t* app_ctx);
 
-int release_yolov5_model(rknn_app_context_t* app_ctx);
+int release_yolov5n_model(rknn_app_context_t* app_ctx);
 
-int inference_yolov5_model(rknn_app_context_t* app_ctx,  object_detect_result_list* od_results);
+int inference_yolov5n_model(rknn_app_context_t* app_ctx,  object_detect_result_list* od_results);
 
-#endif //_RKNN_DEMO_YOLOV5_H_
+#endif //_RKNN_DEMO_YOLOV5N_H_

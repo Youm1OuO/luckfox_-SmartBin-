@@ -28,7 +28,7 @@
 
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
-#include "yolov5.h"
+#include "yolov5n.h"
 
 #include "opencv2/core/core.hpp"
 #include "opencv2/highgui/highgui.hpp"
@@ -192,9 +192,9 @@ int main(int argc, char *argv[]) {
 	rknn_app_context_t rknn_app_ctx;
 	object_detect_result_list od_results;
     int ret;
-	const char *model_path = "./model/yolov5.rknn";
+	const char *model_path = "./model/yolov5n.rknn";
     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
-	init_yolov5_model(model_path, &rknn_app_ctx);
+	init_yolov5n_model(model_path, &rknn_app_ctx);
 	printf("init rknn model success!\n");
 	init_post_process();
 
@@ -383,7 +383,7 @@ int main(int argc, char *argv[]) {
 			}
 			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data,
 			       model_width*model_height*3);
-			inference_yolov5_model(&rknn_app_ctx, &od_results);
+			inference_yolov5n_model(&rknn_app_ctx, &od_results);
 
 			// ============================================================
 			//  坐标映射：letterbox → 原图坐标
@@ -718,7 +718,7 @@ int main(int argc, char *argv[]) {
 
 	RK_MPI_SYS_Exit();
 
-    release_yolov5_model(&rknn_app_ctx);
+    release_yolov5n_model(&rknn_app_ctx);
 	deinit_post_process();
 
 	return 0;

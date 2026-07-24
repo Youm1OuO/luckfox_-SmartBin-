@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
-#include "yolov5.h"
+#include "yolov5n.h"
 
 namespace fridge {
 

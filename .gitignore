@@ -49,15 +49,15 @@ code/c/test.exe
 tools/arm-rockchip830-linux-uclibcgnueabihf/
 luckfox-pico/tools/linux/toolchain/
 
-# ========== vendor 化的 yolov5：排除训练数据集 / 运行输出 / 模型权重 ==========
-tools/yolov5/datasets/
-tools/yolov5/fridge_project/datasets
-tools/yolov5/runs/
-tools/yolov5/wandb/
-tools/yolov5/VOCdevkit/
+# ========== vendor 化的 yolov5n：排除训练数据集 / 运行输出 / 模型权重 ==========
+tools/yolov5n/datasets/
+tools/yolov5n/fridge_project/datasets
+tools/yolov5n/runs/
+tools/yolov5n/wandb/
+tools/yolov5n/VOCdevkit/
 # best.onnx 与 best.onnx.data 用户说要换掉，先排除
-tools/yolov5/fridge_stage_b/best.onnx
-tools/yolov5/fridge_stage_b/best.onnx.data
+tools/yolov5n/fridge_stage_b/best.onnx
+tools/yolov5n/fridge_stage_b/best.onnx.data
 
 # ========== vendor 化的 rknn_model_zoo：排除预编译第三方库 ==========
 tools/rknn_model_zoo/3rdparty/
@@ -112,7 +112,7 @@ tools/rknn-toolkit2/rknn-toolkit2/examples/functions/hybrid_quant/ssd_mobilenet_
 captures
 
 
-tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset
-tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset_raw
-tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset_old
-tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset_new
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/dataset
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/dataset_raw
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/dataset_old
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/dataset_new
