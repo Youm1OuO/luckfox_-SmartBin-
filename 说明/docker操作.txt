@@ -1,0 +1,34 @@
+场景 1：电脑刚开机，想进容器干活
+    # 在 WSL 终端
+    docker ps -a
+
+
+看到 luckfox_work 状态是 Exited（停止）。然后：
+    docker start luckfox_work
+    docker exec -it luckfox_work /bin/bash
+或者一步到位：
+    docker start -ai luckfox_work
+
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+
+
+场景 2：容器已经在跑，想再开一个 bash 进去（比如另起一个终端）
+    docker exec -it luckfox_work /bin/bash
+
+
+
+
+速查表
+    看所有容器	docker ps -a
+    看运行中的	docker ps
+    第一次创建并启动容器	docker run -it --name xxx -v ... image /bin/bash（只做一次！）
+    启动一个已停止的容器	docker start luckfox_work
+    进入运行中的容器	docker exec -it luckfox_work /bin/bash
+    启动 + 进入（合并）	docker start -ai luckfox_work
+    停止容器	docker stop luckfox_work
+    删除容器（不可恢复）	docker rm luckfox_work
+    在容器里退出	exit
+    看容器里改了哪些文件（不常用）	docker diff luckfox_work
