@@ -84,13 +84,13 @@
 第 2 帧：检测到手靠近苹果；苹果变成局部框 L_part。
 → 清空快照缓冲；
 → 创建 Track#1，bound_item_id=1；
-→ start_box=anchor_box=L；latest_box=L。
+→ start_box=anchor_box=L；proxy_box=L。
 
 第 3 帧：检测到手；苹果局部框移动到 M_part。
-→ 用 L_part 到 M_part 的位移更新 Track#1.latest_box；
+→ 用 L_part 到 M_part 的位移更新 Track#1.proxy_box；
 
 第 4 帧：检测到手；YOLO 看不到苹果。
-→ 用手框位移更新 Track#1.latest_box；
+→ 用手框位移更新 Track#1.proxy_box；
 
 第 5 帧：手离开；苹果出现在右侧 R。
 → 冻结 Track#1；开始新的无手快照缓冲。
@@ -165,7 +165,7 @@
 → 不更新 Track；只收集稳定快照的候选帧。
 
 阶段 B：有手
-→ 创建或更新 Track；不生成稳定快照；不修改库存。
+→ 创建或更新 Track；不生成快照；不修改库存。
 
 阶段 C：手离开后
 → Track 冻结；连续 N 帧无手后生成稳定快照；
@@ -192,6 +192,64 @@ ProcessStore {
 ```text
 previous_frame：只保留一帧，用于计算本帧相对上一帧的位移。
 no_hand_buffer：保留 N 帧，用于生成稳定快照。
+```
+
+一条 Track 中的关键框和字段不能混淆：
+
+```text
+last_yolo_box
+→ 上一次真正由 YOLO 识别到的物品框；
+→ 可以是局部小框；
+→ 用来计算“当前 YOLO 框相对上一帧 YOLO 框移动了多少”。
+→ 物品被手完全挡住、YOLO 看不到物品时，它为空。
+
+proxy_box
+→ 当前完整物品的位置代理框；
+→ 从 anchor_box（或 last_seen_box）开始；
+→ 被完全遮挡时，仍可按手位移继续移动。
+
+path
+→ 本次手操作中每次更新后的 proxy_box 副本列表；
+→ 记录完整经过路径，便于查看和作为未确认放下时的后备证据。
+
+release_box
+→ 已确认“物品已经放下”时的 proxy_box；
+→ 为空表示尚未确认最终放下位置。
+```
+
+它们的关系可以写成：
+
+```text
+每帧需要当前位置 → 读写 proxy_box。
+
+Track 每次更新 → 把当前 proxy_box 复制一份追加到 path。
+
+确认放下后 → 记录 release_box。
+
+最后判断整理 → 优先使用 release_box；没有 release_box 时才查看完整 path。
+```
+
+因此 `proxy_box` 和 `path` 不是重复：
+
+```text
+proxy_box = 当前这一刻的位置；
+path = 本次手操作的完整历史位置。
+```
+
+Track 的主要状态只有三个：
+
+```text
+TRACKING_VISIBLE
+→ 当前仍能由 YOLO 看见物品，可以完整可见或部分被手遮挡；last_yolo_box 必须有值；
+→ 物品框的连续位移可以更新 proxy_box。
+
+FULL_HAND_OCCLUDED
+→ 当前看不到物品；last_yolo_box 必须为空；
+→ proxy_box 只能跟随手位移移动。
+
+PLACED
+→ 已经有足够证据认为物品放下；release_box 有值；
+→ 不再让该 Track 跟随手移动。
 ```
 
 每帧固定先做：
@@ -232,7 +290,7 @@ no_hand_buffer：保留 N 帧，用于生成稳定快照。
 → 不创建 Track。
 ```
 
-`active_tracks` 此时若有，也是上一轮手操作留下的冻结证据；本帧不能修改它们的 `latest_box` 或 `path`。
+`active_tracks` 此时若有，也是上一轮手操作留下的冻结证据；本帧不能修改它们的 `proxy_box` 或 `path`。
 
 ### 3.2 前一帧有手、本帧没有手
 
@@ -249,397 +307,292 @@ no_hand_buffer：保留 N 帧，用于生成稳定快照。
 
 ## 4. 阶段 B：本帧检测到手
 
-一旦本帧有手：
-
-```text
-operation_pending = true；
-清空 no_hand_buffer；
-本帧不参与快照；
-InventoryDB 不修改。
-```
-
-之后分成两件事：
-
-```text
-第一件：当前 Detection 能否匹配已有 Track？
-第二件：剩余 Detection 或手附近库存物品，是否需要创建新 Track？
-```
-
-### 4.1 第一步：当前 Detection 先匹配已有 Track
-
-假设本帧检测到：
-
-```text
-Detection D：apple，box=M_part
-```
-
-程序先在 `active_tracks` 中找：
-
-```text
-cls_id 同为 apple 的 Track；
-```
-
-然后按 Track 上一次的状态选择比较参考框：
-
-```text
-Track 上一帧仍检测得到物品 (完全检测到或部分检测到)
-→ D.box 与 Track.last_detected_box 比较。
-
-Track 上一帧物品完全被挡住
-→ D.box 与 Track.latest_box 比较。
-```
-
-为什么参考框不同：
-
-```text
-last_detected_box 是同一种“YOLO 原始框”，
-适合和当前 YOLO 原始框比较。
-
-latest_box 是完整物品的估计位置，
-适合在物品重新出现时，判断它是否在预期位置附近。
-```
-
-比较仍使用同一个 `match_box` 思路：
-
-```text
-1. cls_id 必须相同；
-2. 中心距离必须足够近；
-3. 宽度差、长度差不能过大；
-4. 多个候选时，选择匹配分数最好的一个；
-5. 若最好的两个太接近、无法唯一确定，则本帧不强行匹配。
-```
-
-这里只是 Track 的帧间匹配，因此框大小阈值可以比“稳定快照与库存的原地匹配”宽一些：手部分遮挡会让 YOLO 框缩小，但不应轻易断开 Track。
-
-#### 若 D 匹配到 Track#1，怎么办？
-
-**不创建新 Track。** 只更新 Track#1。
-
-```text
-D → Track#1
-→ Track#1.bound_item_id 保持原样；
-→ Track#1 继续记录同一个物品的轨迹；
-```
-
-若上一帧 Track#1 也有物品 Detection：
+本帧一旦有手，固定先做：
 
 ```cpp
-object_delta = Center(D.box) - Center(track.last_detected_box);
+operation_pending = true;
+no_hand_buffer.clear();
+// 本帧不参与快照，InventoryDB 不修改
+```
 
-track.latest_box = Move(track.latest_box, object_delta);
-track.last_detected_box = D.box;
+然后依次执行下面三步。
+
+### 4.1 所有当前物品 Detection 先更新已有 Track
+
+这里要看所有当前物品 Detection，不只看手附近的物品。因为手可能已放下苹果、转去拿牛奶；苹果虽不在手附近，仍必须接回它原来的 Track。
+
+对本帧每个物品 Detection `D`，按下面的分支处理：
+
+```text
+1. 先从 active_tracks 中找 cls_id 与 D 相同的 Track。
+
+2. 对每一条候选 Track：(尝试匹配)
+
+   如果 track.state == TRACKING_VISIBLE： (物品仍可见，可能完整可见或部分被手挡)
+       用 D.box 与 track.last_yolo_box 比较。
+       主要看中心位置；宽高阈值可以宽松。
+
+   如果 track.state == FULL_HAND_OCCLUDED： (完全被手挡)
+       用 D.box 与 track.proxy_box 比较。
+       只要求 D 的中心在 proxy_box 内部或附近；
+       不要求局部小框与完整 proxy_box 宽高相同。
+
+   如果 track.state == PLACED：(手放开)
+       用 D.box 与 track.last_yolo_box 比较，确认这还是已放下的物品。
+       正常情况下不移动 proxy_box，也不让它重新跟随手。
+
+3. 如果没有任何 Track 匹配 D：(匹配不上)
+       D 暂时标记为“未匹配 Track”；
+       后面交给 4.2 查询库存、决定是否创建新 Track。
+
+4. 如果只有一条 Track 匹配 D：(匹配上, 一对一)
+       D 绑定这条 Track；
+       更新这条 Track；
+       不查库存，不创建新 Track。
+
+5. 如果多条 Track 都能匹配 D，且无法选出唯一最佳：(匹配上, 多对一)
+       不强行绑定；
+       D 暂时标记为“未匹配 Track”。
+```
+
+其中每个 Detection、每条 Track 在本帧最多只能匹配一次；“唯一最佳”表示多个候选中有明显最接近的一条。
+
+当第 4 步匹配成功时，更新方式按状态分三种：
+
+```text
+如果 track.state == TRACKING_VISIBLE：(之前【部分被手挡, 部分可见】, 现在可能【部分被手挡】, 也可能【手放开】)
+    object_delta = Center(D.box) - Center(track.last_yolo_box)
+    last_yolo_box = D.box
+    last_hand_box = 当前 hand_box
+
+    如果物品连续两帧位移很小，
+    且手已不再覆盖物品，
+    且 anchor_valid=true 时，D.box 的宽高与 anchor_box 大致相近：
+        state = PLACED      (之前【部分被手挡, 部分可见】, 现在可以确认【手放开】)
+        proxy_box 的中心校正为 D.box 的中心
+        proxy_box 的宽高保持原样（通常就是 anchor_box 的宽高）
+        release_box = proxy_box
+    否则：
+        proxy_box 按 object_delta 平移
+
+    把当前 proxy_box 追加到 path
+
+如果 track.state == FULL_HAND_OCCLUDED：(之前【被手挡完全挡住】, 现在可能【部分被手挡】, 也可能【手放开】)
+    说明物品刚从完全遮挡中重新出现
+    last_yolo_box = D.box
+    last_hand_box = 当前 hand_box
+    state = TRACKING_VISIBLE
+    本帧不计算 object_delta
+    不修改 proxy_box
+    把当前 proxy_box 追加到 path
+    下一帧再用相邻 YOLO 框的位移更新 proxy_box
+
+如果 track.state == PLACED：
+    object_delta = Center(D.box) - Center(track.last_yolo_box)
+
+    如果手重新覆盖该物品，且 object_delta 明显：
+        state = TRACKING_VISIBLE
+        release_box 置空
+        proxy_box 按 object_delta 平移
+        last_hand_box = 当前 hand_box
+        后续重新记录这一次移动和新的放下位置
+
+    last_yolo_box = D.box
+    把当前 proxy_box 追加到 path
+```
+
+原因：刚重新出现的 `D.box` 仍可能是局部小框，不能直接拿它改写完整物品的 `proxy_box`；且上一帧没有物品 YOLO 框，无法计算可靠的 `object_delta`。完全遮挡期间的位置变化，已经由 4.3 的手位移更新并记录到了 `path`。
+
+`state` 是 4.1 选择比较对象的主要依据；`last_yolo_box` 是否为空只用于保证状态没有写错：
+
+```text
+TRACKING_VISIBLE / PLACED → last_yolo_box 应有值；
+FULL_HAND_OCCLUDED        → last_yolo_box 应为空。
+```
+
+#### 放下是怎样确认的（简短例子）
+
+```text
+第 5 帧：手还在冰箱；苹果刚重新出现于右侧 R_part。
+→ state 从 FULL_HAND_OCCLUDED 变为 TRACKING_VISIBLE；
+→ 只恢复 last_yolo_box，不修改 proxy_box，也不立刻认定已经放下。
+
+第 6 帧：手已移向牛奶；苹果仍在 R，且与第 5 帧几乎没动。
+→ 苹果不再被手覆盖；
+→ 若 D.box 的宽高也接近 anchor_box：
+  state = PLACED；
+  proxy_box 的中心校正为 D.box 中心，宽高保持原样；
+  release_box = 校正后的 proxy_box（右侧 R）。
+
+第 7 帧：手继续移动或遮住牛奶。
+→ 苹果的 Track 保持 PLACED；不再跟随手移动。
+```
+
+### 4.2 剩余 Detection 再尝试创建新 Track
+
+只处理没有匹配到旧 Track、且位于手附近的 Detection。
+
+从库存中筛选：
+
+```text
+status = VISIBLE；
+cls_id 与 D 相同；
+还没有被 active Track 绑定；
+位置也在 hand_box 附近。
+```
+
+比较 D 与库存物品时：
+
+```text
+优先参考 last_seen_box；
+anchor_valid=true 时也参考 anchor_box；
+D 可能是局部小框，可用“交集 / 较小框面积”很高的包含关系。
+```
+
+```text
+唯一匹配一个库存 item
+→ 创建 Track，并绑定该 item_id。
+
+没有匹配或多个都无法区分
+→ 不创建整理用的正式 Track，先略过。
+```
+
+创建时：
+
+```cpp
+track.bound_item_id = item.item_id;
+track.start_box = item.anchor_valid ? item.anchor_box : item.last_seen_box;
+track.proxy_box = track.start_box;
+track.state = TRACKING_VISIBLE;
+track.last_yolo_box = D.box;
 track.last_hand_box = current_hand_box;
+track.path = [track.start_box];
+track.release_box = 空;
 ```
 
-然后：
+若 `previous_frame` 中有对应物品框，可立即用“上一帧框 → 当前 D”的位移补上手刚进入的第一段移动，再把新的 `proxy_box` 追加到 `path`；没有则把当前 `proxy_box` 再追加一次，从下一帧开始计算物品位移。
+
+### 4.3 没有 Detection 接上的 Track：按完全遮挡处理
+
+本帧可能看得到牛奶，却看不到已被手遮住的苹果。因此，对每条本帧没有被 Detection 接上的旧 Track：
+
+```text
+若手仍靠近该 Track 的 proxy_box
+→ 认为物品可能被手完全遮挡；
+→ 用手位移更新 proxy_box。
+```
 
 ```cpp
-if (Distance(track.latest_box, track.path.back()) > path_step_threshold) {
-    track.path.push_back(track.latest_box);
+if (track.state == PLACED) {
+    track.release_box.reset();  // 已再次被手操作，旧放下位置失效
+    track.last_hand_box = current_hand_box;
+    // 刚重新拿起的第一帧没有可靠 hand_delta，不移动 proxy_box
+} else {
+    hand_delta = Center(current_hand_box) - Center(track.last_hand_box);
+    track.proxy_box = Move(track.proxy_box, hand_delta);
+    track.last_hand_box = current_hand_box;
 }
+
+track.state = FULL_HAND_OCCLUDED;
+track.last_yolo_box.reset();  // 已没有可连续比较的物品 YOLO 框
+track.path.push_back(track.proxy_box);
+
+// last_yolo_box 只能保存物品框，绝不能写成手框
 ```
 
-`latest_box` 始终是完整物品的估计框；D 的小框只用于计算位移，不能直接覆盖 `latest_box`。
+这里不再按“距离是否足够远”筛掉路径点：一次手操作的帧数有限，`path` 直接保留每次更新后的完整轨迹，方便查看。手离开后 Track 会冻结，不会继续追加手离开冰箱的路线。
 
-若 Track#1 上一帧是“完全遮挡”：
+然后检查库存中手附近、尚未有 active Track 的 VISIBLE 物品：
 
 ```text
-本帧 D 重新出现；
-先令 track.last_detected_box = D.box；
-本帧不使用很久以前的旧检测框计算 object_delta；
-下一帧再恢复 Detection 位移更新。
+若该物品当前没有 Detection，也没有 Track
+→ 创建候选 Track。
 ```
 
-### 4.2 第二步：当前 Detection 没有匹配到 Track
-
-未匹配 Detection 不代表它一定是新物品。它可能是：
+这就是“手一进来就完全盖住物品”的情况。此类候选 Track 初始化为：
 
 ```text
-1. 手刚碰到的原有库存物品，尚未创建 Track；
-2. 手新放入的物品；
-3. 同类物品太多，本帧无法确定它属于哪条 Track。
+state = FULL_HAND_OCCLUDED；
+proxy_box = anchor_box（没有 anchor_box 时用 last_seen_box）；
+last_yolo_box = 空；
+path = [proxy_box]；
+release_box = 空。
 ```
 
-因此，对每个“未匹配的 D”，只在 D 位于手附近时，再查询库存：
+第一帧只记录 `last_hand_box`，下一帧才有手位移可计算。
 
-```text
-从 InventoryDB 取同 cls_id、status=VISIBLE 的库存物品；
-比较 D.box 与 item.last_seen_box；
-若 anchor_valid=true，也参考 item.anchor_box；
-同时要求 item 的位置在手附近。
-```
+手附近有多个可见库存物品时，可以都建立候选 Track；以后只有路径与稳定快照新位置唯一对应时，才确认哪一个整理。
 
-结果分三种：
+`OCCLUDED` 库存物品通常不参与 Track 创建；它们主要在稳定快照阶段处理“重新可见”。
 
-```text
-只有一个库存 item 匹配
-→ 创建绑定该 item_id 的新 Track。
+## 5. 物品是否移动、快照如何使用 Track
 
-一个都不匹配
-→ D 可能是新放入物品；创建 bound_item_id=空 的临时 Track，
-  或仅保留 Detection，等稳定快照再决定是否入库。
-
-多个库存 item 都匹配
-→ 身份不确定；不强行绑定到某一个 item_id。
-  可以创建不绑定的候选 Track，但它之后不能单独证明整理。
-```
-
-### 4.3 手附近没有物品 Detection：手一开始就完全遮挡
-
-这是最容易漏掉的情况。
-
-本帧只有手框，没有苹果 Detection：
-
-```text
-手框 H；
-InventoryDB 中 item_id=1 的 anchor_box 正好在 H 附近。
-```
-
-此时仍可创建：
+Track 自己只记录“看起来移动过”：
 
 ```cpp
-Track#1 {
-    bound_item_id = 1;
-    start_box = item#1.anchor_box;
-    latest_box = item#1.anchor_box;
-    last_hand_box = H;
-    path = [item#1.anchor_box];
-}
+Distance(Center(track.proxy_box), Center(track.start_box)) > move_threshold
 ```
 
-第一帧没有上一只手框可比较，因此不移动 `latest_box`；从下一帧开始，若手继续移动，才使用手框位移。
+这不等于已经确认整理。
 
-若手附近有两个同类库存物品：
+手离开后，Track 冻结。连续 N 帧无手、稳定 Detection 生成 `current_stable_snapshot`。快照与库存比较时：
 
 ```text
-可以创建两个候选 Track；
-后面只有某一条路径能与稳定快照中的新位置唯一对应时，
-才会确认它是整理。
+库存中的旧物品 A 没有在旧位置直接匹配到；
+当前快照出现新位置物品 B；
+
+如果 A 所绑定 Track 有 release_box：
+    若 B.box 与 release_box 唯一匹配：
+        确认 A 整理到了 B。
+
+    若 B.box 不匹配 release_box，或无法唯一匹配：
+        不再退回使用 path；
+        说明“已确认的放下位置”与当前快照互相矛盾，
+        按普通拿出、放入或遮挡流程处理。
+
+如果没有 release_box：
+    说明手离开得太快，尚未来得及确认放下；
+    若 B.box 与 Track.path 中某个 proxy_box 历史点唯一匹配：
+        仍可确认 A 整理到了 B。
 ```
 
-## 5. 当前帧没有 Detection，但已有 Track 怎么办
-
-遍历所有本帧没有被 Detection 匹配到的活动 Track：
+确认后：
 
 ```text
-若手仍靠近 Track.latest_box，且该 Track 在本次手操作中已经激活
-→ 认为物品可能被手完全挡住；
-→ 使用手框位移更新它。
-
-若手已经明显远离 Track.latest_box
-→ 不再让该 Track 跟随手；
-→ 暂时冻结它已有的路径，等待物品重新出现或手离开。
+A.item_id 保持不变；
+A.anchor_box 更新为与 B 匹配的 release_box 或 Track 路径点；
+A.last_seen_box 更新为 B.box。
 ```
 
-使用手框位移时：
+若没有唯一 Track 证据，就按遮挡、拿出或放入的普通库存流程处理。
 
-```cpp
-hand_delta = Center(current_hand_box) - Center(track.last_hand_box);
-track.latest_box = Move(track.latest_box, hand_delta);
-track.last_hand_box = current_hand_box;
-
-if (Distance(track.latest_box, track.path.back()) > path_step_threshold) {
-    track.path.push_back(track.latest_box);
-}
-```
-
-这个“手仍靠近 Track.latest_box”的条件很重要：物品放下后，手继续在冰箱内移动去拿另一个物品时，不应继续把第一件物品拖着走。
-
-若物品放下后重新被 YOLO 检测到，后续 Track 会自动改回“使用物品 Detection 位移”；此后即使手继续移动，物品 Detection 没有移动，Track 也不会再向手的方向移动。
-
-## 6. 如何知道“物品被移动了”
-
-Track 层面只需要判断：它的完整估计框是否离开起点。
-
-```cpp
-move_distance = Distance(Center(track.latest_box), Center(track.start_box));
-
-track.has_significant_motion =
-    move_distance > move_threshold;
-```
-
-`move_threshold` 应大于正常 YOLO 抖动。例如用物品起始框对角线的一小部分作为阈值；具体数值之后用实际视频调。
-
-这个标记只表示：
+## 6. 简短逐帧例子：苹果从左边移到右边
 
 ```text
-本次手操作中，这条 Track 看起来确实移动过。
+库存：item_id=1 的苹果在 L；没有 active Track。
+
+第 1 帧，无手：苹果 L；进入快照缓冲。
+
+第 2 帧，有手：苹果 L_part。
+→ 没有旧 Track；L_part 在手附近；
+→ 与库存 item_id=1 唯一对应；创建 Track#1。
+
+第 3 帧，有手：苹果 M_part。
+→ M_part 先匹配 Track#1.last_yolo_box；
+→ 匹配成功，更新 Track#1.proxy_box；把当前位置追加到 path；不新建 Track。
+
+第 4 帧，有手：看不到苹果。
+→ state=FULL_HAND_OCCLUDED；
+→ 用手位移更新 Track#1.proxy_box；last_yolo_box 置空；当前位置追加到 path。
+
+第 5 帧，有手：苹果 R_part 重新出现。
+→ 用 R_part 与 Track#1.proxy_box 接回 Track；
+→ state=TRACKING_VISIBLE；last_yolo_box=R_part；本帧不算物品位移；当前位置追加到 path。
+
+第 6 帧，无手：冻结 Track#1，开始无手快照缓冲。
+
+后续连续 N 帧无手稳定：生成快照；
+此时尚未来得及确认 release_box；
+快照苹果在 R 与 Track#1.path 唯一对应；
+→ 确认 item_id=1 从 L 整理到 R。
 ```
-
-它**不等于**库存已经发生整理。
-
-真正确认整理仍必须满足：
-
-```text
-1. 库存 item A 在当前稳定快照中，没有在旧位置直接匹配到；
-2. 当前稳定快照中存在新位置物品 B；
-3. A 绑定的 Track.path 中，至少一个完整估计框匹配 B.box；
-4. A、B、Track 的对应关系唯一。
-```
-
-满足后才：
-
-```text
-保留 A.item_id；
-把 A.anchor_box 更新到与 B 匹配的 Track 路径点；
-把 A.last_seen_box 更新为 B.box；
-```
-
-## 7. 快照在什么时候生成（简要）
-
-Track 只在有手阶段更新。手离开后：
-
-```text
-Track 冻结；
-连续 N 帧无手、Detection 稳定；
-这些 Detection 投票融合为 current_stable_snapshot。
-```
-
-快照生成的 N 帧中：
-
-```text
-不创建新 Track；
-不更新旧 Track；
-不修改库存；
-```
-
-快照生成后才：
-
-```text
-current_stable_snapshot vs InventoryDB；
-若出现“旧位置 A 没有、新位置 B 出现”，
-再查询 A 的冻结 Track.path，判断是否整理。
-```
-
-## 8. 一个完整的逐帧例子
-
-库存初始状态：
-
-```text
-item_id=1：苹果，anchor_box=L，last_seen_box=L，VISIBLE
-item_id=2：牛奶，anchor_box=R，last_seen_box=R，VISIBLE
-active_tracks：空
-```
-
-### 第 1 帧：无手
-
-```text
-YOLO：苹果 L，牛奶 R；手：无。
-→ 加入 no_hand_buffer；
-→ 不创建 Track；
-→ previous_frame = 本帧。
-```
-
-### 第 2 帧：手进入苹果附近，苹果仍部分可见
-
-```text
-YOLO：苹果 L_part，牛奶 R；手：H。
-```
-
-处理：
-
-```text
-1. 清空 no_hand_buffer；
-2. active_tracks 为空，因此苹果 L_part 匹配不到已有 Track；
-3. 查询库存：同类苹果 item_id=1 在手 H 附近；
-4. 创建 Track#1：
-   bound_item_id=1；
-   start_box=L；latest_box=L；
-   last_detected_box=第 1 帧苹果框 L；
-   last_hand_box=H；path=[L]；
-5. 用第 1 帧 L 到第 2 帧 L_part 的位移，更新 Track#1.latest_box；
-6. previous_frame = 第 2 帧。
-```
-
-### 第 3 帧：苹果继续向右，仍有局部框
-
-```text
-YOLO：苹果 M_part，牛奶 R；手：H2。
-```
-
-处理：
-
-```text
-1. 苹果 M_part 先匹配 Track#1；
-2. 匹配成功，不创建新 Track；
-3. object_delta = Center(M_part) - Center(L_part)；
-4. latest_box 按 object_delta 平移；
-5. path 追加新的完整估计框；
-6. previous_frame = 第 3 帧。
-```
-
-### 第 4 帧：苹果完全被挡住
-
-```text
-YOLO：只有牛奶 R；手：H3。
-```
-
-处理：
-
-```text
-1. 本帧没有 Detection 匹配 Track#1；
-2. 手 H3 仍在 Track#1.latest_box 附近；
-3. hand_delta = Center(H3) - Center(H2)；
-4. latest_box 按 hand_delta 平移；
-5. path 追加新的完整估计框；
-```
-
-### 第 5 帧：苹果在右侧露出，手仍在
-
-```text
-YOLO：苹果 R_part，牛奶 R；手：H4。
-```
-
-处理：
-
-```text
-1. 苹果 R_part 匹配 Track#1 的 latest_box；
-2. 因为上一帧完全遮挡，本帧先保存 last_detected_box=R_part；
-3. 不拿 R_part 和第 3 帧 L_part 直接算位移；
-4. Track#1 保留在右侧的 latest_box。
-```
-
-### 第 6 帧：手离开
-
-```text
-YOLO：苹果 R，牛奶 R；手：无。
-```
-
-处理：
-
-```text
-1. 冻结 Track#1；
-2. 清空 no_hand_buffer；
-3. 第 6 帧作为新的无手缓冲第 1 帧；
-4. 不更新 InventoryDB。
-```
-
-### 第 7 ～ N 帧：无手且稳定
-
-```text
-YOLO：苹果 R，牛奶 R；手：无。
-```
-
-处理：
-
-```text
-持续填充 no_hand_buffer；
-Track#1 不更新；
-连续 N 帧后生成稳定快照。
-```
-
-### 稳定快照比较库存
-
-```text
-库存 item_id=1 仍在 L；
-快照中苹果 B 在 R；
-苹果 B 与 item_id=1 的旧位置 L 不直接匹配；
-但 B 与冻结 Track#1.path 中右侧估计框匹配；
-→ 确认 item_id=1 整理到 R；
-```
-
-最后一次性提交库存，再清空 `active_tracks`。
-
-# -------------------------------------------------------------------
-# -------------------------------------------------------------------
-# -------------------------------------------------------------------
