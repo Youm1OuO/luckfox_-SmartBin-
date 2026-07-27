@@ -1,6 +1,10 @@
 // ============================================================================
 //  tracker.h
-//  ByteTrack-Lite 多目标跟踪器
+//  Detection 数据结构 + 历史 ByteTrack-Lite 实现
+//
+//  当前冰箱库存业务不再运行 ByteTrackLite，而使用 SessionManager 中更轻量的
+//  OperationTrack。这里保留 Detection（YOLO 输出的通用结构）以及旧实现，
+//  便于回看历史；CMake 已将 tracker.cc 排除出当前 yolov5n 目标。
 //
 //  核心思想（来自 ByteTrack 论文，ECCV 2022）：
 //    1. 高分检测（score >= HIGH_SCORE_THRESH）先和现有 track 做匹配；

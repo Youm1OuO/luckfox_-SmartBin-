@@ -1,41 +1,33 @@
 // ============================================================================
 //  session.h
-//  会话管理器 — 新业务流程6：统一快照裁决 + OperationContext 辅助证据
+//  会话业务层：库存表 + 单份稳定快照 + 轻量 OperationTrack
 //
-//  核心职责：
-//    1. baseline_snapshot -> stable_snapshot 的单次差异裁决
-//    2. OperationContext 记录手、HELD代理轨迹、ByteTrack移动证据
-//    3. relocation_match 优先于普通出库/入库，避免整理被拆成出库+入库
-//    4. low_confidence_relocation 进入跨快照 PendingRelocation
-//    5. 手不直接产生库存事件，只作为统一裁决的辅助证据
-//
-//  所有操作实时更新进本地库存清单，身份匹配也基于库存清单进行
+//  正式库存只由稳定快照提交；OperationTrack 只在一轮开门期间保存，唯一
+//  用途是证明“旧位置的物品和新位置的物品是同一次整理”。
 // ============================================================================
 #ifndef __FRIDGE_SESSION_H
 #define __FRIDGE_SESSION_H
 
-#include <vector>
 #include <map>
-#include <set>
-#include <opencv2/core.hpp>
-#include "tracker.h"
-#include "snapshot.h"
+#include <vector>
+
 #include "inventory.h"
+#include "snapshot.h"
 
 namespace fridge {
 
-// 出入库事件类型
-enum class EventKind { IN, OUT, MOVED };
+// IN / OUT / MOVED 会上报云端；OCCLUDED / REVEALED 只用于本地终端和库存表，
+// 因为它们表示冰箱内的可见状态变化，不是实际出入库。
+enum class EventKind { IN, OUT, MOVED, OCCLUDED, REVEALED };
 
-// 一条出入库事件
 struct InventoryEvent {
     EventKind kind;
-    int       item_id;
-    int       cls_id;
-    BBox      box;          // IN/OUT: 事件框；MOVED: 整理后的框
-    BBox      before_box;   // MOVED: 整理前的框
-    BBox      after_box;    // MOVED: 整理后的框
-    float     score;
+    int item_id;
+    int cls_id;
+    BBox box;          // IN / OUT 的位置；MOVED 时等于 after_box
+    BBox before_box;   // 仅 MOVED 使用
+    BBox after_box;    // 仅 MOVED 使用
+    float score;
 };
 
 struct SettlementResult {
@@ -43,13 +35,12 @@ struct SettlementResult {
     std::vector<InventoryEvent> events;
 };
 
-// 快照状态机阶段
-enum class SnapState {
-    IDLE,        // 初始化阶段（等待第一份有效快照）
-    COMPARE,     // 正常对比阶段
+// process_frame 的返回值：主循环据此知道这一帧是否刚形成稳定快照。
+struct FrameProcessResult {
+    bool stable_snapshot_generated = false;
+    SettlementResult settlement;
 };
 
-// 开门初始化状态：后台请求和第一份无手稳定快照是两个独立阶段
 enum class InitState {
     WAIT_BACKEND,
     WAIT_FIRST_STABLE_SNAPSHOT,
@@ -62,215 +53,106 @@ enum class BackendStatus {
     NO_TRUSTED_BACKEND,
 };
 
-enum class RelocationDecision {
-    NO_RELOCATION,
-    LOW_CONFIDENCE,
-    CONFIRMED,
+// 这不是 tracker.h 的 ByteTrack Track。它没有全局身份，也不会上传后台。
+enum class OperationTrackState {
+    TRACKING_VISIBLE,       // YOLO 还能看到物品（完整或局部框）
+    FULL_HAND_OCCLUDED,     // YOLO 看不到物品，proxy_box 跟随手移动
+    PLACED,                 // 已确认放下，release_box 可以作为整理证据
 };
 
-struct TrackEvidence {
-    int track_id = -1;
+// Candidate 只记录“手可能正在碰这个物品”，本身不能作为整理证据。
+// 只有确认物品框或手代理真正移动后，才会升级成 OperationTrack。
+enum class OperationCandidateState {
+    VISIBLE_CANDIDATE,          // YOLO 仍能看到物品
+    FULL_HAND_OCCLUDED_CANDIDATE, // 手覆盖原位置，YOLO 暂时看不到物品
+};
+
+struct OperationCandidate {
+    int bound_item_id = -1;
     int cls_id = -1;
-    int associated_item_id = -1;
-    BBox start_box;
-    BBox end_box;
-    int start_frame_id = 0;
-    int end_frame_id = 0;
-    int sample_count = 0;
-    bool occluded_by_hand = false;
-    float confidence = 0.0f;
+
+    BBox source_box;            // Candidate 建立时库存中的可靠位置
+    BBox last_yolo_box;         // 最近一次真实 YOLO 框（可为局部框）
+    bool has_last_yolo_box = false;
+    BBox start_hand_box;        // 完全遮挡时，手刚覆盖物品的位置
+    BBox last_hand_box;
+    bool has_last_hand_box = false;
+    OperationCandidateState state = OperationCandidateState::VISIBLE_CANDIDATE;
 };
 
-struct HeldProxyEvidence {
-    int item_id = -1;
-    int original_object_track_id = -1;
-    int held_by_hand_track_id = -1;
-    BBox last_visible_box;
-    BBox hand_bbox_at_hold_start;
-    std::vector<BBox> proxy_boxes;
-    int held_start_frame_id = 0;
-    int held_end_frame_id = 0;
-    float confidence = 0.0f;
-};
+struct OperationTrack {
+    int track_id = -1;          // 仅本次开门会话内自增
+    int bound_item_id = -1;     // 引用 InventoryItem.item_id
+    int cls_id = -1;
 
-struct OperationContext {
-    int context_id = 0;
-    int baseline_snapshot_id = 0;
-    bool hand_seen = false;
-    int hand_frame_count = 0;
-    bool hand_long_present = false;
-    std::set<int> hand_track_ids;
-    std::map<int, int> candidate_held_items;
-    std::set<int> confirmed_held_items;
-    std::vector<HeldProxyEvidence> held_proxy_evidences;
-    std::map<int, TrackEvidence> active_track_evidences;
-    std::set<int> moving_tracks;
-    std::set<int> moved_item_candidates;
-    int unstable_frame_count = 0;
-    int created_frame_id = 0;
-    int updated_frame_id = 0;
+    BBox start_box;             // 从 anchor_box（或 last_seen_box）复制的起点
+    BBox proxy_box;             // 当前完整物品位置的代理框
+    BBox last_yolo_box;         // 上一次真实 YOLO 物品框，允许是局部框
+    bool has_last_yolo_box = false;
+    BBox last_hand_box;
+    bool has_last_hand_box = false;
 
-    void reset(int new_context_id, int new_baseline_snapshot_id, int frame_id);
-};
-
-struct PendingRelocation {
-    int pending_id = 0;
-    int item_id_A = -1;
-    int class_id = -1;
-    BBox old_bbox;
-    BBox candidate_new_bbox;
-    VotingItem snapshot_object_B;
-    float reid_score = 0.0f;
-    float evidence_score = 0.0f;
-    int created_snapshot_id = 0;
-    int last_checked_snapshot_id = 0;
-    int stable_count = 0;
-    int expire_after_stable_count = 2;
+    std::vector<BBox> path;     // 每次 Track 更新后的 proxy_box，全程保留
+    BBox release_box;           // 确认放下位置
+    bool has_release_box = false;
+    OperationTrackState state = OperationTrackState::TRACKING_VISIBLE;
 };
 
 class SessionManager {
 public:
     SessionManager();
 
-    // ===== 主接口 =====
-
-    // 开门：开始一轮新会话，等待后台库存或首个无手稳定快照
     void start_new_session(long long time_ms = 0);
-
-    // 初始化（开门时从后台获取库存）
-    // authoritative_empty=true 表示后台明确知道库存为空；默认空列表不可信。
     void init_from_backend(const std::vector<InventoryItem>& items,
                            bool authoritative_empty = false);
-
-    // 后台失败、超时、未接入或返回非权威空列表时调用
     void mark_backend_unavailable();
-
-    // 关门：冻结本轮库存，清理未确认的跨快照证据
     void finish_session(long long time_ms = 0);
 
-    // 每帧调用：更新 OperationContext
-    // hand_boxes: 当前帧所有手的bbox
-    // tracks: 当前帧ByteTrack输出的所有track
-    // frame_id: 当前帧号
-    // time_ms: 当前时间戳（毫秒）
-    // 返回：保留兼容主循环；当前不会直接产生库存事件
-    SettlementResult update_hand(const std::vector<BBox>& hand_boxes,
-                                 const std::vector<Track>& tracks,
-                                 int frame_id, long long time_ms);
+    // 每一帧唯一的业务入口。
+    // food_detections 不含手；hand_boxes 是已经通过业务阈值的手框。
+    FrameProcessResult process_frame(const std::vector<Detection>& food_detections,
+                                     const std::vector<BBox>& hand_boxes,
+                                     int frame_id, long long time_ms);
 
-    // 推入一份快照（由SnapshotBuffer生成）
-    // frame: 当前帧图像（用于颜色比较）
-    // 返回：事件结果
-    SettlementResult push_snapshot(const Snapshot& snap, const cv::Mat& frame);
-
-    // ===== 查询接口 =====
     bool has_backend() const { return backend_status_ == BackendStatus::TRUSTED; }
     bool ready() const { return init_state_ == InitState::READY; }
+    bool hand_present() const { return hand_present_; }
+    int no_hand_streak() const { return no_hand_streak_; }
     const InventoryDB& inventory() const { return inventory_; }
     InventoryDB& inventory() { return inventory_; }
+    const std::vector<OperationTrack>& operation_tracks() const { return tracks_; }
 
-    // ===== 手状态信息 =====
-    bool hand_present() const { return hand_present_; }
-    int  no_hand_streak() const { return no_hand_streak_; }
+    // 终端调试用：用紧凑表格展示当前正式库存（不显示临时 OUT 记录）。
+    void print_inventory() const;
 
 private:
-    // ---- 快照状态机（4变量：snap1/contrast/current + has_snap1） ----
-    SnapState snap_state_;
-    Snapshot snap1_;          // 基准快照（用于对比的"快照1"）
-    Snapshot contrast_;       // 稳定性检测基准
-    Snapshot current_;        // 当前快照
-    bool has_snap1_;          // snap1_ 是否有效
+    void update_tracks_while_hand_present(const std::vector<Detection>& food_detections,
+                                          const std::vector<BBox>& hand_boxes,
+                                          int frame_id);
 
-    // ---- 手部显示状态（仅用于 UI / OSD，不直接裁决库存） ----
+    void initialize_from_snapshot(const Snapshot& snapshot);
+    SettlementResult settle_snapshot(const Snapshot& snapshot);
+    void refresh_visible_items_without_operation(const Snapshot& snapshot);
+
+    int find_unique_inventory_binding(const Detection& detection,
+                                      const std::vector<BBox>& hand_boxes) const;
+    bool item_matches_snapshot(const InventoryItem& item,
+                               const VotingItem& observed) const;
+    bool item_is_bound_to_operation(int item_id) const;
+
+    InventoryDB inventory_;
+    SnapshotBuffer no_hand_buffer_;
+    std::vector<OperationTrack> tracks_;
+    std::vector<OperationCandidate> candidates_;
+
+    int next_operation_track_id_;
+    bool operation_pending_;
     bool hand_present_;
     int no_hand_streak_;
-
-    // ---- 操作上下文与待确认整理 ----
-    OperationContext operation_context_;
-    int next_context_id_;
-    std::vector<PendingRelocation> pending_relocations_;
-    int next_pending_id_;
-
-    // ---- 库存 ----
-    InventoryDB inventory_;
-    BackendStatus backend_status_;
-    InitState init_state_;
-    bool inventory_initialized_;                  // 库存是否已初始化（防止重复初始化）
-    std::vector<InventoryItem> backend_items_;
-
-    // ---- 时间 ----
     long long current_time_ms_;
     long long session_start_time_ms_;
-    bool first_empty_grace_logged_;
-
-    // ---- 辅助方法 ----
-
-    // 初始化时拍第一份快照（匹配后台库存或直接用快照初始化）
-    void init_snapshot(const Snapshot& snap, const cv::Mat& frame);
-
-    // 判断两份快照是否"差不多"（大部分物品都匹配上了）
-    bool snapshots_similar(const Snapshot& a, const Snapshot& b);
-
-    // baseline vs stable 的统一差异裁决（更新库存）
-    SettlementResult compare_snapshots(const Snapshot& snap2, const cv::Mat& frame);
-
-    // 重置快照状态机（门状态/外部需要重新建立 baseline 时调用）
-    void reset_snap_state();
-
-    // 每轮 stable diff 完成后重建 OperationContext
-    void reset_operation_context(int baseline_snapshot_id, int frame_id);
-
-    // 每帧收集手、HELD代理、ByteTrack移动证据
-    void update_operation_context(const std::vector<BBox>& hand_boxes,
-                                  const std::vector<Track>& tracks,
-                                  int frame_id);
-
-    int find_inventory_item_strict(const BBox& box, int cls_id,
-                                   bool include_out) const;
-    int find_inventory_item_relaxed(const BBox& box, int cls_id,
-                                    bool include_out) const;
-    int find_inventory_item_for_track(const Track& track) const;
-    int find_best_hand_track_id(const BBox& hand_box,
-                                const std::vector<Track>& tracks) const;
-    int find_original_object_track_id(int item_id) const;
-
-    float reid_score(const VotingItem& a, const VotingItem& b) const;
-    float relocation_evidence_score(int item_id,
-                                    const BBox& from,
-                                    const BBox& to) const;
-    RelocationDecision relocation_match(int item_id,
-                                        const VotingItem& a,
-                                        const VotingItem& b,
-                                        float reid,
-                                        float second_reid,
-                                        float* evidence_score) const;
-    void process_pending_relocations(const Snapshot& snap2,
-                                     SettlementResult& result,
-                                     std::set<int>& reserved_snap2_indices,
-                                     std::set<int>& protected_occluded_item_ids);
-    bool apply_relocation_visibility_changes(
-        int moved_item_id,
-        const BBox& old_box,
-        const VotingItem& new_object,
-        const Snapshot& snap2,
-        const std::vector<int>& disappeared_indices,
-        const std::vector<int>& appeared_indices,
-        const std::vector<int>& baseline_item_ids,
-        std::set<int>& consumed_disappeared_indices,
-        std::set<int>& consumed_appeared_indices,
-        const std::set<int>& reserved_snap2_indices,
-        std::set<int>& protected_occluded_item_ids,
-        bool allow_reveal);
-
-    // 严格身份匹配（5条件，含颜色，frame为空时跳过颜色检查）
-    bool match_strict(const BBox& a, int cls_a, const BBox& b, int cls_b,
-                      const cv::Mat& frame);
-
-    // 颜色差异（16x16 resize + 平均RGB差）
-    float color_diff(const cv::Mat& frame, const BBox& a, const BBox& b);
-
-    // 打印库存
-    void print_inventory();
+    InitState init_state_;
+    BackendStatus backend_status_;
 };
 
 }  // namespace fridge

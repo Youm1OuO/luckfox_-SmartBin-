@@ -58,6 +58,17 @@ find_package(Threads REQUIRED)
 
 set(SRC_DIR "${EXAMPLE_DIR}/src")
 file(GLOB SRC_FILES "${SRC_DIR}/*.cc")
+# 当前冰箱业务使用 SessionManager::OperationTrack；旧 tracker.cc 只保留
+# Detection 数据结构和历史实现，不再进入 yolov5n 可执行文件。
+if("${EXAMPLE_NAME}" STREQUAL "luckfox_pico_rtsp_yolov5n")
+    # file(GLOB) 返回的路径格式会随 CMake 调用位置而变化；逐项判断，
+    # 避免相对路径 / 绝对路径不一致而导致旧 tracker.cc 仍被编译。
+    foreach(SRC_FILE ${SRC_FILES})
+        if("${SRC_FILE}" MATCHES "tracker\\.cc$")
+            list(REMOVE_ITEM SRC_FILES "${SRC_FILE}")
+        endif()
+    endforeach()
+endif()
 add_executable(${PROJECT_NAME} ${SRC_FILES})
 
 add_compile_options(-g -Wall

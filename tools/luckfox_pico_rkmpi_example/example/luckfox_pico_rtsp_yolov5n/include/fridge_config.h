@@ -36,7 +36,7 @@ inline bool is_food(int cls_id) {
 //  分三层：
 //    1. YOLO_CANDIDATE_SCORE_THRESH：RKNN 原始输出的粗筛，低一点，避免过早丢候选。
 //    2. YOLO_OBJECT_SCORE_THRESH / YOLO_HAND_SCORE_THRESH：postprocess 最终输出阈值。
-//    3. 业务层手阈值：HAND_SNAPSHOT_BLOCK_*，只用于决定是否阻塞快照。
+//    3. 业务层手阈值：HAND_CONTEXT_SCORE_THRESH；检测到就停止稳定快照。
 // =========================================================================
 constexpr float YOLO_CANDIDATE_SCORE_THRESH = 0.01f;
 constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.25f;    // 物品的阈值
@@ -163,7 +163,7 @@ constexpr int         HEARTBEAT_INTERVAL_SEC = 30;             // 心跳间隔�
 constexpr bool INFER_INPUT_BGR2RGB = false;
 
 // =========================================================================
-//  ByteTrack-Lite 跟踪器参数
+//  历史 ByteTrack-Lite 参数（当前 yolov5n 目标不会编译 tracker.cc）
 // =========================================================================
 // 高分检测阈值。score >= HIGH_SCORE_THRESH 的 detection 进入第一轮匹配，
 // score < HIGH_SCORE_THRESH 但 >= LOW_SCORE_THRESH 的 detection 进入第二轮。
@@ -189,46 +189,15 @@ constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 // =========================================================================
 
 // =========================================================================
-//  新业务流程6：严格原位身份匹配阈值
-// -------------------------------------------------------------------------
-//  判断"这个新检测到的东西，是不是库存里那个旧东西"。
-//  原位匹配只用于判断"位置基本没变"：
-//    1. 类别相同
-//    2. 中心距离 < IDENTITY_CENTER_DIST
-//    3. 面积比差异 < IDENTITY_AREA_RATIO
-//    4. IoU > IDENTITY_IOU_THRESH
-//  注意：整理/移动不允许只靠这里的外观相似直接确认。
+//  连续无手稳定快照
 // =========================================================================
-constexpr float IDENTITY_CENTER_DIST  = 15.0f;   // ε1: 中心距离阈值（像素）
-constexpr float IDENTITY_AREA_RATIO   = 0.2f;    // ε2: 面积比差异阈值 (|A-B|/max(A,B))
-constexpr float IDENTITY_IOU_THRESH   = 0.5f;    // ε3: IoU 阈值（从0.7降到0.5，容忍bbox微变）
-constexpr float IDENTITY_COLOR_DIFF   = 20.0f;   // 像素颜色差异阈值（每通道 0~255）
-
-// =========================================================================
-//  新业务流程6：整理 / 移动判定阈值
-// -------------------------------------------------------------------------
-//  reid_match 只是外观输入，confirmed_relocation 还必须有移动/手/HELD
-//  等 OperationContext 证据，并且候选唯一性足够好。
-// =========================================================================
-constexpr float RELOCATION_REID_MIN          = 0.70f;
-constexpr float RELOCATION_REID_STRONG       = 0.82f;
-constexpr float RELOCATION_REID_MARGIN       = 0.10f;
-constexpr float RELOCATION_EVIDENCE_WEAK     = 0.25f;
-constexpr float RELOCATION_EVIDENCE_STRONG   = 0.75f;
-constexpr int   PENDING_RELOCATION_CONFIRM_FRAMES = 1;
-constexpr int   PENDING_RELOCATION_EXPIRE_FRAMES  = 2;
-
-// =========================================================================
-//  新业务流程6：多帧快照投票
-// =========================================================================
-constexpr int   SNAPSHOT_N            = 4;        // N帧为一个快照（必须为奇数）
-constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（60%，即3帧中至少出现2次）
+constexpr int   SNAPSHOT_N            = 4;        // 连续无手稳定帧数；不要求是奇数
+constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（N=4 时至少出现 3 帧）
 constexpr float SNAPSHOT_MIN_SCORE    = 0.5f;     // 最低检测分数（低于此分数的不进快照）
-constexpr int   SNAPSHOT_HAND_BLOCK_MIN_COUNT = 1; // N帧中至少几帧有阻塞手，快照才算带手
 constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
 
 // =========================================================================
-//  新业务流程6：自适应"附近"距离阈值
+//  物品附近判定
 // -------------------------------------------------------------------------
 //  normalized_nearby_distance = center_distance / min(对角线A, 对角线B)
 //  小于此值判定为"附近"
@@ -236,23 +205,41 @@ constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定
 constexpr float NEARBY_DISTANCE_THRESH = 1.0f;  // 设计文档建议值，可微调
 
 // =========================================================================
-//  新业务流程6：OperationContext / HELD 证据相关
+//  手框
 // =========================================================================
-// 连续多少帧没有检测到手 → 确认手离开画面
-constexpr int HAND_LEAVE_FRAMES  = 5;
-// 手证据阈值：用于 OperationContext / OSD，和 YOLO_HAND_SCORE_THRESH 保持一致即可。
+// 手证据阈值：业务层只要检测到这种手框，就停止生成稳定快照。
 constexpr float HAND_CONTEXT_SCORE_THRESH = YOLO_HAND_SCORE_THRESH;
-// 阻塞快照的手要更严格，避免低置信/小框误检长期卡住库存对比。
-constexpr float HAND_SNAPSHOT_BLOCK_SCORE_THRESH = 0.45f;
-constexpr float HAND_SNAPSHOT_BLOCK_MIN_AREA_RATIO = 0.002f;
-// 手持续多少帧才认为是长时间操作，长时间操作只提高整理证据权重
-constexpr int HAND_LONG_PRESENT_FRAMES = 12;
-// 手与物品重叠到什么程度，才作为 candidate_held 证据
-constexpr float HELD_HAND_OVERLAP_THRESH = 0.30f;
-// candidate_held 连续不可见多少帧后，建立 HELD 代理证据
-constexpr int HELD_CONFIRM_FRAMES = 2;
-// 物体 track 移动超过自身对角线多少比例，才作为移动证据
-constexpr float TRACK_MOVE_DISTANCE_RATIO = 0.50f;
+// 强手框仅用于 OSD 显示，避免 UI 被普通小手框干扰。
+constexpr float OSD_STRONG_HAND_SCORE_THRESH = 0.45f;
+constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
+
+// =========================================================================
+//  单库存快照 + OperationTrack 参数
+// -------------------------------------------------------------------------
+// 所有框比较都走同一个 "中心距离 + 宽 + 高" 的匹配函数；下面只是不同
+// 场景传给它的阈值，数值可在实机视频上统一调节。
+// =========================================================================
+constexpr float BOX_MATCH_CENTER_NORM       = 0.55f;
+constexpr float BOX_MATCH_WIDTH_RATIO       = 0.45f;
+constexpr float BOX_MATCH_HEIGHT_RATIO      = 0.45f;
+// 普通框匹配失败后，才使用“局部小框被完整参考框包含”的兜底匹配。
+// 这不是把两个框任意相交就当作同一物品；方向必须是小框在完整框内。
+constexpr float PARTIAL_MATCH_CONTAINMENT    = 0.85f;
+constexpr float PARTIAL_MATCH_MAX_AREA_RATIO = 0.90f;
+constexpr float IDENTITY_MATCH_AMBIGUITY_MARGIN = 0.15f;
+constexpr float TRACK_REAPPEAR_CENTER_NORM  = 1.35f;
+constexpr float TRACK_FRAME_CENTER_NORM     = 0.85f;
+constexpr float TRACK_FRAME_WIDTH_RATIO     = 0.85f;
+constexpr float TRACK_FRAME_HEIGHT_RATIO    = 0.85f;
+constexpr float TRACK_HAND_NEAR_NORM        = 1.40f;
+constexpr float TRACK_HAND_OVERLAP           = 0.12f;
+// Candidate 升级为正式 Track 所需的最小位移；比“静止”阈值宽，避免 YOLO 微抖动建轨。
+constexpr float TRACK_CREATE_MOTION_NORM     = 0.25f;
+// 完全遮挡 Candidate 必须被手覆盖较大部分，不能只因手在附近就建立。
+constexpr float TRACK_FULL_OCCLUSION_OVERLAP = 0.50f;
+constexpr float TRACK_STILL_CENTER_NORM     = 0.12f;
+constexpr float TRACK_PLACED_SIZE_RATIO     = 0.50f;
+constexpr int   OCCLUDED_TO_OUT_SNAPSHOTS   = 2;
 
 // =========================================================================
 //  新业务流程6：出库物品过期

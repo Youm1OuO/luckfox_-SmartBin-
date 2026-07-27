@@ -91,6 +91,7 @@ python3 convert_fridge.py \
 //上传到开发板 (在docker中)
     scp -r {path} root@192.168.168.100:/root/
     （即：scp -r install/uclibc/luckfox_pico_rtsp_yolov5_demo  root@192.168.168.100:/root/）
+    （修改为：scp -r install/uclibc/luckfox_pico_rtsp_yolov5n_demo root@192.168.168.100:/root/）
 
 
 
@@ -105,6 +106,12 @@ python3 convert_fridge.py \
 //跑板子 (在MobaXterm中)
     cd luckfox_pico_rtsp_yolov5_demo/
     ./luckfox_pico_rtsp_yolov5 model/yolov5.rknn
+    
+修改为：
+  cd /root/luckfox_pico_rtsp_yolov5n_demo
+  ./luckfox_pico_rtsp_yolov5n
+或
+    ./luckfox_pico_rtsp_yolov5n model/yolov5n.rknn
 
 
 

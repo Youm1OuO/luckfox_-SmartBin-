@@ -23,12 +23,37 @@ struct SnapshotCluster {
     VotingItem item;
     BBox first_box;
     BBox last_box;
+    // 同一候选中见过的最大框，作为“完整框 / 局部框”聚类时的参考。
+    BBox largest_box;
+    bool saw_contained_partial = false;
     int last_frame_index = -1;
 };
+
+// 两个框一大一小，且小框几乎被大框包含：可能是同一物品在不同帧的
+// 完整框 / 局部框。方向在聚类时不重要，因此这里自动找较大框。
+bool cluster_has_contained_partial_pair(const BBox& a, const BBox& b) {
+    if (a.area() <= 0.0f || b.area() <= 0.0f) return false;
+    const BBox& larger = a.area() >= b.area() ? a : b;
+    const BBox& smaller = a.area() >= b.area() ? b : a;
+    if (smaller.area() >= larger.area() * PARTIAL_MATCH_MAX_AREA_RATIO) {
+        return false;
+    }
+    if (overlap_ratio_of_smaller(larger, smaller) < PARTIAL_MATCH_CONTAINMENT) {
+        return false;
+    }
+    return point_in_box(smaller.cx(), smaller.cy(), larger) ||
+           normalized_nearby_distance(larger, smaller) <= CLUSTER_CENTER_NORM_MAX;
+}
 
 float snapshot_cluster_score(const SnapshotCluster& cluster,
                              const Detection& det) {
     if (cluster.item.cls_id != det.cls_id) return -1.0f;
+
+    if (cluster_has_contained_partial_pair(cluster.largest_box, det.box)) {
+        // 这条路径是普通几何聚类的补充：只解决“完整框 / 被包含局部框”。
+        // 同一帧一个 cluster 只能接收一个 detection，避免相邻同类物品合并。
+        return 0.95f;
+    }
 
     float area_diff = area_ratio_diff(cluster.last_box, det.box);
     if (area_diff > CLUSTER_AREA_DIFF_MAX) return -1.0f;
@@ -58,14 +83,24 @@ void update_cluster(SnapshotCluster& cluster,
                     int frame_index) {
     cluster.item.count++;
 
-    float n = (float)cluster.item.count;
-    cluster.item.box.x1 = cluster.item.box.x1 * (n - 1.0f) / n + det.box.x1 / n;
-    cluster.item.box.y1 = cluster.item.box.y1 * (n - 1.0f) / n + det.box.y1 / n;
-    cluster.item.box.x2 = cluster.item.box.x2 * (n - 1.0f) / n + det.box.x2 / n;
-    cluster.item.box.y2 = cluster.item.box.y2 * (n - 1.0f) / n + det.box.y2 / n;
+    bool contained_partial =
+        cluster_has_contained_partial_pair(cluster.largest_box, det.box);
+    if (contained_partial) cluster.saw_contained_partial = true;
+
+    // 只有普通同尺寸框才平均。把完整框和局部框直接平均会制造一个两边都不对的框。
+    if (!cluster.saw_contained_partial) {
+        float n = (float)cluster.item.count;
+        cluster.item.box.x1 = cluster.item.box.x1 * (n - 1.0f) / n + det.box.x1 / n;
+        cluster.item.box.y1 = cluster.item.box.y1 * (n - 1.0f) / n + det.box.y1 / n;
+        cluster.item.box.x2 = cluster.item.box.x2 * (n - 1.0f) / n + det.box.x2 / n;
+        cluster.item.box.y2 = cluster.item.box.y2 * (n - 1.0f) / n + det.box.y2 / n;
+    }
 
     if (det.score > cluster.item.best_score) {
         cluster.item.best_score = det.score;
+    }
+    if (det.box.area() > cluster.largest_box.area()) {
+        cluster.largest_box = det.box;
     }
     cluster.last_box = det.box;
     cluster.last_frame_index = frame_index;
@@ -79,6 +114,7 @@ SnapshotCluster make_cluster(const Detection& det, int frame_index) {
     cluster.item.count = 1;
     cluster.first_box = det.box;
     cluster.last_box = det.box;
+    cluster.largest_box = det.box;
     cluster.last_frame_index = frame_index;
     return cluster;
 }
@@ -86,7 +122,7 @@ SnapshotCluster make_cluster(const Detection& det, int frame_index) {
 VotingItem finalize_cluster(const SnapshotCluster& cluster) {
     VotingItem item = cluster.item;
     float motion_norm = normalized_nearby_distance(cluster.first_box, cluster.last_box);
-    if (motion_norm >= CLUSTER_MOTION_NORM_FOR_LAST_BOX) {
+    if (cluster.saw_contained_partial || motion_norm >= CLUSTER_MOTION_NORM_FOR_LAST_BOX) {
         item.box = cluster.last_box;
     }
     return item;
@@ -101,14 +137,12 @@ VotingItem finalize_cluster(const SnapshotCluster& cluster) {
 SnapshotBuffer::SnapshotBuffer(int N, float s) : N_(N), s_(s) {
     frames_.reserve(N);
     frame_ids_.reserve(N);
-    hand_flags_.reserve(N);
 }
 
 void SnapshotBuffer::push(const std::vector<Detection>& detections,
-                           int frame_id, bool has_hand) {
+                           int frame_id) {
     frames_.push_back(detections);
     frame_ids_.push_back(frame_id);
-    hand_flags_.push_back(has_hand);
 }
 
 bool SnapshotBuffer::full() const {
@@ -118,23 +152,14 @@ bool SnapshotBuffer::full() const {
 void SnapshotBuffer::reset() {
     frames_.clear();
     frame_ids_.clear();
-    hand_flags_.clear();
 }
 
 Snapshot SnapshotBuffer::take_snapshot() {
     Snapshot snap;
     snap.valid = false;
-    snap.has_hand = false;
     snap.frame_id = 0;
 
     if (frames_.empty()) return snap;
-
-    // 检查是否有足够稳定的阻塞手。单帧疑似手不直接废掉整个快照。
-    int hand_count = 0;
-    for (bool h : hand_flags_) {
-        if (h) hand_count++;
-    }
-    snap.has_hand = hand_count >= SNAPSHOT_HAND_BLOCK_MIN_COUNT;
 
     // 最后一帧的帧号
     snap.frame_id = frame_ids_.back();

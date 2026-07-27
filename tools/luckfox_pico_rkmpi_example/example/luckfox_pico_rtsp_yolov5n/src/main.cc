@@ -1,14 +1,13 @@
 // ============================================================================
 //  main.cc
-//  冰箱视觉系统 — 新业务流程6 主循环
+//  冰箱视觉系统主循环
 //
 //  每帧流水线：
 //    1. 摄像头采集 + YOLO推理 + 坐标映射
-//    2. ByteTrack-Lite 每帧更新
-//    3. OperationContext 收集手/HELD/ByteTrack移动证据
-//    4. 每帧推入 SnapshotBuffer（3帧投票缓冲区，快照含 has_hand 标记）
-//    5. 攒满3帧 → 生成 Snapshot → 送入 SessionManager 统一裁决
-//    6. 事件上报 + 画面绘制 + RTSP推流
+//    2. ByteTrack-Lite 每帧更新（只用于 OSD 显示）
+//    3. SessionManager 更新轻量 OperationTrack；有手时清空稳定缓冲
+//    4. 连续 N 帧无手稳定 → 形成一个稳定快照并直接比较库存表
+//    5. 事件上报 + 画面绘制 + RTSP推流
 // ============================================================================
 #include <assert.h>
 #include <errno.h>
@@ -112,26 +111,15 @@ static bool request_backend_inventory(const char* device_id,
 	return false;
 }
 
-static bool is_snapshot_blocking_hand(const fridge::Detection& det) {
-	if (!fridge::is_hand(det.cls_id)) return false;
-	if (det.score < fridge::HAND_SNAPSHOT_BLOCK_SCORE_THRESH) return false;
+static bool is_strong_hand_for_osd(const fridge::Detection& det) {
+    if (!fridge::is_hand(det.cls_id)) return false;
+    if (det.score < fridge::OSD_STRONG_HAND_SCORE_THRESH) return false;
 
 	float frame_area = fridge::FRAME_W * fridge::FRAME_H;
 	if (frame_area <= 0.0f) return false;
 
 	float area_ratio = det.box.area() / frame_area;
-	return area_ratio >= fridge::HAND_SNAPSHOT_BLOCK_MIN_AREA_RATIO;
-}
-
-static bool covered_by_track(const fridge::Detection& det,
-                             const std::vector<fridge::Track>& tracks) {
-	for (const auto& t : tracks) {
-		if (t.cls_id != det.cls_id) continue;
-		if (fridge::iou(t.box, det.box) >= 0.50f) {
-			return true;
-		}
-	}
-	return false;
+    return area_ratio >= fridge::OSD_STRONG_HAND_MIN_AREA_RATIO;
 }
 
 static double update_no_event_pixel_diff(const cv::Mat& frame,
@@ -171,6 +159,48 @@ static cv::Scalar display_color_for_class(int cls_id) {
 	int n = (int)(sizeof(colors) / sizeof(colors[0]));
 	int idx = cls_id >= 0 ? cls_id % n : 0;
 	return colors[idx];
+}
+
+// 业务层只返回结构化事件；这里统一恢复终端可读的 [EVENT] 日志。
+// 遮挡 / 露出是库存状态变化，不会作为出入库事件上传云端。
+static void print_inventory_event(const fridge::InventoryEvent& ev) {
+	const char* name = coco_cls_to_name(ev.cls_id);
+	switch (ev.kind) {
+		case fridge::EventKind::IN:
+			printf("\033[1;32m[EVENT]\033[0m 放入: item#%d %s (置信度 %.0f%%) "
+			       "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+			       ev.item_id, name, ev.score * 100.0f,
+			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
+			break;
+		case fridge::EventKind::OUT:
+			printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
+			       "原位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+			       ev.item_id, name,
+			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
+			break;
+		case fridge::EventKind::MOVED:
+			printf("\033[1;32m[EVENT]\033[0m 整理: item#%d %s "
+			       "原位置=(%.0f,%.0f)~(%.0f,%.0f) -> "
+			       "新位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+			       ev.item_id, name,
+			       ev.before_box.x1, ev.before_box.y1,
+			       ev.before_box.x2, ev.before_box.y2,
+			       ev.after_box.x1, ev.after_box.y1,
+			       ev.after_box.x2, ev.after_box.y2);
+			break;
+		case fridge::EventKind::OCCLUDED:
+			printf("\033[1;32m[EVENT]\033[0m 遮挡: item#%d %s "
+			       "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+			       ev.item_id, name,
+			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
+			break;
+		case fridge::EventKind::REVEALED:
+			printf("\033[1;32m[EVENT]\033[0m 露出: item#%d %s "
+			       "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
+			       ev.item_id, name,
+			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
+			break;
+	}
 }
 
 
@@ -263,9 +293,7 @@ int main(int argc, char *argv[]) {
 	// ============================================================
 	//  业务模块初始化
 	// ============================================================
-	fridge::ByteTrackLite tracker;
 	fridge::SessionManager session;
-	fridge::SnapshotBuffer snap_buffer(fridge::SNAPSHOT_N, fridge::SNAPSHOT_S);
 	fridge::CloudUploader cloud;
 	cloud.start();
 	int g_frame_id = 0;
@@ -320,7 +348,6 @@ int main(int argc, char *argv[]) {
 						cloud.device_id.c_str(), (long long)ts, door_session_id);
 					printf("%s\n", json.c_str());
 					cloud.enqueue_inventory_snapshot(json, (long long)ts);
-					snap_buffer.reset();
 					no_event_last_gray_small.release();
 					no_event_stable_count = 0;
 					last_no_event_upload_ms = 0;
@@ -334,7 +361,6 @@ int main(int argc, char *argv[]) {
 					         cloud.device_id.c_str());
 
 					session.start_new_session((long long)ts);
-					snap_buffer.reset();
 					no_event_last_gray_small.release();
 					no_event_stable_count = 0;
 					last_no_event_upload_ms = 0;
@@ -391,7 +417,7 @@ int main(int argc, char *argv[]) {
 			std::vector<fridge::Detection> detections;
 			std::vector<fridge::Detection> hand_dets_for_display;
 			std::vector<fridge::BBox> hand_boxes;
-			bool has_snapshot_blocking_hand = false;
+			bool has_strong_hand = false;
 			detections.reserve(od_results.count);
 			hand_dets_for_display.reserve(od_results.count);
 
@@ -415,8 +441,8 @@ int main(int argc, char *argv[]) {
 						hand_boxes.push_back(d.box);
 						hand_dets_for_display.push_back(d);
 					}
-					if (is_snapshot_blocking_hand(d)) {
-						has_snapshot_blocking_hand = true;
+					if (is_strong_hand_for_osd(d)) {
+						has_strong_hand = true;
 					}
 				}
 			}
@@ -427,46 +453,39 @@ int main(int argc, char *argv[]) {
 			RK_U64 now_us = TEST_COMM_GetNowUs();
 			long long now_ms = (long long)(now_us / 1000);
 
-			// ============================================================
-			//  ByteTrack 每帧更新
-			// ============================================================
 			g_frame_id++;
-			const std::vector<fridge::Track>& tracks =
-				tracker.update(detections, g_frame_id);
 
-			// ============================================================
-			//  OperationContext：每帧记录手、HELD代理、ByteTrack移动证据
-			//  注意：这里不直接产生库存事件，库存只由后面的稳定快照diff裁决。
-			// ============================================================
-			session.update_hand(hand_boxes, tracks, g_frame_id, now_ms);
-
-			// ============================================================
-			//  快照缓冲：手证据和快照阻塞分开。
-			//  OperationContext 可以使用较敏感的 hand_boxes；
-			//  快照阻塞只接受更高置信度/足够面积的手，避免弱误检长期卡住库存。
-			// ============================================================
-			bool has_hand = has_snapshot_blocking_hand;
-
-			// 只把食物检测推入快照缓冲区（不含手）
+			// 只保留物品检测给业务层（手框单独传入）。
 			std::vector<fridge::Detection> food_dets;
 			for (const auto& d : detections) {
 				if (fridge::is_food(d.cls_id) && d.score >= fridge::SNAPSHOT_MIN_SCORE) {
 					food_dets.push_back(d);
 				}
 			}
-			snap_buffer.push(food_dets, g_frame_id, has_hand);
 
-			if (snap_buffer.full()) {
-				fridge::Snapshot snap = snap_buffer.take_snapshot();
-				fridge::SettlementResult res = session.push_snapshot(snap, frame);
+			// 新业务层自己维护“连续无手稳定 N 帧”的快照缓冲，并在有手时
+			// 更新轻量 OperationTrack；旧 ByteTrack 不参与本程序运行。
+			fridge::FrameProcessResult frame_result =
+				session.process_frame(food_dets, hand_boxes, g_frame_id, now_ms);
 
-				// 处理快照对比产生的事件：上报云端
+			if (frame_result.stable_snapshot_generated) {
+				const fridge::SettlementResult& res = frame_result.settlement;
+
+				// 处理快照对比产生的事件：先打印终端日志；只有真正出入库/整理
+				// 才上报云端，遮挡和露出仅更新本地库存状态。
 				for (const auto& ev : res.events) {
+					print_inventory_event(ev);
+					if (ev.kind == fridge::EventKind::OCCLUDED ||
+					    ev.kind == fridge::EventKind::REVEALED) {
+						continue;
+					}
+
 					fridge::UploadJob job;
 					switch (ev.kind) {
 						case fridge::EventKind::IN:    job.kind = fridge::UploadKind::ITEM_IN;    break;
 						case fridge::EventKind::OUT:   job.kind = fridge::UploadKind::ITEM_OUT;   break;
 						case fridge::EventKind::MOVED: job.kind = fridge::UploadKind::ITEM_MOVED; break;
+						default: break;  // 上面已 continue；保留给编译器完整分支。
 					}
 					job.local_track_id = ev.item_id;
 					job.category       = fridge::cls_id_to_chinese(ev.cls_id);  // 中文细粒度
@@ -555,7 +574,7 @@ int main(int argc, char *argv[]) {
 					no_event_last_gray_small.release();
 					no_event_stable_count = 0;
 					last_no_event_upload_ms = 0;
-				} else if (!snap.has_hand && !session.hand_present() && session.ready()) {
+				} else if (!session.hand_present() && session.ready()) {
 					double pixel_diff =
 						update_no_event_pixel_diff(frame, no_event_last_gray_small);
 					if (pixel_diff <= NO_EVENT_PIXEL_DIFF_THRESH) {
@@ -601,6 +620,7 @@ int main(int argc, char *argv[]) {
 				}
 
 				if (res.happened && !res.events.empty()) {
+					session.print_inventory();
 					printf("\n\033[1;36m[INVENTORY]\033[0m 快照对比后库存:\n");
 					session.inventory().print("  ");
 				}
@@ -613,7 +633,7 @@ int main(int argc, char *argv[]) {
 				if (fridge::is_hand(d.cls_id)) continue;
 				bool should_display_raw =
 					d.score >= fridge::SNAPSHOT_MIN_SCORE;
-				if (!should_display_raw || covered_by_track(d, tracks)) continue;
+				if (!should_display_raw) continue;
 
 				int x1 = (int)d.box.x1;
 				int y1 = (int)d.box.y1;
@@ -629,24 +649,6 @@ int main(int argc, char *argv[]) {
 				            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
 			}
 
-			for (const auto& t : tracks) {
-				if (fridge::is_hand(t.cls_id)) continue;
-				int x1 = (int)t.box.x1;
-				int y1 = (int)t.box.y1;
-				int x2 = (int)t.box.x2;
-				int y2 = (int)t.box.y2;
-
-				cv::Scalar color = display_color_for_class(t.cls_id);
-
-				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
-
-				char label[64];
-				snprintf(label, sizeof(label), "#%d %s %.0f%%",
-				         t.track_id, coco_cls_to_name(t.cls_id), t.score * 100);
-				cv::putText(frame, label, cv::Point(x1, y1 - 6),
-				            cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
-			}
-
 			// 屏幕左上角：系统状态
 			{
 				bool has_hand_now = session.hand_present();
@@ -655,10 +657,10 @@ int main(int argc, char *argv[]) {
 					: cv::Scalar(0, 255, 0);  // 绿 = 无手
 				const fridge::InventoryDB& inv = session.inventory();
 				char osd[128];
-				snprintf(osd, sizeof(osd), "%s rawH=%zu blockH=%d | V=%zu O=%zu OUT=%zu",
+				snprintf(osd, sizeof(osd), "%s rawH=%zu strongH=%d | V=%zu O=%zu OUT=%zu",
 				         has_hand_now ? "HAND" : "STABLE",
 				         hand_dets_for_display.size(),
-				         has_snapshot_blocking_hand ? 1 : 0,
+					         has_strong_hand ? 1 : 0,
 				         inv.count_by_status(fridge::ItemStatus::VISIBLE),
 				         inv.count_by_status(fridge::ItemStatus::OCCLUDED),
 				         inv.count_by_status(fridge::ItemStatus::OUT));
