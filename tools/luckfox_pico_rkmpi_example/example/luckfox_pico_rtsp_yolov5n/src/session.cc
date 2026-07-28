@@ -972,9 +972,26 @@ SettlementResult SessionManager::settle_snapshot(const Snapshot& snapshot) {
 void SessionManager::print_inventory() const {
     const size_t visible_count = inventory_.count_by_status(ItemStatus::VISIBLE);
     const size_t occluded_count = inventory_.count_by_status(ItemStatus::OCCLUDED);
-    printf("[INVENTORY] 可见=%zu 遮挡=%zu 总计=%zu\n",
-           visible_count, occluded_count, visible_count + occluded_count);
-    inventory_.print("  ");
+    const size_t in_count = visible_count + occluded_count;
+
+    printf("\n");
+    printf("  ┌──────────────────────────────────────────────────┐\n");
+    printf("  │  在库清单 │ 可见: %-3zu │ 遮挡: %-3zu │ 共: %-3zu    │\n",
+           visible_count, occluded_count, in_count);
+    printf("  ├────┬──────────────┬────────┬───────────────────────┤\n");
+    printf("  │ #  │ 类别         │ 状态   │ 位置 (中心)           │\n");
+    printf("  ├────┼──────────────┼────────┼───────────────────────┤\n");
+
+    for (std::map<int, InventoryItem>::const_iterator it = inventory_.items().begin();
+         it != inventory_.items().end(); ++it) {
+        const InventoryItem& item = it->second;
+        const char* status = item.status == ItemStatus::VISIBLE ? "可见" : "遮挡";
+        printf("  │ %-2d │ %-12s │ %-6s │ (%4.0f,%4.0f)          │\n",
+               item.item_id, cls_id_to_chinese(item.cls_id), status,
+               item.last_box.cx(), item.last_box.cy());
+    }
+
+    printf("  └────┴──────────────┴────────┴───────────────────────┘\n\n");
 }
 
 FrameProcessResult SessionManager::process_frame(

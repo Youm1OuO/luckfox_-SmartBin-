@@ -81,15 +81,25 @@ size_t InventoryDB::count_by_status(ItemStatus s) const {
 }
 
 void InventoryDB::print(const char* prefix) const {
+    // 保持原来的显示顺序：先可见，再遮挡。
     for (const auto& kv : items_) {
         const auto& it = kv.second;
-        printf("%s  - item#%d cls=%d(%s) [%s] "
-               "last_box=(%.0f,%.0f)~(%.0f,%.0f) blocker=%d score=%.2f\n",
+        if (it.status != ItemStatus::VISIBLE) continue;
+        printf("%s  - item#%d cls=%d(%s) [可见] "
+               "last_box=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f\n",
                prefix,
                it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
-               item_status_to_str(it.status),
                it.last_box.x1, it.last_box.y1, it.last_box.x2, it.last_box.y2,
-               it.blocker_id,
+               it.score);
+    }
+    for (const auto& kv : items_) {
+        const auto& it = kv.second;
+        if (it.status != ItemStatus::OCCLUDED) continue;
+        printf("%s  - item#%d cls=%d(%s) [遮挡] "
+               "last_box=(%.0f,%.0f)~(%.0f,%.0f) score=%.2f\n",
+               prefix,
+               it.item_id, it.cls_id, coco_cls_to_name(it.cls_id),
+               it.last_box.x1, it.last_box.y1, it.last_box.x2, it.last_box.y2,
                it.score);
     }
 }
