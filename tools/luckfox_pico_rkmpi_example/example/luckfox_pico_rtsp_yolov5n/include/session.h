@@ -53,20 +53,6 @@ enum class BackendStatus {
     NO_TRUSTED_BACKEND,
 };
 
-// 这不是 tracker.h 的 ByteTrack Track。它没有全局身份，也不会上传后台。
-enum class OperationTrackState {
-    TRACKING_VISIBLE,       // YOLO 还能看到物品（完整或局部框）
-    FULL_HAND_OCCLUDED,     // YOLO 看不到物品，proxy_box 跟随手移动
-    PLACED,                 // 已确认放下，release_box 可以作为整理证据
-};
-
-// Candidate 只记录“手可能正在碰这个物品”，本身不能作为整理证据。
-// 只有确认物品框或手代理真正移动后，才会升级成 OperationTrack。
-enum class OperationCandidateState {
-    VISIBLE_CANDIDATE,          // YOLO 仍能看到物品
-    FULL_HAND_OCCLUDED_CANDIDATE, // 手覆盖原位置，YOLO 暂时看不到物品
-};
-
 struct OperationCandidate {
     int bound_item_id = -1;
     int cls_id = -1;
@@ -74,18 +60,15 @@ struct OperationCandidate {
     BBox source_box;            // Candidate 建立时库存中的可靠位置
     BBox last_yolo_box;         // 最近一次真实 YOLO 框（可为局部框）
     bool has_last_yolo_box = false;
-    BBox start_hand_box;        // 完全遮挡时，手刚覆盖物品的位置
     BBox last_hand_box;
     bool has_last_hand_box = false;
-    OperationCandidateState state = OperationCandidateState::VISIBLE_CANDIDATE;
 };
 
 struct OperationTrack {
-    int track_id = -1;          // 仅本次开门会话内自增
     int bound_item_id = -1;     // 引用 InventoryItem.item_id
     int cls_id = -1;
 
-    BBox start_box;             // 从 anchor_box（或 last_seen_box）复制的起点
+    BBox start_box;             // 从库存 last_box 复制的起点
     BBox proxy_box;             // 当前完整物品位置的代理框
     BBox last_yolo_box;         // 上一次真实 YOLO 物品框，允许是局部框
     bool has_last_yolo_box = false;
@@ -95,7 +78,6 @@ struct OperationTrack {
     std::vector<BBox> path;     // 每次 Track 更新后的 proxy_box，全程保留
     BBox release_box;           // 确认放下位置
     bool has_release_box = false;
-    OperationTrackState state = OperationTrackState::TRACKING_VISIBLE;
 };
 
 class SessionManager {
@@ -136,8 +118,6 @@ private:
 
     int find_unique_inventory_binding(const Detection& detection,
                                       const std::vector<BBox>& hand_boxes) const;
-    bool item_matches_snapshot(const InventoryItem& item,
-                               const VotingItem& observed) const;
     bool item_is_bound_to_operation(int item_id) const;
 
     InventoryDB inventory_;
@@ -145,7 +125,6 @@ private:
     std::vector<OperationTrack> tracks_;
     std::vector<OperationCandidate> candidates_;
 
-    int next_operation_track_id_;
     bool operation_pending_;
     bool hand_present_;
     int no_hand_streak_;

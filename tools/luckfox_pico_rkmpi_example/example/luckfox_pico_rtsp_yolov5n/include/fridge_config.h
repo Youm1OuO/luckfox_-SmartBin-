@@ -195,14 +195,9 @@ constexpr int   SNAPSHOT_N            = 4;        // 连续无手稳定帧数；
 constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（N=4 时至少出现 3 帧）
 constexpr float SNAPSHOT_MIN_SCORE    = 0.5f;     // 最低检测分数（低于此分数的不进快照）
 constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
-
-// =========================================================================
-//  物品附近判定
-// -------------------------------------------------------------------------
-//  normalized_nearby_distance = center_distance / min(对角线A, 对角线B)
-//  小于此值判定为"附近"
-// =========================================================================
-constexpr float NEARBY_DISTANCE_THRESH = 1.0f;  // 设计文档建议值，可微调
+// 仅用于快照聚类：把完整框与被包含的局部框归到同一候选。
+constexpr float PARTIAL_MATCH_CONTAINMENT    = 0.85f;
+constexpr float PARTIAL_MATCH_MAX_AREA_RATIO = 0.90f;
 
 // =========================================================================
 //  手框
@@ -214,19 +209,32 @@ constexpr float OSD_STRONG_HAND_SCORE_THRESH = 0.45f;
 constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
 
 // =========================================================================
-//  单库存快照 + OperationTrack 参数
+//  稳定快照与库存的单框关系
 // -------------------------------------------------------------------------
-// 所有框比较都走同一个 "中心距离 + 宽 + 高" 的匹配函数；下面只是不同
-// 场景传给它的阈值，数值可在实机视频上统一调节。
+//  NORMAL / SHRINK / GROW 的所有阈值集中在这里；数值只作为初始值，
+//  必须用真实视频继续标定。
 // =========================================================================
-constexpr float BOX_MATCH_CENTER_NORM       = 0.55f;
-constexpr float BOX_MATCH_WIDTH_RATIO       = 0.45f;
-constexpr float BOX_MATCH_HEIGHT_RATIO      = 0.45f;
-// 普通框匹配失败后，才使用“局部小框被完整参考框包含”的兜底匹配。
-// 这不是把两个框任意相交就当作同一物品；方向必须是小框在完整框内。
-constexpr float PARTIAL_MATCH_CONTAINMENT    = 0.85f;
-constexpr float PARTIAL_MATCH_MAX_AREA_RATIO = 0.90f;
-constexpr float IDENTITY_MATCH_AMBIGUITY_MARGIN = 0.15f;
+constexpr float SNAPSHOT_NORMAL_IOM          = 0.70f;
+constexpr float SNAPSHOT_CONTAIN_IOM         = 0.80f;
+constexpr float SNAPSHOT_CENTER_NORMAL        = 0.18f;
+constexpr float SNAPSHOT_CENTER_CONTAIN       = 0.55f;
+constexpr float SNAPSHOT_SHAPE_NORMAL         = 0.28f;
+constexpr float SNAPSHOT_SHAPE_CONTAIN        = 0.85f;
+// NORMAL 与 SHRINK / GROW 留出安全间隔，避免一个框同时落入两种关系。
+constexpr float SNAPSHOT_NORMAL_AREA_MIN      = 0.91f;
+constexpr float SNAPSHOT_NORMAL_AREA_MAX      = 1.09f;
+constexpr float SNAPSHOT_SHRINK_AREA_MAX      = 0.88f;
+constexpr float SNAPSHOT_GROW_AREA_MIN        = 1.12f;
+constexpr float SNAPSHOT_GROW_AREA_MAX        = 4.00f;
+constexpr float SNAPSHOT_BLOCK_COVER          = 0.55f;
+constexpr float SNAPSHOT_FULL_COVER           = 0.80f;
+constexpr float SNAPSHOT_LEAVE_COVER_MAX      = 0.15f;
+
+// =========================================================================
+//  OperationTrack 参数
+// -------------------------------------------------------------------------
+// Track 只辅助确认 MOVED；它不参与快照中的 NORMAL / SHRINK / GROW 裁决。
+// =========================================================================
 constexpr float TRACK_REAPPEAR_CENTER_NORM  = 1.35f;
 constexpr float TRACK_FRAME_CENTER_NORM     = 0.85f;
 constexpr float TRACK_FRAME_WIDTH_RATIO     = 0.85f;
@@ -237,16 +245,7 @@ constexpr float TRACK_HAND_OVERLAP           = 0.12f;
 constexpr float TRACK_CREATE_MOTION_NORM     = 0.25f;
 // 完全遮挡 Candidate 必须被手覆盖较大部分，不能只因手在附近就建立。
 constexpr float TRACK_FULL_OCCLUSION_OVERLAP = 0.50f;
-constexpr float TRACK_STILL_CENTER_NORM     = 0.12f;
 constexpr float TRACK_PLACED_SIZE_RATIO     = 0.50f;
-constexpr int   OCCLUDED_TO_OUT_SNAPSHOTS   = 2;
-
-// =========================================================================
-//  新业务流程6：出库物品过期
-// -------------------------------------------------------------------------
-//  OUT 状态的物品超过此时间仍未重新出现 → 确认出库，从记录中清除
-// =========================================================================
-constexpr long long OUT_ITEM_EXPIRE_MS = 600000LL;  // 10分钟
 
 // =========================================================================
 //  帧尺寸（用于手部扩展等计算）

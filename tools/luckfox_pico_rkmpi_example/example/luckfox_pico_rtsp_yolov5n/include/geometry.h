@@ -60,6 +60,18 @@ inline float iou(const BBox& a, const BBox& b) {
     return inter / uni;
 }
 
+inline float intersection_area(const BBox& a, const BBox& b) {
+    const float width = std::max(0.0f, std::min(a.x2, b.x2) - std::max(a.x1, b.x1));
+    const float height = std::max(0.0f, std::min(a.y2, b.y2) - std::max(a.y1, b.y1));
+    return width * height;
+}
+
+// IoM = 交集 / 较小框面积。小框被大框包含时接近 1，适合 SHRINK / GROW。
+inline float iom(const BBox& a, const BBox& b) {
+    const float smaller = std::min(a.area(), b.area());
+    return smaller > 0.0f ? intersection_area(a, b) / smaller : 0.0f;
+}
+
 // 两个中心点的欧氏距离（手部移动速度判定用得上）
 inline float center_distance(const BBox& a, const BBox& b) {
     float dx = a.cx() - b.cx();
@@ -105,6 +117,45 @@ inline bool is_same_position(const BBox& a, const BBox& b,
 // 物体对角线长度（自适应"附近"距离计算用）
 inline float diagonal(const BBox& b) {
     return std::sqrt(b.w() * b.w() + b.h() * b.h());
+}
+
+// 单框库存匹配的相对中心偏移。取较大框为分母，避免局部小框放大正常偏移。
+inline float normalized_center_shift(const BBox& a, const BBox& b) {
+    const float scale = std::max(diagonal(a), diagonal(b));
+    return scale > 0.0f ? center_distance(a, b) / scale : 999.0f;
+}
+
+inline float box_area_ratio(const BBox& reference, const BBox& observed) {
+    const float reference_area = reference.area();
+    return reference_area > 0.0f ? observed.area() / reference_area : 0.0f;
+}
+
+inline float box_shape_delta(const BBox& a, const BBox& b) {
+    if (a.w() <= 0.0f || a.h() <= 0.0f || b.w() <= 0.0f || b.h() <= 0.0f) {
+        return 999.0f;
+    }
+    return std::fabs(std::log((b.w() / b.h()) / (a.w() / a.h())));
+}
+
+// C 覆盖目标区域 R 的比例。
+inline float cover_ratio(const BBox& target, const BBox& cover) {
+    const float target_area = target.area();
+    return target_area > 0.0f ? intersection_area(target, cover) / target_area : 0.0f;
+}
+
+// A 原框中、B 当前小框没有覆盖的区域，被 C 覆盖的比例。
+// A \ B 可能是非矩形区域，用集合面积计算，不能只拿普通交集替代。
+inline float missing_region_cover_ratio(const BBox& a, const BBox& b,
+                                        const BBox& c) {
+    const float missing_area = a.area() - intersection_area(a, b);
+    if (missing_area <= 0.0f) return 0.0f;
+
+    const float covered_by_c = intersection_area(a, c);
+    const float triple_overlap = intersection_area(
+        BBox(std::max(a.x1, b.x1), std::max(a.y1, b.y1),
+             std::min(a.x2, b.x2), std::min(a.y2, b.y2)),
+        c);
+    return std::max(0.0f, covered_by_c - triple_overlap) / missing_area;
 }
 
 // 自适应归一化中心距离（用于"附近"判定）

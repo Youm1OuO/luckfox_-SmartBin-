@@ -657,13 +657,12 @@ int main(int argc, char *argv[]) {
 					: cv::Scalar(0, 255, 0);  // 绿 = 无手
 				const fridge::InventoryDB& inv = session.inventory();
 				char osd[128];
-				snprintf(osd, sizeof(osd), "%s rawH=%zu strongH=%d | V=%zu O=%zu OUT=%zu",
+				snprintf(osd, sizeof(osd), "%s rawH=%zu strongH=%d | V=%zu O=%zu",
 				         has_hand_now ? "HAND" : "STABLE",
 				         hand_dets_for_display.size(),
 					         has_strong_hand ? 1 : 0,
 				         inv.count_by_status(fridge::ItemStatus::VISIBLE),
-				         inv.count_by_status(fridge::ItemStatus::OCCLUDED),
-				         inv.count_by_status(fridge::ItemStatus::OUT));
+				         inv.count_by_status(fridge::ItemStatus::OCCLUDED));
 				cv::putText(frame, osd, cv::Point(8, 22),
 				            cv::FONT_HERSHEY_SIMPLEX, 0.6, osd_color, 2);
 			}
