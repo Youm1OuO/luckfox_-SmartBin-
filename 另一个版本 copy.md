@@ -56,12 +56,12 @@
 > 当前这一版是纯净的使用[严格匹配]+[局部匹配]+对比的逻辑而已
 
 
-> 有 .block_ids, 但是这个版本的 .block_ids 用法相对简单, 不会很复杂。
+> 有 .block_id, 但是这个版本的 .block_id 用法相对简单, 不会很复杂。
 > 例如:
 1. 若一个库存中的物品A看不见了, 并且快照中有个新的物品进来, 并且这个新的物品现在的位置能把原先库存中的这个物品A的位置几乎完全覆盖了, 那么这个物体A就变成【遮挡】, 并且记录这个物体A的 block_id 为这个新物品
 2. 若当一个物品A被判断为【整理】, 我们就检查所有原先被这个物品遮挡的物品C, 如果整理后物体的位置(从快照可得) 跟被他遮挡的原先的物品不再重合, 那么这些物体C的 block_id 就去掉物品A的信息记录; 并且这个物品A整理后的位置如果挡住了 其他物品B, 那么这个物品B的 block_id 就添加物品A的信息记录;
 3. 若当一个物品A被判断为【出库】, 我们就检查所有原先被这个物品遮挡的物品C, 如果整理后物体的位置(从快照可得) 跟被他遮挡的原先的物品不再重合, 那么这些物体C的 block_id 就去掉物品A的信息记录
-(.block_ids 不是一个数, 而是一个集合, 他要允许记录多个物品信息记录, 而且能自动**去重**)
+(.block_id 不是一个数, 而是一个列表, 他要允许记录多个物品信息记录)
 
 
 **hold_and_move 的使用**
@@ -91,68 +91,27 @@
 > 因为面积大的快照物品更可能对上库存中【可见】的物品, 这些物品更可能匹配的上
 > (这只是一个代码实现中的小技巧, 逻辑本身没有改变; 如果排序本身的代价更重的话, 也可以不排序)
 
-3. 给快照中的物品一个临时的 temporary_id 和 item_id
+3. 给快照中的物品一个临时的 temporary_id
 > 由于只有库存中的物品才有 item_id, 而快照中的物品没有 item_id
-> 为了方便操作, 我们给排完序之后的快照中的物品一个临时的**temporary_id (从-1开始递减)**, 并且也给他们初始一个 item_id=-1
+> 为了方便操作, 我们给排完序之后的快照中的物品一个临时的 temporary_id (从1开始递增), 并且也给他们初始一个 item_id=-1
 > 当快照中的物品的 item_id=-1 时表明他们还没有与库存中的物品匹配上, 否者表示已经匹配上了
 
 4. 找出库存物品中 item_id 对最大值, 赋值给 count
 > 因为如果有新物品进来, 我们要给他一个 item_id
 > count = 库存物品中 item_id 对最大值
 
-5. 建立临时映射 matched_snapshot_of_item
-> matched_snapshot_of_item 只在当前一次快照结算中存在
-> 它表示：当前库存物品 A 是否真的有一个当前快照物品 B 与之匹配; 若存在，则可通过该映射找到 A 当前对应的快照框 B
-> matched_snapshot_of_item[库存 item_id] = 与该库存物品匹配的快照物品B
 
+## 1. 先严格匹配
 
-
-## 1. 严格匹配
-
-> 严格匹配的目标是先绑定那些“位置和大小几乎没有变化”的物品。
-> 我们最好要 A 与 B 一对一才好, 所以这里不应在扫描到第一个匹配时立刻修改 `A.affirm` 或`B.item_id`，而应分为两个阶段。
-
-### 1.1 收集严格匹配候选
-
-以下候选表只在当前一次快照结算中临时存在，不写入正式库存：
-
-strict_A_to_B[A.item_id]：A 可以匹配的 B.temporary_id 列表
-strict_B_to_A[B.temporary_id]：B 可以匹配的 A.item_id 列表
-
-for A in 库存物品:
-    if A.status != 【可见】:
-        // 严格匹配是库存中看得见的与快照中看得见的进行的严格匹配, 因此只允许【可见】状态的物品进行匹配更合理, 也更高效
-        continue
-
-    for B in 快照物品:
-        if 严格匹配(A, B):
-            if A.block_ids 为空 and A.box.area < B.box.area:
-                // 原本没有被遮挡的 A 不应无理由变大；
-                // 此时可能是同类物品重叠，不作为严格匹配。
+for B in 快照物品 :
+    for A in 库存物品 :
+        if !A.affirm and 严格匹配(A, B):
+            if A.block_id is None and A.box.area < B.area:
+                // 如果原本就没有物品挡着A, A现在又如何凭空变大呢, 这种情况说明A与B不是同一个东西, 不能匹配
+                // 这时候有可能是同类物品前后重叠放在一起了
                 continue
-
-            strict_A_to_B[A.item_id].add(B.temporary_id)
-            strict_B_to_A[B.temporary_id].add(A.item_id)
-
-
-### 1.2 只接受双向唯一的严格匹配
-> 若 A 有多个候选 B, 或 B 有多个候选 A，则本轮不能仅凭严格匹配绑定它们。
-
-for A in 库存物品:
-    if strict_A_to_B[A.item_id].size != 1:
-        continue
-
-    B_id = strict_A_to_B[A.item_id][0]
-
-    if strict_B_to_A[B_id].size != 1:
-        continue
-
-    B = 根据 B_id 找到对应快照物品
-
-    A.affirm = True
-    B.item_id = A.item_id
-    matched_snapshot_of_item[A.item_id] = B
-
+            A.affirm = True
+            B.item_id = A.item_id
 
 **注意**
 这里的严格匹配使用的阈值可以稍微严格一点 (但也不要过于严格, 以防全都匹配不上)
@@ -161,48 +120,20 @@ for A in 库存物品:
 一开始会先给每一个库存物品A 都设置一个临时变量 A.affirm, 初始化为 False, 表示这个物品没有被匹配上
 一开始会先给每一个快照物品B 都设置一个临时变量 B.item_id 初始化为 -1, 表示一开始是未匹配上的
 
+> 小问题:
+>    这里是用 B 与 A 匹配的; 要不要多用一次, 用 A 与 B 匹配呢?
+>    A.affirm 与 B.item_id 要怎么具体代码实现最好？(最方便、最快、最省空间)
 
 
-## 2. 局部匹配
-> 局部匹配只处理严格匹配后仍未绑定的物品。
-> 局部匹配同样先收集候选，再接受双向唯一关系；不能在双重
+## 2. 再局部匹配
 
-### 2.1 收集局部匹配候选
-
-
-partial_A_to_B[A.item_id]：A 可以局部匹配的 B.temporary_id 列表
-partial_B_to_A[B.temporary_id]：B 可以局部匹配的 A.item_id 列表
-
-for A in 库存物品:
-    if A.affirm == True:
-        continue
-
-    for B in 快照物品:
-        if B.item_id != -1:
-            continue
-
-        if 局部匹配(A, B):
-            partial_A_to_B[A.item_id].add(B.temporary_id)
-            partial_B_to_A[B.temporary_id].add(A.item_id)
-
-
-### 2.2 只接受双向唯一的局部匹配
-
-for A in 库存物品:
-    if A.affirm == True or partial_A_to_B[A.item_id].size != 1:
-        continue
-
-    B_id = partial_A_to_B[A.item_id][0]
-
-    if partial_B_to_A[B_id].size != 1:
-        continue
-
-    B = 根据 B_id 找到对应快照物品
-
-    A.affirm = True
-    B.item_id = A.item_id
-    matched_snapshot_of_item[A.item_id] = B
-
+for B in 快照物品 :
+    if B.item_id == -1:
+        for A in 库存物品 :
+            if !A.affirm and 局部匹配(A, B):
+                A.affirm = True
+                B.item_id = A.item_id
+                B.partial_match = True
 
 **注意**
 这里的[局部匹配]使用的阈值可以稍微严格一点 (即:最好要接近1.0,但也不要过于严格, 以防全都匹配不上)
@@ -231,30 +162,18 @@ for B in 快照物品 :
                 if track能证明A与B是整理 or A.hold_and_move==True:
                     A.affirm = True
                     B.item_id = A.item_id
-                    matched_snapshot_of_item[A.item_id] = B
+                    B.partial_match = True
                     A.box = B.box
 
-                    // 还要处理 .block_ids
+                    // 还要处理 .block_id
                     for C in 库存物品 :
-                        if A.item_id in C.block_ids:
-                            C.block_ids.erase(A.item_id)   // 删不了也不要报错
-                            if C的状态 ==【遮挡】and matched_snapshot_of_item 中存在键 C.item_id:
-                                C的状态从【遮挡】变成【可见】
-                                C.box = matched_snapshot_of_item[C.item_id].box 
-                        if B对C的覆盖比例足够高 and B.item_id != C.item_id:
-                            C.block_ids.insert(B.temporary_id)    // 要去重
-                            if !C.affirm and C的状态 ==【可见】and IoM(B, C)≈1 and B.box.area ≥ C.box.area:
-                                C的状态从【可见】变成【遮挡】
-                            if B.temporary_id in C.block_ids:
-                                C.block_ids.erase(B.temporary_id)   // 删不了也不要报错
-                                C.block_ids.insert(B.item_id)     // 要去重
-
-**说明**
->[B对C的覆盖比例]足够高 = [intersection_area(B,C)/area(C)] 足够高
+                        if A.item_id in C.block_id:
+                            C.block_id.remove(A.item_id)
+                        if IoM(B, C)≈1 and B.box.area ≥ C.box.area:
+                            C.block_id.add(B.temporary_id)
 
 
-
-## 3.2 处理[库存中有]而[快照中没有]的物体
+## 3.2 处理库存中有而快照中没有的物体
 
 > 这些物品是消失了的, 有以下几种情况：
 1. 这个物品是[被完全遮挡了] (需要检查快照中是否有一个未匹配的物品完全覆盖了这个物品)
@@ -265,23 +184,20 @@ for A in 库存物品:
         for B in 快照物品:
             if B.item_id==-1 and IoM(A, B)≈1 and B.box.area ≥ A.box.area:
                 A.affirm = True
-                A.block_ids.insert(B.temporary_id)   // 要去重
+                A.block_id.add(B.temporary_id)
 
         if !A.affirm:
             A.affirm = True
             物品 A 出库, 修改状态
 
-            // 还要处理 .block_ids
+            // 还要处理 .block_id
             for C in 库存物品:
-                if A.item_id in C.block_ids:
-                    C.block_ids.erase(A.item_id)    // 删不了也不要报错
-                    if C的状态 ==【遮挡】and matched_snapshot_of_item 中存在键 C.item_id:
-                        C的状态从【遮挡】变成【可见】
-                        C.box = matched_snapshot_of_item[C.item_id].box 
+                if A.item_id in C.block_id:
+                    C.block_id.remove(A.item_id)
 
+            
 
-
-## 3.3 处理[库存中没有]而[快照中有]的物体
+## 3.3 处理[快照中有]而[库中没有]的物体
 
 > 这些物品是多出来的, 有以下几种情况：
 1. 这个物品是[新放进来的]
@@ -291,17 +207,14 @@ for B in 快照物品 :
     if B.item_id == -1:
         物品 B 入库, 修改状态
         count +=1
-        B.item_id = count
-        matched_snapshot_of_item[B.item_id] = B
+        B = count
 
-        // 还要处理 .block_ids
+        // 还要处理 .block_id
         for C in 库存物品 :
-            if B对C的覆盖比例足够高 and B.item_id != C.item_id:
-                C.block_ids.insert(B.item_id)    // 要去重
-                if C的状态 ==【可见】and IoM(B, C)≈1 and B.box.area ≥ C.box.area:
-                    C的状态从【可见】变成【遮挡】
-
+            if IoM(B, C)≈1 and B.box.area ≥ C.box.area:
+                C.block_id.add(B.item_id)
+        
             // 新物品入库, 检查看看有没有之前使用过 B.temporary_id 的
-            if B.temporary_id in C.block_ids:
-                C.block_ids.erase(B.temporary_id)    // 删不了也不要报错
-                C.block_ids.insert(B.item_id)    // 要去重
+            if B.temporary_id in C.block_id:
+                C.block_id.remove(B.temporary_id)
+                C.block_id.add(B.item_id)
