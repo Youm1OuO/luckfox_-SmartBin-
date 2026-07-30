@@ -127,16 +127,21 @@ def process_frame(item_detections, hand_detections):
             create_candidate_track(A, hand, 当前与 A 对应的 Detection 或 None)
 ```
 
-无手时，不更新 Track；只把这一帧交给快照模块：
+无手时不更新 Track。只有当前确实需要生成快照时，才把这一帧交给快照模块：
 
 ```python
 def process_no_hand_frame(item_detections):
     # 调用者已确认当前帧无手。
+    # 一次结算完成后，should_collect_snapshot() 为 False；此时是待机，
+    # 但外层仍会继续以正常帧率运行 YOLO 和手检测。
+    if not should_collect_snapshot():
+        return None
+
     # collect_no_hand_snapshot_frame 是 no_hand_buffer 唯一的写入者。
     return collect_no_hand_snapshot_frame(item_detections)
 ```
 
-有手时，`process_frame()` 调用 `clear_snapshot_buffer()`；因此手在凑满 N 帧前再次出现时，已累计的无手帧会被清空，但 Track 保持可更新状态。
+有手时，`process_frame()` 会立即令 `operation_pending = True` 并调用 `clear_snapshot_buffer()`；因此手在凑满 N 帧前再次出现时，已累计的无手帧会被清空，但 Track 保持可更新状态。手再次离开后，`should_collect_snapshot()` 会重新为 True，开始累计新的连续 N 帧。
 
 
 ## 5. 创建候选 Track
