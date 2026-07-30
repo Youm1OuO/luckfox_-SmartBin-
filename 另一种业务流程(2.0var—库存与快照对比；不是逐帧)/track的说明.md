@@ -86,6 +86,7 @@ def process_frame(item_detections, hand_detections):
     if 手的数量 > 1:
         # 本版本不处理多手或交叉手。
         no_hand_buffer.clear()
+        operation_pending = True
         track_session_is_ambiguous = True
         return
 
@@ -228,7 +229,8 @@ def update_track_by_visible_item(track, D, hand):
             track.seen_hand_contact = True
 
         hand_and_item_move_together = (
-            hand_delta 的长度 > hand_move_eps
+            手与 D 有接触证据
+            and hand_delta 的长度 > hand_move_eps
             and object_delta 的长度 > move_eps
             and object_delta 与 hand_delta 的方向、幅度大致一致
         )
@@ -348,10 +350,10 @@ def get_unique_move_pairs(库存物品, 快照物品, frozen_tracks):
             if B.cls_id != A.cls_id:
                 continue
 
-            if abs(B.box.width - A.box.width) > eps_w:
+            if abs(B.box.width - expected_end_box.width) > eps_w:
                 continue
 
-            if abs(B.box.height - A.box.height) > eps_h:
+            if abs(B.box.height - expected_end_box.height) > eps_h:
                 continue
 
             if B.box 与 expected_end_box 不足够接近:
