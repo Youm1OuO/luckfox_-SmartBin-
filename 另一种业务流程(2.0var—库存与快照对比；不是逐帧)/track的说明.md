@@ -21,6 +21,8 @@ Track 证据不足或对应不唯一
 
 `hold_and_move` 是 Track 内部的证据，不在库存对比主流程中单独使用。
 
+Track 从创建起一直可更新，直到连续 N 帧无手已经生成稳定快照。手在凑满 N 帧前再次出现时，视为同一次尚未结算的复合操作；此时 Track 不冻结，仍可继续更新。
+
 
 ## 2. 一个 A 只能有一条 Track
 
@@ -70,6 +72,8 @@ Track:
     release_box         # 已确认放下的位置；没有则为 None
     hand_path           # 本次操作的手框轨迹，仅用于调试或后续扩展
     proxy_path          # 已确认 proxy_box 的轨迹，仅用于调试或后续扩展
+
+    frozen              # 初始 False；稳定快照生成后设为 True，结算期间禁止更新
 ```
 
 `proxy_box` 保持 `start_box` 的宽高。只有验证“手确实带着 A 移动”后，才允许按物品或手的位移平移它；物品完全看不见时，绝不能把手框当成物品框。
@@ -80,29 +84,32 @@ Track:
 ```python
 def process_frame(item_detections, hand_detections):
     if 手的数量 == 0:
-        process_no_hand_frame(item_detections)
-        return
+        return process_no_hand_frame(item_detections)
 
     if 手的数量 > 1:
         # 本版本不处理多手或交叉手。
-        no_hand_buffer.clear()
+        clear_snapshot_buffer()
         operation_pending = True
         track_session_is_ambiguous = True
-        return
+        return None
 
     hand = 唯一的手框
-    no_hand_buffer.clear()
+    clear_snapshot_buffer()
     operation_pending = True
+
+    # 正常情况下冻结只会发生在快照生成后的同步结算期间。
+    # 这里仍显式排除 frozen Track，保证任何更新函数都不会修改它们。
+    active_track_buffer = track_buffer 中所有 track.frozen == False 的 Track
 
     # 第一步：先更新旧 Track；绝不为已有 Track 的 A 再创建 Track。
     detection_track_pairs = 当前 Detection 与现有 Track 的双向唯一关联(
-        item_detections, track_buffer
+        item_detections, active_track_buffer
     )
 
     for D, track in detection_track_pairs:
         update_track_by_visible_item(track, D, hand)
 
-    for track in 本帧没有匹配到 Detection 的旧 Track:
+    for track in active_track_buffer 中本帧没有匹配到 Detection 的旧 Track:
         update_track_by_hand_or_mark_invalid(track, item_detections, hand)
 
     删除 state == INVALID 的 Track
@@ -112,6 +119,7 @@ def process_frame(item_detections, hand_detections):
         if A.status != 【可见】:
             continue
 
+        # 即使已有 Track 正被冻结，也不能再为同一个 A 新建一条 Track。
         if A.item_id in track_buffer:
             continue
 
@@ -119,25 +127,16 @@ def process_frame(item_detections, hand_detections):
             create_candidate_track(A, hand, 当前与 A 对应的 Detection 或 None)
 ```
 
-无手时，不更新 Track：
+无手时，不更新 Track；只把这一帧交给快照模块：
 
 ```python
 def process_no_hand_frame(item_detections):
-    if 上一帧有手:
-        freeze_all_tracks()
-        no_hand_buffer.clear()
-        no_hand_buffer.append(当前帧)
-        return
-
-    if 物品明显移动、突然出现或突然消失:
-        # 手可能漏检；此时不能生成稳定快照，
-        # 但也不能创建可确认整理的正式 Track。
-        no_hand_buffer.clear()
-        operation_pending = True
-        return
-
-    no_hand_buffer.append(当前帧)
+    # 调用者已确认当前帧无手。
+    # collect_no_hand_snapshot_frame 是 no_hand_buffer 唯一的写入者。
+    return collect_no_hand_snapshot_frame(item_detections)
 ```
+
+有手时，`process_frame()` 调用 `clear_snapshot_buffer()`；因此手在凑满 N 帧前再次出现时，已累计的无手帧会被清空，但 Track 保持可更新状态。
 
 
 ## 5. 创建候选 Track
@@ -162,6 +161,7 @@ def create_candidate_track(A, hand, D_or_None):
     track.last_hand_box = hand.box
 
     track.hold_and_move = False
+    track.frozen = False
     track.seen_hand_contact = True
     track.seen_effective_move = False
     track.still_at_start_count = 0
@@ -208,6 +208,8 @@ def create_candidate_track(A, hand, D_or_None):
 ```python
 def update_track_by_visible_item(track, D, hand):
     # D 与 track 已在本帧双向唯一关联。
+    if track.frozen:
+        return
 
     if track.state == PLACED and 手没有重新接触 D:
         # 手可能已经转去操作别的物品；已放下的 A 不应继续跟手移动。
@@ -271,6 +273,9 @@ def update_track_by_visible_item(track, D, hand):
 
 ```python
 def update_track_by_hand_or_mark_invalid(track, item_detections, hand):
+    if track.frozen:
+        return
+
     A = item_by_id[track.bound_item_id]
     hand_delta = center(hand.box) - center(track.last_hand_box)
 
@@ -316,9 +321,35 @@ def update_track_by_hand_or_mark_invalid(track, item_detections, hand):
 “连续若干帧”用于抵抗 YOLO 单帧漏检或小抖动，不能只凭一帧就把候选 Track 判真或判假。
 
 
-## 7. 稳定快照后，输出唯一整理配对
+## 7. 稳定快照生成后冻结 Track，再输出唯一整理配对
 
-手离开后，Track 冻结。连续 N 帧无手且稳定得到快照后，Track 只处理仍未匹配的 A、B。
+Track 不在手离开时冻结；只有连续 N 帧无手已经生成稳定快照时，才冻结本次尚未结算的所有 Track。这样手在 N 帧前再次出现时，Track 仍可继续记录同一次复合操作。
+
+```python
+def freeze_all_tracks():
+    frozen_tracks.clear()
+
+    for track in track_buffer.values():
+        if track.state == INVALID:
+            continue
+
+        track.frozen = True
+        frozen_tracks.append(track)
+
+    return frozen_tracks
+
+
+def clear_tracks_after_settlement():
+    # 结算完成后这批 Track 不再有用途。
+    # 先恢复 frozen 标记，再同时清空活动与冻结集合。
+    for track in frozen_tracks:
+        track.frozen = False
+
+    frozen_tracks.clear()
+    track_buffer.clear()
+```
+
+库存结算期间，所有更新 Track 的函数都会先检查 `track.frozen`；被冻结的 Track 不允许再被修改。
 
 ```python
 def get_unique_move_pairs(库存物品, 快照物品, frozen_tracks):
@@ -330,6 +361,9 @@ def get_unique_move_pairs(库存物品, 快照物品, frozen_tracks):
 
     for track in frozen_tracks:
         if track.state == INVALID:
+            continue
+
+        if track.frozen != True:
             continue
 
         if track.hold_and_move != True:
