@@ -125,18 +125,26 @@ def process_frame(item_detections, hand_detections):
 
     删除 state == INVALID 的 Track
 
-    # 第二步：只为“尚无 Track”的 A 创建候选 Track。
-    for A in 库存物品:
-        if A.status != 【可见】:
-            continue
+    # 第二步：2.0 的单次结果约定只允许本段连续手操作有一个候选 Track。
+    # 若已有 Track，不能再因手框靠近相邻物品继续新建。
+    if track_buffer 为空:
+        candidate_tracks = []
+        for A in 库存物品:
+            if A.status != 【可见】:
+                continue
+            if 手与 A 有有效接触证据:
+                candidate_tracks.append(A, 当前与 A 对应的 Detection 或 None)
 
-        # 即使已有 Track 正被冻结，也不能再为同一个 A 新建一条 Track。
-        if A.item_id in track_buffer:
-            continue
-
-        if 手与 A 有有效接触证据:
-            create_candidate_track(A, hand, 当前与 A 对应的 Detection 或 None)
+        # 完整被手覆盖 > 当前帧实际重叠 > 仅附近；分数相同按稳定 item_id。
+        A, D = candidate_tracks 中接触证据最强的一条
+        if A 存在:
+            create_candidate_track(A, hand, D)
 ```
+
+补充两个关联保护：
+
+1. “最多一条候选”的限制会避免实际只拿 A、再把 A 放到 B 前方时，B 因手框靠近或临时消失又生成假 Track；B 应留给稳定快照和 `block_ids` 处理。这个限制正是 2.0 “单次只处理一个最终结果”的实现边界。
+2. 若 Track 对应的前景物品原本挡住了一件 `OCCLUDED` 库存物品，手带着该前景物品移动时，优先尝试 `proxy_box + hand_delta` 附近、且仍与手接触的 Detection。这样前景物品移开后，原位置重新露出的同类后景 Detection 不会错误接管前景 Track。
 
 当前帧第一次检测到手、而前一帧没有手时，要保留前一帧的 YOLO 结果：
 用**当前手框**与前一帧中 A 的框（或库存中 A 的最近 box）判断接触 / 完全遮挡，

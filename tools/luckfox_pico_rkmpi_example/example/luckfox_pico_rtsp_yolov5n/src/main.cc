@@ -22,6 +22,8 @@
 #include <sys/poll.h>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
+#include <deque>
 #include <vector>
 #include <thread>
 
@@ -107,7 +109,9 @@ static bool request_backend_inventory(const char* device_id,
 
 	// 后台库存 GET/POST 协议还没有在端侧落地。这里保留明确接入点：
 	// 后续拿到后端返回 JSON 后，只需要在本函数里填充 items 并返回 true。
-	printf("[BACKEND] 开门库存获取接口未接入，使用首个无手稳定快照兜底\n");
+	// 后台未接入期间，SessionManager 会依据配置决定是否用首次稳定快照建立
+	// 本地测试库存；接入可信后台后可关闭该测试兜底。
+	printf("[BACKEND] 开门库存获取接口未接入；将按测试配置处理首次快照\n");
 	return false;
 }
 
@@ -139,6 +143,32 @@ static double update_no_event_pixel_diff(const cv::Mat& frame,
 	double mean_diff = cv::mean(diff)[0];
 	small.copyTo(last_gray_small);
 	return mean_diff;
+}
+
+// 门状态机只使用原始 Y 平面，不依赖缩放、翻转或 YOLO 输出。
+static double raw_dark_pixel_ratio(const cv::Mat& y_plane) {
+	if (y_plane.empty() || y_plane.total() == 0) return 0.0;
+	cv::Mat dark_mask;
+	cv::threshold(y_plane, dark_mask, fridge::DOOR_DARK_PIXEL_THRESHOLD,
+	              255, cv::THRESH_BINARY_INV);
+	return (double)cv::countNonZero(dark_mask) / (double)y_plane.total();
+}
+
+static double median_brightness(const std::deque<double>& values) {
+	if (values.empty()) return 0.0;
+	std::vector<double> ordered(values.begin(), values.end());
+	std::sort(ordered.begin(), ordered.end());
+	const size_t mid = ordered.size() / 2;
+	return ordered.size() % 2 ? ordered[mid] : (ordered[mid - 1] + ordered[mid]) * 0.5;
+}
+
+static bool is_high_confidence_closing_dark(double mean_brightness,
+	                                           double dark_pixel_ratio,
+	                                           double open_brightness_reference) {
+	return open_brightness_reference > 0.0 &&
+	       mean_brightness <= fridge::DOOR_CLOSING_GUARD_THRESHOLD &&
+	       mean_brightness <= open_brightness_reference * fridge::DOOR_CLOSING_DROP_RATIO &&
+	       dark_pixel_ratio >= fridge::DOOR_CLOSING_DARK_PIXEL_RATIO_THRESHOLD;
 }
 
 static cv::Scalar display_color_for_class(int cls_id) {
@@ -295,17 +325,27 @@ int main(int argc, char *argv[]) {
 	// ============================================================
 	fridge::SessionManager session;
 	fridge::CloudUploader cloud;
-	cloud.start();
+	bool cloud_enabled = fridge::CLOUD_ENABLED;
+	if (const char* env_cloud_enabled = getenv("FRIDGE_CLOUD_ENABLED")) {
+		cloud_enabled = atoi(env_cloud_enabled) != 0;
+	}
+	if (cloud_enabled) {
+		cloud.start();
+	} else {
+		printf("[CLOUD] 离线测试模式：已关闭登录、心跳和事件上传 "
+		       "（需要后台时设置 FRIDGE_CLOUD_ENABLED=1）\n");
+	}
 	int g_frame_id = 0;
 
 	// ============================================================
-	//  开关门检测（全局亮度阈值法）
+	//  开关门状态机：CLOSED / OPENING / OPEN / CLOSING
 	// ============================================================
-	bool door_open = false;
-	const double DOOR_DARK_THRESH = 50.0;
-	int dark_streak = 0;
-	int bright_streak = 0;
-	const int DOOR_CONFIRM = 5;
+	enum class DoorState { CLOSED, OPENING, OPEN, CLOSING };
+	DoorState door_state = DoorState::CLOSED;
+	int opening_confirm_count = 0;
+	int closing_confirm_count = 0;
+	std::deque<double> recent_open_brightness;
+	double open_brightness_reference = 0.0;
 	int door_session_seq = 0;
 	char door_session_id[96] = "";
 	const double NO_EVENT_PIXEL_DIFF_THRESH = 2.0;
@@ -329,58 +369,113 @@ int main(int argc, char *argv[]) {
 			cv::cvtColor(yuv420sp, frame, cv::COLOR_YUV420sp2BGR);
 
 			// ============================================================
-			//  开关门检测：YUV420SP 的前 width*height 字节就是 Y(亮度)分量
+			//  开关门检测：YUV420SP 的前 width*height 字节就是原始 Y 平面。
+			//  进入 CLOSING 后立即停止 YOLO、Track、快照与结算，防止暗帧混入。
 			// ============================================================
+			bool run_yolo_this_frame = false;
 			{
 				cv::Mat y_plane(height, width, CV_8UC1, vi_data);
-				double mean_y = cv::mean(y_plane)[0];
+				const double mean_y = cv::mean(y_plane)[0];
+				const double dark_ratio = raw_dark_pixel_ratio(y_plane);
+				const bool high_confidence_closing = is_high_confidence_closing_dark(
+					mean_y, dark_ratio, open_brightness_reference);
 
-				bool dark_now = (mean_y < DOOR_DARK_THRESH);
-				if (dark_now) { dark_streak++; bright_streak = 0; }
-				else          { bright_streak++; dark_streak = 0; }
+				if (door_state == DoorState::CLOSED) {
+					if (mean_y >= fridge::DOOR_OPENING_CANDIDATE_BRIGHTNESS) {
+						door_state = DoorState::OPENING;
+						opening_confirm_count = 1;
+					}
+				} else if (door_state == DoorState::OPENING) {
+					if (mean_y >= fridge::DOOR_OPEN_LIGHT_THRESHOLD) {
+						++opening_confirm_count;
+						if (opening_confirm_count >= fridge::DOOR_OPEN_CONFIRM_FRAME_COUNT) {
+							door_state = DoorState::OPEN;
+							recent_open_brightness.clear();
+							recent_open_brightness.push_back(mean_y);
+							open_brightness_reference = mean_y;
+							printf("\n\033[1;33m[DOOR]\033[0m 开门 (亮度=%.0f)\n", mean_y);
+							RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
+							door_session_seq++;
+							snprintf(door_session_id, sizeof(door_session_id),
+							         "%lld_%d_%s", (long long)ts, door_session_seq,
+							         cloud.device_id.c_str());
+							session.start_new_session((long long)ts);
+							no_event_last_gray_small.release();
+							no_event_stable_count = 0;
+							last_no_event_upload_ms = 0;
 
-				if (door_open && dark_streak >= DOOR_CONFIRM) {
-					door_open = false;
-					printf("\n\033[1;33m[DOOR]\033[0m 关门 (亮度=%.0f), 上传库存:\n", mean_y);
-					RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
-					session.finish_session((long long)ts);
-					std::string json = session.inventory().to_json(
-						cloud.device_id.c_str(), (long long)ts, door_session_id);
-					printf("%s\n", json.c_str());
-					cloud.enqueue_inventory_snapshot(json, (long long)ts);
-					no_event_last_gray_small.release();
-					no_event_stable_count = 0;
-					last_no_event_upload_ms = 0;
-				} else if (!door_open && bright_streak >= DOOR_CONFIRM) {
-					door_open = true;
-					printf("\n\033[1;33m[DOOR]\033[0m 开门 (亮度=%.0f)\n", mean_y);
-					RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
-					door_session_seq++;
-					snprintf(door_session_id, sizeof(door_session_id),
-					         "%lld_%d_%s", (long long)ts, door_session_seq,
-					         cloud.device_id.c_str());
-
-					session.start_new_session((long long)ts);
-					no_event_last_gray_small.release();
-					no_event_stable_count = 0;
-					last_no_event_upload_ms = 0;
-
-					std::vector<fridge::InventoryItem> backend_items;
-					bool authoritative_empty = false;
-					if (request_backend_inventory(cloud.device_id.c_str(),
-					                              door_session_id,
-					                              (long long)ts,
-					                              backend_items,
-					                              &authoritative_empty)) {
-						session.init_from_backend(backend_items, authoritative_empty);
+							// 只有本地从未初始化库存时才访问后台；本地库存跨关门保留。
+							if (session.needs_backend_inventory()) {
+								std::vector<fridge::InventoryItem> backend_items;
+								bool authoritative_empty = false;
+								if (request_backend_inventory(cloud.device_id.c_str(),
+								                              door_session_id,
+								                              (long long)ts,
+								                              backend_items,
+								                              &authoritative_empty)) {
+									session.init_from_backend(backend_items, authoritative_empty);
+								} else {
+									session.mark_backend_unavailable();
+								}
+							} else {
+								printf("[SESSION] 使用跨关门保留的本地库存，不申请后台库存\n");
+							}
+						}
 					} else {
-						session.mark_backend_unavailable();
+						door_state = DoorState::CLOSED;
+						opening_confirm_count = 0;
+					}
+				} else if (door_state == DoorState::CLOSING) {
+					if (high_confidence_closing) {
+						++closing_confirm_count;
+						if (closing_confirm_count >= fridge::DOOR_CLOSE_CONFIRM_FRAME_COUNT) {
+							printf("\n\033[1;33m[DOOR]\033[0m 关门 (亮度=%.0f)\n", mean_y);
+							RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
+							const bool may_upload_inventory = session.has_local_inventory();
+							session.finish_session((long long)ts);
+							if (may_upload_inventory && cloud_enabled) {
+								std::string json = session.inventory().to_json(
+									cloud.device_id.c_str(), (long long)ts, door_session_id);
+								printf("%s\n", json.c_str());
+								cloud.enqueue_inventory_snapshot(json, (long long)ts);
+							} else if (may_upload_inventory) {
+								printf("[CLOUD] 离线测试模式：关门库存只保留本地，不上传\n");
+							} else {
+								printf("[BACKEND] 本次没有可信本地库存，跳过空库存上传\n");
+							}
+							door_state = DoorState::CLOSED;
+							closing_confirm_count = 0;
+							no_event_last_gray_small.release();
+							no_event_stable_count = 0;
+							last_no_event_upload_ms = 0;
+						}
+					} else {
+						// 暗帧误判恢复：只有真的已有 Track 时才丢弃并标记 ambiguous。
+						door_state = DoorState::OPEN;
+						closing_confirm_count = 0;
+						session.resume_after_false_closing();
+					}
+				} else {  // DoorState::OPEN
+					if (high_confidence_closing) {
+						door_state = DoorState::CLOSING;
+						closing_confirm_count = 1;
+						session.begin_closing_guard();
+					} else {
+						if (mean_y >= fridge::OPEN_REFERENCE_UPDATE_THRESHOLD &&
+						    dark_ratio <= fridge::OPEN_DARK_PIXEL_RATIO_LIMIT) {
+							recent_open_brightness.push_back(mean_y);
+							while ((int)recent_open_brightness.size() >
+							       fridge::OPEN_REFERENCE_WINDOW_SIZE) {
+								recent_open_brightness.pop_front();
+							}
+							open_brightness_reference = median_brightness(recent_open_brightness);
+						}
+						run_yolo_this_frame = true;
 					}
 				}
 			}
 
-			// 关门状态下，跳过识别
-			if (!door_open) {
+			if (!run_yolo_this_frame) {
 				memcpy(data, frame.data, width * height * 3);
 				RK_MPI_VENC_SendFrame(0, &h264_frame, -1);
 				s32Ret = RK_MPI_VENC_GetStream(0, &stFrame, -1);
@@ -567,14 +662,14 @@ int main(int argc, char *argv[]) {
 						job.x2 = (int)ev.box.x2;
 						job.y2 = (int)ev.box.y2;
 					}
-					cloud.enqueue(job);
+					if (cloud_enabled) cloud.enqueue(job);
 				}
 
 				if (!res.events.empty()) {
 					no_event_last_gray_small.release();
 					no_event_stable_count = 0;
 					last_no_event_upload_ms = 0;
-				} else if (!session.hand_present() && session.ready()) {
+				} else if (cloud_enabled && !session.hand_present() && session.ready()) {
 					double pixel_diff =
 						update_no_event_pixel_diff(frame, no_event_last_gray_small);
 					if (pixel_diff <= NO_EVENT_PIXEL_DIFF_THRESH) {
@@ -619,10 +714,11 @@ int main(int argc, char *argv[]) {
 					}
 				}
 
-				if (res.happened && !res.events.empty()) {
+				// 正式快照只要成功提交，就打印当前库存；即使本轮只是确认“无变化”，
+				// 终端也能看到它确实已经结算完成。
+				if (res.committed) {
+					printf("\n\033[1;36m[INVENTORY]\033[0m 快照结算已提交:\n");
 					session.print_inventory();
-					printf("\n\033[1;36m[INVENTORY]\033[0m 快照对比后库存:\n");
-					session.inventory().print("  ");
 				}
 			}
 

@@ -19,17 +19,20 @@ namespace fridge {
 
 // 投票缓冲区中的一个候选物品
 struct VotingItem {
-    int cls_id;
+    int cls_id = -1;
     BBox box;           // 平均位置（多帧加权平均）
-    float best_score;   // 最高分数
-    int count;          // 出现帧数
+    float best_score = 0.0f;   // 最高分数
+    int count = 0;             // 出现帧数
+    // 仅本轮结算使用。temporary_id 从 -1 递减；item_id=-1 表示尚未绑定库存。
+    int temporary_id = -1;
+    int item_id = -1;
 };
 
 // 一份快照（投票过滤后的最终结果）
 struct Snapshot {
     std::vector<VotingItem> items;  // 通过投票阈值的物品
-    int frame_id;                   // 快照帧号（最后一帧的帧号）
-    bool valid;                     // 是否是一份有效快照
+    int frame_id = 0;               // 快照帧号（最后一帧的帧号）
+    bool valid = false;             // 是否是一份有效快照
 };
 
 // 多帧投票缓冲区
@@ -42,6 +45,8 @@ public:
 
     // 缓冲区是否满（攒够 N 帧）
     bool full() const;
+    bool empty() const { return frames_.empty(); }
+    int size() const { return static_cast<int>(frames_.size()); }
 
     // 取出快照并重置缓冲区
     Snapshot take_snapshot();

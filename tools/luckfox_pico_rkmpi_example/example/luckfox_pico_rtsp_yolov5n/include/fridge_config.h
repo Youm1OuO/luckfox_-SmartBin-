@@ -149,6 +149,9 @@ constexpr const char* CLOUD_DEVICE_ID  = "luckfox-001";       // 设备 ID
 constexpr const char* CLOUD_USERNAME   = "admin";              // 登录用户名
 constexpr const char* CLOUD_PASSWORD   = "admin123";           // 登录密码
 constexpr int         HEARTBEAT_INTERVAL_SEC = 30;             // 心跳间隔（秒）
+// 当前离线测试默认关闭登录、心跳和事件上传；接入后台后改为 true，或在运行时设置
+// FRIDGE_CLOUD_ENABLED=1 覆盖本默认值。
+constexpr bool        CLOUD_ENABLED    = false;
 
 // =========================================================================
 //  推理输入颜色顺序开关（已实测定论）
@@ -185,19 +188,47 @@ constexpr int TRACK_BUFFER_FRAMES = 60;
 constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 
 // =========================================================================
-//  稳态切片 + 会话事件
+//  2.0 库存 / 快照流程超参数
+// -------------------------------------------------------------------------
+//  这里的常量只给出可运行的初始值；部署前必须按该摄像头、该模型和实际
+//  冰箱格局标定。详细的“地址 + 含义 + 调整方向”见：
+//  另一种业务流程(2.0var—库存与快照对比；不是逐帧)/超参数修改说明.md
 // =========================================================================
 
-// =========================================================================
-//  连续无手稳定快照
-// =========================================================================
-constexpr int   SNAPSHOT_N            = 4;        // 连续无手稳定帧数；不要求是奇数
-constexpr float SNAPSHOT_S            = 0.6f;     // 投票阈值百分比（N=4 时至少出现 3 帧）
-constexpr float SNAPSHOT_MIN_SCORE    = 0.5f;     // 最低检测分数（低于此分数的不进快照）
-constexpr long long FIRST_SNAPSHOT_EMPTY_GRACE_MS = 800LL; // 开门曝光稳定前不急着用0件快照判空
-// 仅用于快照聚类：把完整框与被包含的局部框归到同一候选。
-constexpr float PARTIAL_MATCH_CONTAINMENT    = 0.85f;
-constexpr float PARTIAL_MATCH_MAX_AREA_RATIO = 0.90f;
+// 连续无手稳定快照。
+// 票数采用严格大于 frames * SNAPSHOT_S：N=3、S=0.5 时至少需要 2 票。
+constexpr int   SNAPSHOT_N            = 3;
+constexpr float SNAPSHOT_S            = 0.5f;
+constexpr float SNAPSHOT_MIN_SCORE    = 0.5f;
+constexpr float SNAPSHOT_MIN_BOX_WIDTH  = 12.0f;
+constexpr float SNAPSHOT_MIN_BOX_HEIGHT = 12.0f;
+
+// 同一份快照内跨帧投票候选的严格关联。只用于快照投票，不用于库存结算。
+constexpr float SNAPSHOT_VOTE_CENTER_NORM = 0.30f;
+constexpr float SNAPSHOT_VOTE_WIDTH_RATIO = 0.25f;
+constexpr float SNAPSHOT_VOTE_HEIGHT_RATIO = 0.25f;
+
+// 库存 A 与快照 B 的“严格匹配”：类别相同 + 中心、宽、高均接近。
+constexpr float INVENTORY_STRICT_CENTER_NORM = 0.26f;
+constexpr float INVENTORY_STRICT_WIDTH_RATIO = 0.25f;
+constexpr float INVENTORY_STRICT_HEIGHT_RATIO = 0.25f;
+
+// “局部匹配”：类别相同且 IoM 接近 1。可见物品没有 blocker 时不应无故变大。
+constexpr float INVENTORY_PARTIAL_IOM = 0.84f;
+constexpr float VISIBLE_AREA_GROWTH_RATIO_EPS = 0.10f;
+constexpr float BASE_BOX_CONTAIN_EPS = 5.0f;
+
+// 动态矩形遮挡 / block_ids。
+constexpr float BLOCK_OVERLAP_AREA_EPS = 4.0f;
+constexpr float COVER_REMAINING_AREA_EPS = 4.0f;
+// YOLO 框存在边缘抖动时，刚由 Track 确认移动到前方的物品覆盖旧物品达到该比例，
+// 且旧物品在稳定快照中消失，可按“被遮挡”处理。仅用于本轮 MOVED 的前景物品，
+// 不会放宽普通静态缺失 / OUT 的判定。
+constexpr float TRACKED_BLOCKER_OCCLUSION_COVER_RATIO = 0.60f;
+
+// 当前尚未对接后台，允许首次无手稳定快照建立本地测试库存。
+// 接入可信后台后建议改为 false：此时冷启动快照只做只读校验，不负责建库。
+constexpr bool ALLOW_SNAPSHOT_BOOTSTRAP_WHEN_BACKEND_UNAVAILABLE = true;
 
 // =========================================================================
 //  手框
@@ -209,43 +240,43 @@ constexpr float OSD_STRONG_HAND_SCORE_THRESH = 0.45f;
 constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
 
 // =========================================================================
-//  稳定快照与库存的单框关系
-// -------------------------------------------------------------------------
-//  NORMAL / SHRINK / GROW 的所有阈值集中在这里；数值只作为初始值，
-//  必须用真实视频继续标定。
-// =========================================================================
-constexpr float SNAPSHOT_NORMAL_IOM          = 0.70f;
-constexpr float SNAPSHOT_CONTAIN_IOM         = 0.80f;
-constexpr float SNAPSHOT_CENTER_NORMAL        = 0.18f;
-constexpr float SNAPSHOT_CENTER_CONTAIN       = 0.55f;
-constexpr float SNAPSHOT_SHAPE_NORMAL         = 0.28f;
-constexpr float SNAPSHOT_SHAPE_CONTAIN        = 0.85f;
-// NORMAL 与 SHRINK / GROW 留出安全间隔，避免一个框同时落入两种关系。
-constexpr float SNAPSHOT_NORMAL_AREA_MIN      = 0.91f;
-constexpr float SNAPSHOT_NORMAL_AREA_MAX      = 1.09f;
-constexpr float SNAPSHOT_SHRINK_AREA_MAX      = 0.88f;
-constexpr float SNAPSHOT_GROW_AREA_MIN        = 1.12f;
-constexpr float SNAPSHOT_GROW_AREA_MAX        = 4.00f;
-constexpr float SNAPSHOT_BLOCK_COVER          = 0.55f;
-constexpr float SNAPSHOT_FULL_COVER           = 0.80f;
-constexpr float SNAPSHOT_LEAVE_COVER_MAX      = 0.15f;
-
-// =========================================================================
 //  OperationTrack 参数
 // -------------------------------------------------------------------------
-// Track 只辅助确认 MOVED；它不参与快照中的 NORMAL / SHRINK / GROW 裁决。
+// Track 是 2.0 中确认“整理 / 出库”的唯一来源；静态快照不能单独判 OUT。
 // =========================================================================
-constexpr float TRACK_REAPPEAR_CENTER_NORM  = 1.35f;
-constexpr float TRACK_FRAME_CENTER_NORM     = 0.85f;
-constexpr float TRACK_FRAME_WIDTH_RATIO     = 0.85f;
-constexpr float TRACK_FRAME_HEIGHT_RATIO    = 0.85f;
-constexpr float TRACK_HAND_NEAR_NORM        = 1.40f;
+constexpr float TRACK_ASSOCIATE_CENTER_NORM  = 1.00f;
+constexpr float TRACK_ASSOCIATE_WIDTH_RATIO  = 0.70f;
+constexpr float TRACK_ASSOCIATE_HEIGHT_RATIO = 0.70f;
+constexpr float TRACK_START_REAPPEAR_CENTER_NORM = 0.55f;
+constexpr float TRACK_HAND_NEAR_NORM         = 1.25f;
 constexpr float TRACK_HAND_OVERLAP           = 0.12f;
-// Candidate 升级为正式 Track 所需的最小位移；比“静止”阈值宽，避免 YOLO 微抖动建轨。
-constexpr float TRACK_CREATE_MOTION_NORM     = 0.25f;
-// 完全遮挡 Candidate 必须被手覆盖较大部分，不能只因手在附近就建立。
-constexpr float TRACK_FULL_OCCLUSION_OVERLAP = 0.50f;
-constexpr float TRACK_PLACED_SIZE_RATIO     = 0.50f;
+constexpr float TRACK_FULL_OCCLUSION_OVERLAP = 0.58f;
+constexpr float TRACK_CARRY_OVERLAP          = 0.20f;
+constexpr float TRACK_HAND_MOVE_EPS          = 12.0f;
+constexpr float TRACK_OBJECT_MOVE_EPS        = 10.0f;
+constexpr float TRACK_MOVE_DIRECTION_COS_MIN = 0.65f;
+constexpr float TRACK_MOVE_MAGNITUDE_RATIO_MIN = 0.25f;
+constexpr float TRACK_MOVE_MAGNITUDE_RATIO_MAX = 3.50f;
+constexpr int   TRACK_STILL_AT_START_FRAME_LIMIT = 3;
+constexpr int   TRACK_LOST_FRAME_LIMIT = 4;
+constexpr float TRACK_SETTLEMENT_CENTER_EPS = 38.0f;
+constexpr float TRACK_SETTLEMENT_WIDTH_EPS  = 28.0f;
+constexpr float TRACK_SETTLEMENT_HEIGHT_EPS = 28.0f;
+
+// =========================================================================
+//  门状态机（CLOSED / OPENING / OPEN / CLOSING）
+// =========================================================================
+constexpr float DOOR_OPENING_CANDIDATE_BRIGHTNESS = 58.0f;
+constexpr float DOOR_OPEN_LIGHT_THRESHOLD = 68.0f;
+constexpr int   DOOR_OPEN_CONFIRM_FRAME_COUNT = 5;
+constexpr float DOOR_CLOSING_GUARD_THRESHOLD = 42.0f;
+constexpr float DOOR_CLOSING_DROP_RATIO = 0.62f;
+constexpr float DOOR_DARK_PIXEL_THRESHOLD = 38.0f;
+constexpr float DOOR_CLOSING_DARK_PIXEL_RATIO_THRESHOLD = 0.72f;
+constexpr int   DOOR_CLOSE_CONFIRM_FRAME_COUNT = 5;
+constexpr float OPEN_REFERENCE_UPDATE_THRESHOLD = 72.0f;
+constexpr float OPEN_DARK_PIXEL_RATIO_LIMIT = 0.35f;
+constexpr int   OPEN_REFERENCE_WINDOW_SIZE = 20;
 
 // =========================================================================
 //  帧尺寸（用于手部扩展等计算）
