@@ -2,7 +2,8 @@
 
 ## 1. Track 的作用
 
-> Track 只负责确认：库存中原本【可见】的物品 A，是否被整理到了稳定快照中的物品 B。
+> Track 先确认：库存中原本【可见】的物品 A，是否真的被手移动过。
+> Track 不逐帧修改库存；稳定快照生成后，才把“已移动”的证据和最终画面一起用于结算。
 
 ```text
 逐帧 YOLO 结果
@@ -12,16 +13,20 @@
 稳定快照
 → 才用于库存结算。
 
-Track 证据足够且 A、B 唯一对应
+hold_and_move=True 的 A，若有唯一终点 B
 → 输出 “A 整理到 B”。
 
-Track 证据不足或对应不唯一
-→ 不判整理，交给普通的遮挡 / 出库 / 入库流程。
+hold_and_move=True 的 A，若没有任何终点 B
+→ 按 2.0 的单次结果约定，输出 “A 出库”。
+
+候选终点不唯一 / Track 会话 ambiguous
+→ 本轮不强行修改该 A。
 ```
 
-`hold_and_move` 是 Track 内部的证据，不在库存对比主流程中单独使用。
+这里的“没有终点 B 就出库”是 2.0 的业务约定：一次结算只处理一个最终结果，
+不支持“把 A 移动后又放到不可见处”这类复合动作。若以后要支持该类动作，不能沿用这条规则。
 
-Track 从创建起一直可更新，直到连续 N 帧无手已经生成稳定快照。手在凑满 N 帧前再次出现时，视为同一次尚未结算的复合操作；此时 Track 不冻结，仍可继续更新。
+Track 从创建起一直可更新，直到连续 N 帧无手已经生成稳定快照。手在凑满 N 帧前再次出现时，说明还没有得到可结算的静态结果；此时 Track 不冻结，仍可继续更新。最终结算仍只接受一个【整理】或【出库】结果。
 
 
 ## 2. 一个 A 只能有一条 Track
@@ -45,7 +50,8 @@ track_buffer[A1.item_id]
 track_buffer[A2.item_id]
 ```
 
-它们都是弱候选，初始 `hold_and_move=False`。最后只有满足双向唯一关系的 Track 才能确认整理；不是“一条 Track 绑定多个 A”。
+它们都是弱候选，初始 `hold_and_move=False`。稳定快照生成前会删除没有确认移动的候选；
+保留下来的 Track 才参与“整理 / 出库”判断。不是“一条 Track 绑定多个 A”。
 
 注意：当前帧的 YOLO Detection 没有库存 `item_id`。`track.bound_item_id` 只是 Track 记住的起始库存 A；当前 Detection 必须依靠类别、位置和上一帧信息与 Track 做一对一关联，不能直接靠 `item_id` 匹配。
 
@@ -63,6 +69,7 @@ Track:
     last_hand_box       # 上一次手框
 
     state               # VISIBLE / HAND_OCCLUDED / PLACED / INVALID
+    shelter_or_hold     # 已有手接触或手完全遮挡 A 的候选证据
     hold_and_move       # 初始 False；本次操作结束后清除
     seen_hand_contact   # 是否已有有效接触证据
     seen_effective_move # 是否已有有效移动证据
@@ -80,6 +87,10 @@ Track:
 
 
 ## 4. 每帧处理顺序
+
+Track 还需要保留上一帧的完整 YOLO 输出（物品检测、手检测以及“上一帧是否有手”）。
+它不是 `no_hand_buffer`：无论当前是否需要收集快照，都要在**本帧 Track 处理结束后**把当前结果保存为下一帧的上一帧结果。
+因此，第一次出现手时可以用“当前手框 + 上一帧物品框”建立候选，而不会因当前物品已经被手遮住而漏掉 A。
 
 ```python
 def process_frame(item_detections, hand_detections):
@@ -127,6 +138,10 @@ def process_frame(item_detections, hand_detections):
             create_candidate_track(A, hand, 当前与 A 对应的 Detection 或 None)
 ```
 
+当前帧第一次检测到手、而前一帧没有手时，要保留前一帧的 YOLO 结果：
+用**当前手框**与前一帧中 A 的框（或库存中 A 的最近 box）判断接触 / 完全遮挡，
+再创建候选 Track。不能只依赖当前帧的物品 Detection，因为 A 可能已经被手遮住。
+
 无手时不更新 Track。只有当前确实需要生成快照时，才把这一帧交给快照模块：
 
 ```python
@@ -165,6 +180,7 @@ def create_candidate_track(A, hand, D_or_None):
     track.proxy_box = A.base_box
     track.last_hand_box = hand.box
 
+    track.shelter_or_hold = True
     track.hold_and_move = False
     track.frozen = False
     track.seen_hand_contact = True
@@ -326,20 +342,27 @@ def update_track_by_hand_or_mark_invalid(track, item_detections, hand):
 “连续若干帧”用于抵抗 YOLO 单帧漏检或小抖动，不能只凭一帧就把候选 Track 判真或判假。
 
 
-## 7. 稳定快照生成后冻结 Track，再输出唯一整理配对
+## 7. 稳定快照生成后先删除未移动候选，再输出整理 / 出库结果
 
-Track 不在手离开时冻结；只有连续 N 帧无手已经生成稳定快照时，才冻结本次尚未结算的所有 Track。这样手在 N 帧前再次出现时，Track 仍可继续记录同一次复合操作。
+Track 不在手离开时冻结；只有连续 N 帧无手已经生成稳定快照时，才冻结本次尚未结算的所有 Track。这样手在 N 帧前再次出现时，Track 仍可继续记录；最终输出仍受“单次只处理一个结果”的限制。
 
 ```python
 def freeze_all_tracks():
+    # 先删除“只碰到 / 只遮挡、但没有确认移动”的候选。
+    # 因此冻结后 frozen_tracks 中每条 Track 都满足 hold_and_move == True。
     frozen_tracks.clear()
+    track_ids_to_delete = []
 
-    for track in track_buffer.values():
-        if track.state == INVALID:
+    for item_id, track in track_buffer:
+        if track.state == INVALID or track.hold_and_move != True:
+            track_ids_to_delete.append(item_id)
             continue
 
         track.frozen = True
         frozen_tracks.append(track)
+
+    for item_id in track_ids_to_delete:
+        track_buffer.erase(item_id)
 
     return frozen_tracks
 
@@ -368,24 +391,30 @@ def discard_tracks_and_mark_ambiguous():
 库存结算期间，所有更新 Track 的函数都会先检查 `track.frozen`；被冻结的 Track 不允许再被修改。
 
 `discard_tracks_and_mark_ambiguous()` 用于 Track 证据已经断开、却还不能修改库存的情况。
-之后仍可收集新的稳定快照并按库存对比结算，但本次开门 Session 不再用 Track 确认“整理”；
+之后仍可收集新的稳定快照并按库存对比结算，但本次开门 Session 不再用 Track 确认“整理”或“出库”；
 直到一次库存结算成功提交后，才把 `track_session_is_ambiguous` 清回 `False`。
 
 ```python
-def get_unique_move_pairs(库存物品, 快照物品, frozen_tracks):
+TrackSettlementResult:
+    move_pairs = []         # [(A.item_id, B.temporary_id)]
+    out_item_ids = set()    # 已移动、但没有终点 B 的 A.item_id
+    ambiguous_item_ids = set()  # 终点不唯一，不能本轮修改的 A.item_id
+
+
+def get_track_settlement_result(库存物品, 快照物品, frozen_tracks, item_by_id):
+    result = TrackSettlementResult()
+
     if track_session_is_ambiguous:
-        return []
+        return result
 
     track_A_to_B = {}
     track_B_to_A = {}
+    moved_item_ids = []
 
     for track in frozen_tracks:
-        if track.state == INVALID:
+        # freeze_all_tracks() 已过滤过；这里仍作防御性检查。
+        if track.state == INVALID or track.frozen != True:
             continue
-
-        if track.frozen != True:
-            continue
-
         if track.hold_and_move != True:
             continue
 
@@ -393,57 +422,73 @@ def get_unique_move_pairs(库存物品, 快照物品, frozen_tracks):
         if A.status != 【可见】 or A.affirm:
             continue
 
+        moved_item_ids.append(A.item_id)
+        track_A_to_B[A.item_id] = set()
         expected_end_box = track.release_box
         if expected_end_box is None:
             expected_end_box = track.proxy_box
 
         for B in 快照物品:
-            if B.item_id != -1:
+            if B.item_id != -1 or B.cls_id != A.cls_id:
                 continue
-
-            if B.cls_id != A.cls_id:
-                continue
-
             if abs(B.box.width - expected_end_box.width) > eps_w:
                 continue
-
             if abs(B.box.height - expected_end_box.height) > eps_h:
                 continue
-
             if B.box 与 expected_end_box 不足够接近:
                 continue
 
             track_A_to_B[A.item_id].add(B.temporary_id)
-            track_B_to_A[B.temporary_id].add(A.item_id)
+            track_B_to_A.setdefault(B.temporary_id, set()).add(A.item_id)
 
-    unique_move_pairs = []
+    for A_item_id in moved_item_ids:
+        candidate_B_ids = track_A_to_B[A_item_id]
 
-    for A_item_id in track_A_to_B:
-        if track_A_to_B[A_item_id].size != 1:
+        if candidate_B_ids.size == 0:
+            # 2.0 约定：A 已确认被移动，稳定快照却没有终点 B，即出库。
+            result.out_item_ids.add(A_item_id)
             continue
 
-        B_id = track_A_to_B[A_item_id][0]
+        if candidate_B_ids.size != 1:
+            result.ambiguous_item_ids.add(A_item_id)
+            continue
 
+        B_id = candidate_B_ids 的唯一元素
         if track_B_to_A[B_id].size != 1:
+            result.ambiguous_item_ids.add(A_item_id)
             continue
 
-        unique_move_pairs.append((A_item_id, B_id))
+        result.move_pairs.append((A_item_id, B_id))
 
-    return unique_move_pairs
+    # 2.0 的业务前提是一轮只处理一个最终结果。若同一稳定快照中
+    # 出现多个已确认的“整理 / 出库”结果，不能批量套用，应等待下一轮。
+    confirmed_item_ids = [A_item_id for A_item_id, _ in result.move_pairs]
+    confirmed_item_ids.extend(result.out_item_ids)
+    if confirmed_item_ids.size > 1:
+        for A_item_id in confirmed_item_ids:
+            result.ambiguous_item_ids.add(A_item_id)
+        result.move_pairs.clear()
+        result.out_item_ids.clear()
+
+    return result
 ```
 
-库存对比主流程只使用 `unique_move_pairs`：确认 A 与 B 为整理后，再更新 A 的 `box`、`base_box` 和其他物品的 `block_ids`。
+库存对比主流程只使用 `TrackSettlementResult`：唯一 A-B 对确认整理；
+零个终点 B 对确认出库；不唯一，或同一轮出现多个已确认结果，则本轮不强行修改。
 
 
 ## 8. 边界与取舍
 
 ```text
 多手、手交叉、手身份丢失
-→ 本版本不使用 Track 确认整理。
+→ 本版本不使用 Track 确认整理或出库。
 
 用户拿走 A，又放入同类同尺寸 B，且 B 落在 Track 终点附近
 → 仍可能被判为 A 整理；这是已接受的业务取舍。
 
 A 或 B 的候选不唯一
-→ Track 放弃确认整理，不能强行分配 item_id。
+→ Track 放弃确认整理或出库，不能强行分配 item_id 或删除 A。
+
+一次操作把 A 移到不可见处
+→ 这属于 2.0 明确不处理的复合结果；当前规则会把它视为出库。
 ```
