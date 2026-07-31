@@ -280,100 +280,13 @@ for A in working_inventory:
 
 
 
-## 2. 处理[整理]或[出库]
-> 之前已经处理了严格匹配成功的(那些严格匹配成功的物品, 其大概率就是前后一点变化也没有的, 他们可以先)
-
-## 2.1 先处理[整理]
-```python
-# frozen_tracks：
-# 本轮稳定快照已经生成后被冻结、且尚未清除的 Track
-# 此函数内部会自动跳过：
-# - Track 证据不足的情况；
-# - hold_and_move != True 的情况；
-# - A / B 不唯一的情况；
-# - 已在严格匹配、局部匹配中绑定的 A / B。
+## 2. 局部匹配
+> 局部匹配只处理严格匹配后仍未绑定的物品
+> 局部匹配也应该跳过【遮挡】的物品 (先让【可见】与看得见的物品匹配, 这样更稳)
+> 局部匹配同样先收集候选, 再接受双向唯一关系
 
 
-## 2.2 处理[出库]
-> [出库]的判断必定要有track, 并且这个物品原本在库存中可见, 而现在看不到(匹配不上)
-
-```python
-for A_item_id in original_item_ids:
-    if not item_by_id.contains_key(A_item_id):
-        continue    # A 已在前面阶段出库
-    A = item_by_id[A_item_id]
-
-    if A.status != 【可见】 or A.affirm or 不存在A的track:
-        continue
-    
-    temp_partial_A_to_B[] # A 可以局部匹配的 B.temporary_id 列表
-
-    for B in 快照物品:
-        if B.item_id != -1 or B.cls_id != A.cls_id:
-            continue
-        if B与A的track的路径至少有一个匹配上 and B.box的宽>=A.box的宽 and B.box的高>=A.box的高:
-            temp_partial_A_to_B[A.item_id].add(B.temporary_id)
-        
-        if temp_partial_A_to_B.size() == 1:
-            # 说明A整理移动到了B的位置
-            # B.box 就是整理后 A 的新 base_box
-            A.box = B.box
-            A.base_box = A.box
-
-            # 正式确认 A 整理到 B
-            A.affirm = True
-            B.item_id = A.item_id
-            matched_snapshot_of_item[A.item_id] = B
-
-            # 按当前业务假设：整理后的 A 不被其他物品遮挡
-            A.block_ids.clear()
-
-            # 更新“被 A 遮挡”的其他库存物品 C
-            for C in working_inventory:
-                if C.item_id == A.item_id:
-                    continue
-
-                if A.item_id in C.block_ids \
-                    and intersection_area(A.base_box, C.base_box) <= overlap_area_eps:
-                    C.block_ids.erase(A.item_id)
-
-                if intersection_area(A.base_box, C.base_box) > overlap_area_eps:
-                    C.block_ids.insert(A.item_id)
-        elif temp_partial_A_to_B.size() == 0:
-            # 说明A出库了
-                removed_item_id = A.item_id
-                物品 A 出库, 修改状态
-                A.affirm = True
-                item_by_id.erase(removed_item_id)
-                # 旧物品出库, 要处理 .block_ids
-                for C in working_inventory:
-                    if removed_item_id in C.block_ids:
-                        C.block_ids.erase(removed_item_id)    # 删不了也不要报错
-```
-
-
-## 3. 匹配库存中剩下的物品
-
-> 前面已经处理了[严格匹配]与[整理与出库]的判断了
-> 接下来处理库存中剩下的物品, 先进行[局部匹配]
-> 进行局部匹配时要先单独处理【可见】物品的局部匹配, 然后再单独处理【遮挡】物品的局部匹配
-> 因为【可见】物品原先是可见的, 我们应该给他一个优先, 让【可见】物品先匹配, 匹配成功后, 才去匹配【遮挡】物品
-<!-- 
-> 直到这一步, 我们可以大胆认为:
-1. 库存中剩下的没匹配上的物品 A (.affirm == False) 
-    > 1.1 如果原先是【可见】的话, 要么是[被完全遮挡了]要么是[被整理到其他地方]或者[被拿走出库了]
-    > 1.2 如果原先是【遮挡】的话, 要么是[依旧被完全遮挡]或者[其实已经露出了一点了,但是还没匹配上]
-        > 1.2.1 如果原先是【遮挡】的话, 然后现在是[其实已经露出了一点了,但是还没匹配上]的话必然同时满足：
-            > (1) 存在一个快照物品B与A满足"局部匹配" (也就是说现在快照物品B中应该有还没匹配上的, 并且B能与A进行"局部匹配")
-            > (2) 在 .block_ids 稳定后(处理完“整理”、“出库”、“入库”之后), 还要计算 A 的面积是否没有被完全遮挡
-            > (3) base_box 包含 B.box
-2. 快照中剩下的没匹配上的物品 B (.item_id == -1) 要么是[新放进来的], 要么是[被整理到这里的], 要么是[原先是【遮挡】的,现在露出来了] -->
-
-
-## 3.1. 优先局部匹配库存中的【可见】物品
-
-
-### 3.1.1 收集【可见】物品的局部匹配候选
+### 2.1 收集局部匹配候选
 
 partial_A_to_B[A.item_id]：A 可以局部匹配的 B.temporary_id 列表
 partial_B_to_A[B.temporary_id]：B 可以局部匹配的 A.item_id 列表
@@ -398,7 +311,7 @@ for A in working_inventory:
 ```
 
 
-### 3.1.2 只接受双向唯一的局部匹配
+### 2.2 只接受双向唯一的局部匹配
 ```python
 for A in working_inventory:
     if A.affirm == True or partial_A_to_B[A.item_id].size != 1:
@@ -420,12 +333,87 @@ for A in working_inventory:
 **注意**
 这里的[局部匹配]使用的阈值可以稍微严格一点 (即:最好要接近1.0,但也不要过于严格, 以防全都匹配不上)
 想法: 冰箱中那些没有改动的物品上一步已经匹配上了, 现在剩下的都是无法严格匹配的, 也就是说现在剩下的是都有变动的
-我们可以不管这么多, 直接匹配最接近的, 因为：相同cls_id的物品通常体型差距不大, 如果 局部匹配(A, B) 成功的话就说明大概率是原地变大变小
+我们可以不管这么多, 直接匹配最接近的, 因为：
+    相同cls_id的物品通常体型差距不大, 如果 局部匹配(A, B) 成功的话就说明大概率是原地变大变小
 
 
-## 3.2 再局部匹配库存中的【遮挡】物品
+## 3. 处理没匹配的
 
-### 3.2.1 收集【遮挡】物品的局部匹配候选
+> 直到这一步, 我们可以大胆认为:
+1. 库存中剩下的没匹配上的物品 A (.affirm == False) 
+    > 1.1 如果原先是【可见】的话, 要么是[被完全遮挡了]要么是[被整理到其他地方]或者[被拿走出库了]
+    > 1.2 如果原先是【遮挡】的话, 要么是[依旧被完全遮挡]或者[其实已经露出了一点了,但是还没匹配上]
+        > 1.2.1 如果原先是【遮挡】的话, 然后现在是[其实已经露出了一点了,但是还没匹配上]的话必然同时满足：
+            > (1) 存在一个快照物品B与A满足"局部匹配" (也就是说现在快照物品B中应该有还没匹配上的, 并且B能与A进行"局部匹配")
+            > (2) 在 .block_ids 稳定后(处理完“整理”、“出库”、“入库”之后), 还要计算 A 的面积是否没有被完全遮挡
+            > (3) base_box 包含 B.box
+2. 快照中剩下的没匹配上的物品 B (.item_id == -1) 要么是[新放进来的], 要么是[被整理到这里的], 要么是[原先是【遮挡】的,现在露出来了]
+
+
+## 3.1 先处理[整理]
+```python
+# frozen_tracks：
+# 本轮稳定快照已经生成后被冻结、且尚未清除的 Track
+# 此函数内部会自动跳过：
+# - Track 证据不足的情况；
+# - hold_and_move != True 的情况；
+# - A / B 不唯一的情况；
+# - 已在严格匹配、局部匹配中绑定的 A / B。
+unique_move_pairs = get_unique_move_pairs(
+    库存物品=working_inventory,
+    快照物品=快照物品,
+    frozen_tracks=frozen_tracks
+)
+
+for A_item_id, B_temp_id in unique_move_pairs:
+    A = item_by_id[A_item_id]
+    B = 根据 B_temp_id 找到对应快照物品
+
+    # 防御性检查; 正常情况下 get_unique_move_pairs 已保证它们成立
+    if A.status != 【可见】 or A.affirm:
+        continue
+
+    if B.item_id != -1:
+        continue
+
+    # B.box 就是整理后 A 的新 base_box
+    A.box = B.box
+    A.base_box = A.box
+
+    # 正式确认 A 整理到 B
+    A.affirm = True
+    B.item_id = A.item_id
+    matched_snapshot_of_item[A.item_id] = B
+
+    # 按当前业务假设：整理后的 A 不被其他物品遮挡
+    A.block_ids.clear()
+
+    # 更新“被 A 遮挡”的其他库存物品 C
+    for C in working_inventory:
+        if C.item_id == A.item_id:
+            continue
+
+        if A.item_id in C.block_ids \
+            and intersection_area(A.base_box, C.base_box) <= overlap_area_eps:
+            C.block_ids.erase(A.item_id)
+
+        if intersection_area(A.base_box, C.base_box) > overlap_area_eps:
+            C.block_ids.insert(A.item_id)
+```
+
+
+## 3.2 局部匹配[库存中【遮挡】物品]与[剩余未匹配的快照物品]
+
+> 之前的[严格匹配]与[局部匹配]中, 【遮挡】物品都跳过了匹配, 现在才来尝试匹配 (是故意这样做的)
+
+
+**注意**
+> 【遮挡】物品 A 与快照物品 B 匹配不是为了真的确认 A 与 B 的匹配关系, 而是为了先处理那些[连【遮挡】物品都匹配不上的物品]
+> 所以我们要先来"临时"绑定【遮挡】物品 A 与快照物品 B
+
+
+### 3.2.1 收集局部匹配候选
+
 shelter_partial_A_to_B[A.item_id]：A 可以局部匹配的 B.temporary_id 列表
 shelter_partial_B_to_A[B.temporary_id]：B 可以局部匹配的 A.item_id 列表
 
@@ -465,9 +453,9 @@ for A in working_inventory:
 
 ## 3.3 处理[库存中未匹配的【可见】物品]
 
-> 原本库存中【可见】, 但是现在这些物品匹配不了, 提出之前的[整理]与[出库]情况后, 有以下几种情况：
+> 原本库存中【可见】, 但是现在这些物品匹配不了, 提出之前的[整理]情况后, 有以下几种情况：
 1. 这个【可见】物品是[被完全遮挡了] (需要检查快照中是否有一个未匹配的物品完全覆盖了这个物品)
-2. 这个【可见】物品是[被拿走出库了] (或许存在之前漏判)
+2. 这个【可见】物品是[被拿走出库了]
 
 ```python
 for A_item_id in original_item_ids:

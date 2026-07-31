@@ -352,9 +352,24 @@ def clear_tracks_after_settlement():
 
     frozen_tracks.clear()
     track_buffer.clear()
+
+
+def discard_tracks_and_mark_ambiguous():
+    # CLOSING 误判造成的暂停，或库存结算未提交，都会让 Track 的连续证据失效。
+    # 只丢弃本开门 Session 的 Track，不修改 inventory，也不重置 operation_pending。
+    for track in frozen_tracks:
+        track.frozen = False
+
+    frozen_tracks.clear()
+    track_buffer.clear()
+    track_session_is_ambiguous = True
 ```
 
 库存结算期间，所有更新 Track 的函数都会先检查 `track.frozen`；被冻结的 Track 不允许再被修改。
+
+`discard_tracks_and_mark_ambiguous()` 用于 Track 证据已经断开、却还不能修改库存的情况。
+之后仍可收集新的稳定快照并按库存对比结算，但本次开门 Session 不再用 Track 确认“整理”；
+直到一次库存结算成功提交后，才把 `track_session_is_ambiguous` 清回 `False`。
 
 ```python
 def get_unique_move_pairs(库存物品, 快照物品, frozen_tracks):
