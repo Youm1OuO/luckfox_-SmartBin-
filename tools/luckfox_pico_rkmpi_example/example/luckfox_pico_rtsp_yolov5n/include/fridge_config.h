@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r6";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r7";
 
 // =========================================================================
 //  类别 ID 配置
@@ -225,6 +225,11 @@ constexpr float FLOW3_TRACK_CENTER_NORM = 0.75f;
 constexpr float FLOW3_TRACK_PARTIAL_IOM = 0.50f;
 constexpr float FLOW3_TRACK_WIDTH_RATIO = 0.65f;
 constexpr float FLOW3_TRACK_HEIGHT_RATIO = 0.65f;
+// C 暂时不可见后，首次出现 B 的候选轨迹容差。它只用于把 B 暂存为
+// reappear_candidate，不会单帧改变 item_id；下一帧仍需自匹配确认。
+constexpr float FLOW3_REAPPEAR_CANDIDATE_CENTER_NORM = 1.25f;
+constexpr float FLOW3_REAPPEAR_CANDIDATE_WIDTH_RATIO = 0.85f;
+constexpr float FLOW3_REAPPEAR_CANDIDATE_HEIGHT_RATIO = 0.85f;
 constexpr float FLOW3_OLD_POSITION_OVERLAP_AREA = 16.0f;
 
 // 物品刚被手挡住时，YOLO 输出的是完整框的一部分，不能继续用库存/快照的
@@ -290,7 +295,14 @@ constexpr float FLOW3_C_REPLACEMENT_MIN_COVER_RATIO = 0.30f;
 // POST_HAND_REVEAL_D。当前 N=3、D 需要两次观察，所以设为 2，确保仍有
 // 后续帧可完成自匹配并进入本轮稳定快照。
 constexpr int   FLOW3_POST_HAND_REVEAL_WINDOW_FRAMES = 2;
+// 同类 B 首次重新出现后，需要多少次连续自匹配，才允许作为旧 C 的
+// 已确认候选。无手稳定快照仍是最终提交条件。
+constexpr int   FLOW3_REAPPEAR_CANDIDATE_CONFIRM_FRAMES = 2;
 constexpr float FLOW3_DROP_FALL_BEHIND_RATIO = 0.45f;
+// 放下需要连续证据，不能只凭 B 与手脱离的一帧就确认。
+constexpr int   FLOW3_DROP_EVIDENCE_REQUIRED = 2;
+// B 的宽高相对完整 C 更接近多少，才可作为“逐渐露出完整框”的辅助放下证据。
+constexpr float FLOW3_DROP_FULL_BOX_IMPROVEMENT = 0.08f;
 constexpr float FLOW3_COMMIT_MOVE_CENTER_DISTANCE = 28.0f;
 
 // =========================================================================

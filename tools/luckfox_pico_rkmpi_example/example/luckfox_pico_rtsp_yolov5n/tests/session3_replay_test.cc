@@ -527,6 +527,96 @@ void test_partial_existing_item_is_not_registered_as_new_d() {
     assert(!has_event(result, fridge::EventKind::IN, 2));
 }
 
+// 有效帧之间手框发生较大跳动时，C 的“旧框 + 手位移”终点可能错过实际 B。
+// 同类贴手 B 仍应先成为 C 的 reappear_candidate，而不是新建 HAND_VISIBLE_D。
+void test_fast_same_class_b_becomes_c_candidate_not_d() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(2, 100, 100, 200, 200)), &frame);
+
+    // C 先被完整遮住，随后手快速移到右侧。实际橙子 B 留在候选轨迹的
+    // 中间位置，和当前终点预计框不匹配，但与手相贴。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(2, 180, 100, 280, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(300, 80, 440, 220)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& first_tracks = session.operation_tracks();
+    assert(first_tracks.find(1) != first_tracks.end());
+    assert(first_tracks.find(1)->second.has_reappear_candidate_box);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = first_tracks.begin();
+         it != first_tracks.end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    // 第二次看到同一个 B 后，候选才完成自匹配；整个过程中仍不应出现 D。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(2, 180, 100, 280, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(460, 80, 600, 220)), &frame);
+    const std::map<int, fridge::OperationTrack>& second_tracks = session.operation_tracks();
+    assert(second_tracks.find(1) != second_tracks.end());
+    assert(second_tracks.find(1)->second.reappear_candidate_match_count >=
+           fridge::FLOW3_REAPPEAR_CANDIDATE_CONFIRM_FRAMES);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = second_tracks.begin();
+         it != second_tracks.end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(2, 180, 100, 280, 200)), &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
+// 放下不能因单帧“B 看起来掉队”就确认：需要连续两帧都满足
+// 手继续移动、B 基本停住、且 B 已与手脱离/更接近完整框的组合证据。
+void test_drop_requires_continuous_evidence() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    // 前两次跟手观察建立 hold_and_move。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 220, 100, 320, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 300, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(320, 80, 420, 220)), &frame);
+    assert(session.operation_tracks().find(1)->second.hold_and_move);
+
+    // B 已停在 x=340；第一次手继续离开只累计第 1 个 drop 证据。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(500, 80, 600, 220)), &frame);
+    const fridge::OperationTrack& after_first_drop =
+        session.operation_tracks().find(1)->second;
+    assert(after_first_drop.state != fridge::OperationTrackState::PLACED);
+    assert(after_first_drop.drop_evidence_count == 1);
+
+    // 第二个连续证据才允许进入 PLACED。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(700, 80, 800, 220)), &frame);
+    assert(session.operation_tracks().find(1)->second.state ==
+           fridge::OperationTrackState::PLACED);
+
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)), &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+}
+
 // 同类相邻物品都可能解释手边的局部框时，不能因为 map 遍历顺序把框强塞给
 // item#1 或 item#2，更不能把它新建为 D；本轮应保持两个旧身份不变。
 void test_ambiguous_hand_partial_box_does_not_create_d() {
@@ -669,6 +759,8 @@ int main() {
     test_d_reappearance_does_not_claim_strict_existing_inventory();
     test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
     test_partial_existing_item_is_not_registered_as_new_d();
+    test_fast_same_class_b_becomes_c_candidate_not_d();
+    test_drop_requires_continuous_evidence();
     test_ambiguous_hand_partial_box_does_not_create_d();
     test_adjacent_same_class_new_item_gets_its_own_d_chain();
     test_unbound_stable_box_never_auto_in();

@@ -95,6 +95,10 @@ struct OperationTrack {
     bool has_first_hand_block_box = false;
     BBox last_hand_block_box;
     bool has_last_hand_block_box = false;
+    // C 曾暂时不可见后重新出现的同类 B。它先只是候选，必须连续自匹配
+    // 或由无手稳定快照支持，不能在第一帧直接把它当成 C 或新 D。
+    BBox reappear_candidate_box;
+    bool has_reappear_candidate_box = false;
     BBox placed_box;
     bool has_placed_box = false;
 
@@ -105,6 +109,12 @@ struct OperationTrack {
     int hold_evidence_count = 0;
     int not_hold_evidence_count = 0;
     int self_match_count = 0;
+    int reappear_candidate_match_count = 0;
+    int drop_evidence_count = 0;
+    // 只用于已有 C：上一有效有手帧没有可靠看到 C 时，下一次同类 B 即使
+    // 正好落在预计轨迹上，也先走重新出现候选的二次确认。
+    bool reappearance_pending = false;
+    bool reappear_candidate_started_touching_hand = false;
     int hand_track_start_index = -1;
     // 仅 POST_HAND_REVEAL_D 使用：它在第几张无手帧首次出现。
     // 后续一张有效无手帧若不能自匹配，就丢弃该候选而不产生事件。

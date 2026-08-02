@@ -15,10 +15,11 @@ tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/session.c
 修改参数后必须重新交叉编译。建议一次只改一项，并保存“参数版本 + 视频 +
 事件日志”；多个阈值一起放宽，出现误匹配时会无法判断是哪一项造成的。
 
-当前版本的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有自己的
-唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用的框
-才能进入疑似 D 链路。若旧物品本身没有独立框、两个同类框又完全无法区分，系统
-仍会保守地保持未决，不会凭类别相同强行增加数量。
+当前版本（3.0-r7）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
+自己的唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用
+的框才有机会进入疑似 D 链路。若某个 HAND_* 旧 C 没有自己的检测框，而同类贴手
+B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_candidate` 暂存，不能
+立刻建立 D。多个 C 都合理时保持未决；单摄像头无法区分时不会凭类别相同强行增加数量。
 
 
 二、无手稳定快照
@@ -77,6 +78,15 @@ FLOW3_TRACK_WIDTH_RATIO、FLOW3_TRACK_HEIGHT_RATIO
     累计移动值”所得到的预计位置。
     调大/调小的影响与严格匹配相同，但这里过大尤其危险：会把相邻同类物品当成被手
     拿着移动的那个物品。
+
+FLOW3_REAPPEAR_CANDIDATE_CENTER_NORM、
+FLOW3_REAPPEAR_CANDIDATE_WIDTH_RATIO、FLOW3_REAPPEAR_CANDIDATE_HEIGHT_RATIO
+    只用于 C 曾暂时看不见后，判断一个同类 B 是否足够接近 C 的完整候选路径，从而
+    暂记为 `reappear_candidate`。它比普通 FLOW3_TRACK_* 略宽，但候选还必须连续
+    自匹配，且最终仍要通过无手稳定快照，所以它不会单帧产生 MOVED 或 IN。
+    调大：更能抵抗手框/YOLO 在相邻有效帧间的大跳动，减少“移动 C 被误建成 D”；
+    过大：较远的同类新物品也更可能被保守地暂认给 C，导致真实 IN 延后或保持未决。
+    调小：同类身份更严格，但快速手移动或运动模糊时更容易重新落入 D 链路。
 
 FLOW3_OLD_POSITION_OVERLAP_AREA
     判断某个检测是否占据旧位置的最小交集面积。
@@ -166,9 +176,29 @@ FLOW3_NOT_HOLD_EVIDENCE_REQUIRED（当前 2）
     调小：很快释放，可能错过随后真正拿起的动作。
 
 FLOW3_DROP_FALL_BEHIND_RATIO
-    手继续移动而物品框移动明显较少时，认为物品已经放下的比例。
-    调大：更容易判定放下，可能把手持但慢速移动的物品提前放下。
+    手继续移动而物品框移动明显较少时，“掉队”的比例。它只是放下证据的必要条件；
+    还必须同时满足 B 已与手脱离或 B 的宽高更接近完整 C.box，并连续达到
+    FLOW3_DROP_EVIDENCE_REQUIRED 次才会进入 PLACED。
+    调大：更容易累积放下证据，可能把手持但慢速移动的物品提前放下。
     调小：更严格，放下确认更慢，更多依赖无手稳定快照。
+
+FLOW3_REAPPEAR_CANDIDATE_CONFIRM_FRAMES（当前 2）
+    `reappear_candidate` 首次出现后，需要连续多少次能匹配到同一个 B，才可把 B
+    作为旧 C 的已确认重新出现位置。若 B 是在无手第一帧才首次可见，也同样使用
+    这个门槛；稳定快照仍是正式提交的最后一步。
+    调大：对一帧误检、同类串身份更稳，但快速操作后确认整理更慢。
+    调小：更快恢复 C 的身份，但单帧 YOLO 跳动更容易造成错误整理。
+
+FLOW3_DROP_EVIDENCE_REQUIRED（当前 2）
+    连续多少帧出现“手继续走、B 基本停住、且 B 脱手/更接近完整框”的组合证据后，
+    才确认放下并进入 PLACED。
+    调大：避免单帧手框跳动触发整理，代价是放下确认更慢。
+    调小：实时性更高，但单帧误差可能提前确认放下。
+
+FLOW3_DROP_FULL_BOX_IMPROVEMENT（当前 0.08）
+    B 相对完整 C.box 的宽高差至少改善多少，才把“框逐渐变完整”视为辅助放下证据。
+    调大：只有明显从局部框变完整时才计入，较安全但可能漏掉轻微改善。
+    调小：更容易把框大小变化计入放下，适合局部框变化小的模型，但更容易受抖动影响。
 
 FLOW3_COMMIT_MOVE_CENTER_DISTANCE
     最终提交时，旧 base_box 与新 base_box 的中心距离达到此值才发 MOVED。
@@ -232,6 +262,8 @@ BLOCK_OVERLAP_AREA_EPS、COVER_REMAINING_AREA_EPS
    新 item_id，也不合并相邻同类物品。
 3. 调手框参数与 HAND_MICRO_MOVE_SKIP_EPS：先让“手经过但没拿”不产生移动。
 4. 最后调 FLOW3_TRACK_*、两类 evidence 阈值、放下与遮挡参数。
+   若“移动旧 C 却误报 IN”，先检查/小幅调大 FLOW3_REAPPEAR_CANDIDATE_*；若
+   “真正相邻同类 IN 长期保持未决”，再小幅调小它们，并保留回放验证。
 
 每次验证至少回放以下操作：
 
