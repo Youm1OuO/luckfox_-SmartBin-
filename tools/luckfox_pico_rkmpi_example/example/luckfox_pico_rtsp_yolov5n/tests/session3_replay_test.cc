@@ -321,6 +321,161 @@ void test_new_item_can_confirm_from_first_no_hand_frame() {
     assert(has_event(result, fridge::EventKind::IN, 1));
 }
 
+// D 首帧只有被手露出的细条，后续完全看不见；它在手路径中段被放下，
+// 手继续移开后才在无手帧看到完整框。不能只拿终点或初始细条做匹配。
+void test_partially_seen_new_item_can_reappear_full_on_middle_path() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    session.init_from_backend(std::vector<fridge::InventoryItem>(), true);
+    int frame = 1;
+    initial_snapshot(&session, std::vector<fridge::Detection>(), &frame);
+
+    // 初次只看到宽 30 像素的 D 局部框。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 160, 100, 190, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(100, 80, 180, 220)), &frame);
+    // D 已完全被手遮住；手分别向右移动 100、200 像素，路径中会保留 P1 和 P2。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 280, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(400, 80, 480, 220)), &frame);
+
+    // 完整苹果位于路径中段 P1 附近，既不重叠初始细条，也不重叠最终 P2。
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 290, 50, 430, 270)), &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(has_event(result, fridge::EventKind::IN, 1));
+}
+
+// D 可以从进入到放下始终完全被手遮住，整个有手阶段没有任何 D 检测框。
+// 手离开后，只要完整 B 出现在本次公共手轨迹附近并连续稳定出现，也必须
+// 建立 POST_HAND_REVEAL_D -> 工作库存 -> IN 链路。
+void test_fully_hidden_new_item_can_enter_from_post_hand_reveal() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    session.init_from_backend(std::vector<fridge::InventoryItem>(), true);
+    int frame = 1;
+    initial_snapshot(&session, std::vector<fridge::Detection>(), &frame);
+
+    // 有手期间始终没有苹果检测；手在路径中段放下它后继续向右移开。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(260, 80, 360, 220)), &frame);
+
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 170, 100, 290, 220)), &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(has_event(result, fridge::EventKind::IN, 1));
+}
+
+// C 被手挡住后，手移开时在 C 原位置留下一个不贴手的、不同类别 D。
+// D 不能因为“不贴手”被漏掉；它应以 C_POSITION_REPLACEMENT_D 预登记，
+// 最终让 C 保持遮挡、D 正常 IN。
+void test_new_item_replacing_c_old_position_is_registered_without_hand_contact() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 100, 100, 200, 200));  // C: orange
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(2, 100, 100, 200, 200)), &frame);
+
+    // 先把 C 完全挡住。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    // 手已移到右边；苹果 D 留在 C 原位置，和手框不相贴。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 220, 220)),
+               std::vector<fridge::BBox>(1, fridge::BBox(300, 80, 440, 220)), &frame);
+
+    bool found_replacement_source = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        if (it->second.suspect_source ==
+            fridge::SuspectSource::C_POSITION_REPLACEMENT_D) {
+            found_replacement_source = true;
+        }
+    }
+    assert(found_replacement_source);
+
+    // 第二张有效有手帧让 D 完成一次自匹配；随后稳定无手快照正式结算。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 220, 220)),
+               std::vector<fridge::BBox>(1, fridge::BBox(500, 80, 640, 220)), &frame);
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 100, 100, 220, 220)), &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::OCCLUDED);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(result, fridge::EventKind::IN, 2));
+}
+
+// POST_HAND_REVEAL_D 的首帧完整 B 不是正式入库证据。若下一张有效无手帧
+// 消失，则候选必须丢弃，之后也不能因为旧 B 偶然重现就补发 IN。
+void test_post_hand_reveal_requires_continuous_no_hand_confirmation() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    session.init_from_backend(std::vector<fridge::InventoryItem>(), true);
+    int frame = 1;
+    initial_snapshot(&session, std::vector<fridge::Detection>(), &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(260, 80, 360, 220)), &frame);
+
+    const int first_no_hand = frame++;
+    session.process_frame(std::vector<fridge::Detection>(1, det(0, 170, 100, 290, 220)),
+                          std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    const int second_no_hand = frame++;
+    session.process_frame(std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+                          second_no_hand, second_no_hand);
+    const int third_no_hand = frame++;
+    fridge::FrameProcessResult final_frame = session.process_frame(
+        std::vector<fridge::Detection>(1, det(0, 170, 100, 290, 220)),
+        std::vector<fridge::BBox>(), third_no_hand, third_no_hand);
+
+    assert(final_frame.stable_snapshot_generated);
+    assert(session.inventory().size() == 0);
+    assert(!has_event(final_frame.settlement, fridge::EventKind::IN, 1));
+}
+
+// 即使一个 B 在 D 的候选路径附近，只要它可以严格认领给已有库存，D 就不能
+// 抢占它并制造重复 IN。
+void test_d_reappearance_does_not_claim_strict_existing_inventory() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 290, 50, 430, 270));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(0, 290, 50, 430, 270)), &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 160, 100, 190, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(100, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 280, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(400, 80, 480, 220)), &frame);
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 290, 50, 430, 270)), &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
 // D 放下后手会继续移开。此时物品的最近真实观测比“旧框 + 手累计位移”可靠；
 // 若仍只使用估计框，D 会在无手稳定快照中无法绑定而被错误丢弃。
 void test_new_item_dropped_before_hand_moves_away_keeps_its_identity() {
@@ -507,6 +662,11 @@ int main() {
     test_hand_cover_ratio_controls_hand_state();
     test_new_item_requires_d_chain();
     test_new_item_can_confirm_from_first_no_hand_frame();
+    test_partially_seen_new_item_can_reappear_full_on_middle_path();
+    test_fully_hidden_new_item_can_enter_from_post_hand_reveal();
+    test_new_item_replacing_c_old_position_is_registered_without_hand_contact();
+    test_post_hand_reveal_requires_continuous_no_hand_confirmation();
+    test_d_reappearance_does_not_claim_strict_existing_inventory();
     test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
     test_partial_existing_item_is_not_registered_as_new_d();
     test_ambiguous_hand_partial_box_does_not_create_d();

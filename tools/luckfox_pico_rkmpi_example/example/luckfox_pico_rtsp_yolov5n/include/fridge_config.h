@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r4";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r6";
 
 // =========================================================================
 //  类别 ID 配置
@@ -279,6 +279,17 @@ constexpr float FLOW3_HAND_PARTIAL_COVER_RATIO = 0.30f;
 constexpr float FLOW3_HAND_FULL_COVER_RATIO  = 0.88f;
 // 仅供“D 是否和手相贴/相交”和放下判断使用，不参与已有库存物品的 HAND 状态。
 constexpr float FLOW3_HAND_DETECTION_OVERLAP_AREA = 300.0f;
+// D 初次仅有局部框、手离开后重新出现完整框时的专用路径匹配。
+// B 覆盖路径中预测局部框达到该比例，或中心偏移足够小，才允许局部→完整重现。
+constexpr float FLOW3_D_REAPPEAR_MIN_PARTIAL_COVER = 0.35f;
+constexpr float FLOW3_D_REAPPEAR_MAX_CENTER_SHIFT_NORM = 0.45f;
+// 有手阶段：若一个无法认领的 D 覆盖了看不见的旧 C 的原位置达到该比例，
+// 即使 D 已不贴手，也以 C_POSITION_REPLACEMENT_D 预登记它。
+constexpr float FLOW3_C_REPLACEMENT_MIN_COVER_RATIO = 0.30f;
+// 无手阶段：手离开后的前几张无手帧可从公共手轨迹创建
+// POST_HAND_REVEAL_D。当前 N=3、D 需要两次观察，所以设为 2，确保仍有
+// 后续帧可完成自匹配并进入本轮稳定快照。
+constexpr int   FLOW3_POST_HAND_REVEAL_WINDOW_FRAMES = 2;
 constexpr float FLOW3_DROP_FALL_BEHIND_RATIO = 0.45f;
 constexpr float FLOW3_COMMIT_MOVE_CENTER_DISTANCE = 28.0f;
 

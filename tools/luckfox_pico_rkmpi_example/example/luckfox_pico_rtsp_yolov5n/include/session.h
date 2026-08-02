@@ -63,6 +63,15 @@ enum class OperationTrackState {
     PLACED,
 };
 
+// 疑似新物品 D 的首次发现来源。来源只决定后续需要哪一条确认链路；
+// 无论哪一种，正式 IN 都仍要等无手稳定快照提交。
+enum class SuspectSource {
+    NONE,
+    HAND_VISIBLE_D,
+    C_POSITION_REPLACEMENT_D,
+    POST_HAND_REVEAL_D,
+};
+
 struct MoveValue {
     float dx = 0.0f;
     float dy = 0.0f;
@@ -75,6 +84,7 @@ struct OperationTrack {
     int suspect_id = 0;
     bool is_suspect_new = false;
     bool promoted_to_working_inventory = false;
+    SuspectSource suspect_source = SuspectSource::NONE;
     int cls_id = -1;
 
     // original_box 在进入 HAND_* 时固定；主轨迹只从它叠加 move_values 得到。
@@ -96,6 +106,9 @@ struct OperationTrack {
     int not_hold_evidence_count = 0;
     int self_match_count = 0;
     int hand_track_start_index = -1;
+    // 仅 POST_HAND_REVEAL_D 使用：它在第几张无手帧首次出现。
+    // 后续一张有效无手帧若不能自匹配，就丢弃该候选而不产生事件。
+    int post_hand_reveal_no_hand_streak = -1;
 
     std::vector<MoveValue> move_values;
     std::vector<BBox> track;       // 每个点均为完整物品坐标系的估计框
@@ -181,6 +194,9 @@ private:
 
     // 手离开后的收尾与提交
     void observe_no_hand_frame_(const std::vector<Detection>& detections);
+    void register_post_hand_reveal_suspects_(
+        const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices);
     SettlementResult settle_stable_snapshot_(const Snapshot& snapshot);
     void clear_runtime_after_commit_();
 

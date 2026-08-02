@@ -123,6 +123,30 @@ bool hand_touches_detection(const BBox& hand, const BBox& detection_box) {
                FLOW3_HAND_DETECTION_OVERLAP_AREA;
 }
 
+const char* suspect_source_name(SuspectSource source) {
+    switch (source) {
+        case SuspectSource::HAND_VISIBLE_D:
+            return "HAND_VISIBLE_D";
+        case SuspectSource::C_POSITION_REPLACEMENT_D:
+            return "C_POSITION_REPLACEMENT_D";
+        case SuspectSource::POST_HAND_REVEAL_D:
+            return "POST_HAND_REVEAL_D";
+        case SuspectSource::NONE:
+            break;
+    }
+    return "NONE";
+}
+
+// D 全程被手挡住时，手离开后的完整 B 可能位于手轨迹中段，而不是最后
+// 一个手框旁。因此必须检查整个公共 hand_track，而不是只比较 old_hand_box_。
+bool hand_track_touches_detection(const std::vector<BBox>& hand_track,
+                                  const Detection& detection) {
+    for (size_t i = 0; i < hand_track.size(); ++i) {
+        if (hand_touches_detection(hand_track[i], detection.box)) return true;
+    }
+    return false;
+}
+
 BBox move_box(const BBox& box, const MoveValue& delta) {
     return BBox(box.x1 + delta.dx, box.y1 + delta.dy,
                 box.x2 + delta.dx, box.y2 + delta.dy);
@@ -436,6 +460,259 @@ bool detection_strictly_matches_other_item(const Detection& detection,
         if (strict_match(it->second, detection)) return true;
     }
     return false;
+}
+
+// 有手阶段的第二种 D 来源：旧 C 已进入 HAND_*，当前又没有自己的检测框，
+// 但一个未认领的 D 覆盖了 C 的原位置。这里返回唯一的 C；多个 C 都合理时
+// 保持未决，不能按 map 顺序挑一个。
+int unique_c_replacement_owner_for_detection(
+        const Detection& detection,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner) {
+    int owner = -1;
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        const OperationTrack& c = it->second;
+        if (c.is_suspect_new || c.item_id <= 0 ||
+            (c.state != OperationTrackState::HAND_PARTIAL_BLOCKED &&
+             c.state != OperationTrackState::HAND_FULL_BLOCKED) ||
+            known_item_owner.count(c.item_id) || c.original_box.area() <= 0.0f) {
+            continue;
+        }
+        if (cover_ratio(c.original_box, detection.box) <
+            FLOW3_C_REPLACEMENT_MIN_COVER_RATIO) {
+            continue;
+        }
+        if (owner >= 0) return -1;
+        owner = c.item_id;
+    }
+    return owner;
+}
+
+// D 的初始框可能只是被手露出的一小条，手离开后第一次看到的 B 却是完整框。
+// 普通单点轨迹匹配要求尺寸大致相近，无法覆盖“局部 D → 完整 B”；这里沿整条
+// D 路径找最合理的重现位置。正常严格/局部/轨迹匹配优先，局部→完整只作为后备。
+float suspect_d_reappearance_path_cost(const OperationTrack& track,
+                                       const Detection& observed) {
+    if (!track.is_suspect_new || track.cls_id != observed.cls_id ||
+        observed.box.area() <= 0.0f) {
+        return std::numeric_limits<float>::infinity();
+    }
+
+    const size_t path_size = track.track.empty() ? 1 : track.track.size();
+    float best_cost = std::numeric_limits<float>::infinity();
+    for (size_t pi = 0; pi < path_size; ++pi) {
+        const BBox reference = track.track.empty() ? estimated_box(track) : track.track[pi];
+        if (reference.area() <= 0.0f) continue;
+
+        float cost = std::numeric_limits<float>::infinity();
+        if (strict_match_box(track.cls_id, reference, observed.cls_id, observed.box)) {
+            cost = normalized_center_shift(reference, observed.box);
+        } else if (track_match_box(track.cls_id, reference,
+                                   observed.cls_id, observed.box)) {
+            cost = 1.0f + normalized_center_shift(reference, observed.box);
+        } else if (observed.box.area() >= reference.area()) {
+            // 完整 B 未必和预测局部框重合到普通 IoM 阈值；允许它覆盖局部框的一部分，
+            // 或在更大的完整框尺度内保持足够接近。两个条件都只用于 D，不用于 C。
+            const float partial_cover = cover_ratio(reference, observed.box);
+            const float center_shift = normalized_center_shift(reference, observed.box);
+            if (partial_cover >= FLOW3_D_REAPPEAR_MIN_PARTIAL_COVER ||
+                center_shift <= FLOW3_D_REAPPEAR_MAX_CENTER_SHIFT_NORM) {
+                cost = 2.0f + (1.0f - partial_cover) + 0.25f * center_shift;
+            }
+        }
+        best_cost = std::min(best_cost, cost);
+    }
+    return best_cost;
+}
+
+// 只在 D 原有的单点匹配全部失败后调用。B 必须不严格属于已有库存，且在
+// D 候选路径和多个 D 候选之间都有唯一更优的来源；否则保持未决，不能强认领。
+int unique_d_reappearance_detection_for_track(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        int runtime_key, const OperationTrack& track,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, OperationTrack>& tracks) {
+    const float tie_epsilon = 0.0001f;
+    float best_cost = std::numeric_limits<float>::infinity();
+    int best_detection = -1;
+    bool tied_detection = false;
+
+    for (size_t di = 0; di < detections.size(); ++di) {
+        if (claimed.count(static_cast<int>(di))) continue;
+        const Detection& detection = detections[di];
+        // 未提升 D 要排除全部库存；已提升 D 只允许排除“其他”库存物品。
+        if (detection_strictly_matches_other_item(detection, track.item_id, working)) {
+            continue;
+        }
+        const float cost = suspect_d_reappearance_path_cost(track, detection);
+        if (!(cost < std::numeric_limits<float>::infinity())) continue;
+        if (cost + tie_epsilon < best_cost) {
+            best_cost = cost;
+            best_detection = static_cast<int>(di);
+            tied_detection = false;
+        } else if (std::fabs(cost - best_cost) <= tie_epsilon) {
+            tied_detection = true;
+        }
+    }
+    if (best_detection < 0 || tied_detection) return -1;
+
+    // 即使当前 D 找到了唯一最近的 B，若另一个疑似 D 对同一个 B 更合理或同样
+    // 合理，也不能按 track_buffer_ 的遍历顺序抢占这个检测框。
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        if (it->first == runtime_key || !it->second.is_suspect_new ||
+            it->second.state == OperationTrackState::NORMAL) {
+            continue;
+        }
+        const float other_cost = suspect_d_reappearance_path_cost(
+            it->second, detections[best_detection]);
+        if (other_cost <= best_cost + tie_epsilon) return -1;
+    }
+    return best_detection;
+}
+
+// 手离开后首次完整出现的 B 不能抢占任何已有 C/D。这里不是正式库存的
+// 最终绑定，而是一个保守的“是否仍可能属于旧对象”检查：只要任一活动轨迹
+// 能合理解释 B，就不把 B 另建成 POST_HAND_REVEAL_D。
+bool detection_can_belong_to_active_track(const Detection& detection,
+                                          const OperationTrack& track) {
+    if (track.state == OperationTrackState::NORMAL ||
+        track.cls_id != detection.cls_id) {
+        return false;
+    }
+    const BBox reference = track.has_placed_box ? track.placed_box : estimated_box(track);
+    if (strict_match_box(track.cls_id, reference, detection.cls_id, detection.box) ||
+        partial_match_box(track.cls_id, reference, detection.cls_id, detection.box) ||
+        track_match_box(track.cls_id, reference, detection.cls_id, detection.box)) {
+        return true;
+    }
+    if (track.original_box.area() > 0.0f &&
+        (strict_match_box(track.cls_id, track.original_box,
+                          detection.cls_id, detection.box) ||
+         partial_match_box(track.cls_id, track.original_box,
+                           detection.cls_id, detection.box) ||
+         track_match_box(track.cls_id, track.original_box,
+                         detection.cls_id, detection.box))) {
+        return true;
+    }
+    if (track.has_last_seen_box &&
+        track_match_box(track.cls_id, track.last_seen_box,
+                        detection.cls_id, detection.box)) {
+        return true;
+    }
+    if (track.has_last_hand_block_box &&
+        track_match_box(track.cls_id, track.last_hand_block_box,
+                        detection.cls_id, detection.box)) {
+        return true;
+    }
+    for (size_t i = 0; i < track.track.size(); ++i) {
+        if (track_match_box(track.cls_id, track.track[i],
+                            detection.cls_id, detection.box)) {
+            return true;
+        }
+    }
+    return track.is_suspect_new &&
+        suspect_d_reappearance_path_cost(track, detection) <
+            std::numeric_limits<float>::infinity();
+}
+
+bool detection_matches_old_working_inventory(
+        const Detection& detection,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start) {
+    for (std::map<int, InventoryItem>::const_iterator original =
+             operation_start.begin(); original != operation_start.end(); ++original) {
+        std::map<int, InventoryItem>::const_iterator current =
+            working.find(original->first);
+        if (current == working.end()) continue;
+        const BBox reference = current->second.base_box.area() > 0.0f
+            ? current->second.base_box : current->second.box;
+        if (strict_match_box(current->second.cls_id, reference,
+                             detection.cls_id, detection.box) ||
+            partial_match_box(current->second.cls_id, reference,
+                              detection.cls_id, detection.box)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool detection_conflicts_with_active_track(
+        const Detection& detection,
+        const std::map<int, OperationTrack>& tracks) {
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        if (detection_can_belong_to_active_track(detection, it->second)) return true;
+    }
+    return false;
+}
+
+bool has_active_runtime_for_item(const std::map<int, OperationTrack>& tracks,
+                                 int item_id) {
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        if (it->second.item_id == item_id &&
+            it->second.state != OperationTrackState::NORMAL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 无手阶段，未参与本次 HAND_* 的旧库存也必须先占用自己唯一的严格框。
+// 否则一个已有 D 的宽松局部/轨迹匹配可能会先抢走它，进而制造重复 IN。
+void reserve_unique_no_hand_static_inventory_detections(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::map<int, OperationTrack>& tracks,
+        std::set<int>* claimed) {
+    bool made_progress = true;
+    while (made_progress) {
+        made_progress = false;
+        std::map<int, int> item_to_detection;
+        std::map<int, std::vector<int> > detection_to_items;
+
+        for (std::map<int, InventoryItem>::const_iterator original =
+                 operation_start.begin(); original != operation_start.end(); ++original) {
+            if (has_active_runtime_for_item(tracks, original->first)) continue;
+            std::map<int, InventoryItem>::const_iterator current =
+                working.find(original->first);
+            if (current == working.end()) continue;
+            const BBox reference = current->second.base_box.area() > 0.0f
+                ? current->second.base_box : current->second.box;
+            int only_detection = -1;
+            for (size_t di = 0; di < detections.size(); ++di) {
+                const int index = static_cast<int>(di);
+                if (claimed->count(index) ||
+                    !strict_match_box(current->second.cls_id, reference,
+                                      detections[di].cls_id, detections[di].box)) {
+                    continue;
+                }
+                if (only_detection >= 0) {
+                    only_detection = -1;
+                    break;
+                }
+                only_detection = index;
+            }
+            if (only_detection >= 0) {
+                item_to_detection[original->first] = only_detection;
+                detection_to_items[only_detection].push_back(original->first);
+            }
+        }
+
+        for (std::map<int, int>::const_iterator item = item_to_detection.begin();
+             item != item_to_detection.end(); ++item) {
+            const int detection_index = item->second;
+            if (claimed->count(detection_index) ||
+                detection_to_items[detection_index].size() != 1) {
+                continue;
+            }
+            claimed->insert(detection_index);
+            made_progress = true;
+        }
+    }
 }
 
 bool boxes_differ_as_move(const BBox& before, const BBox& after) {
@@ -1076,8 +1353,10 @@ void SessionManager::update_existing_hand_tracks_(
                 ++track.self_match_count;
                 track.last_seen_box = d.box;
                 track.has_last_seen_box = true;
-                track.last_hand_block_box = d.box;
-                track.has_last_hand_block_box = true;
+                if (hand_touches_detection(hand_box, d.box)) {
+                    track.last_hand_block_box = d.box;
+                    track.has_last_hand_block_box = true;
+                }
                 if (!track.promoted_to_working_inventory &&
                     track.self_match_count >= NEW_ITEM_CONFIRM_FRAMES) {
                     promote_keys.push_back(it->first);
@@ -1186,7 +1465,13 @@ void SessionManager::scan_or_update_suspects_(
     for (size_t di = 0; di < detections.size(); ++di) {
         if (claimed_detection_indices->count(static_cast<int>(di))) continue;
         const Detection& d = detections[di];
-        if (!hand_touches_detection(hand_box, d.box)) {
+        const bool hand_visible_d = hand_touches_detection(hand_box, d.box);
+        // D 已经被放到 C 原位置时，手可能继续移开，因此 D 不一定还贴手。
+        // 只要它是唯一一个覆盖“当前看不见的 C”原位置的未认领框，也必须
+        // 预登记；否则 C 会在后续无手阶段被错误当成 OUT。
+        const int replacement_owner = unique_c_replacement_owner_for_detection(
+            d, track_buffer_, known_item_owner);
+        if (!hand_visible_d && replacement_owner < 0) {
             continue;
         }
 
@@ -1239,14 +1524,21 @@ void SessionManager::scan_or_update_suspects_(
         const int key = new_suspect_id_();
         track.suspect_id = key;
         track.is_suspect_new = true;
+        track.suspect_source = replacement_owner >= 0
+            ? SuspectSource::C_POSITION_REPLACEMENT_D
+            : SuspectSource::HAND_VISIBLE_D;
         track.cls_id = d.cls_id;
         track.original_box = d.box;
         track.last_seen_box = d.box;
         track.has_last_seen_box = true;
-        track.first_hand_block_box = d.box;
-        track.last_hand_block_box = d.box;
-        track.has_first_hand_block_box = true;
-        track.has_last_hand_block_box = true;
+        // C 原位置替代 D 可能已不贴手。此时它仍有 last_seen_box 和候选
+        // 轨迹，但不伪造“被手遮挡时的局部框”。
+        if (hand_visible_d) {
+            track.first_hand_block_box = d.box;
+            track.last_hand_block_box = d.box;
+            track.has_first_hand_block_box = true;
+            track.has_last_hand_block_box = true;
+        }
         track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
         track.shelter_or_hold = true;
         track.self_match_count = 1;
@@ -1254,7 +1546,8 @@ void SessionManager::scan_or_update_suspects_(
         track.track.push_back(d.box);
         track_buffer_[key] = track;
         claimed_detection_indices->insert(static_cast<int>(di));
-        printf("[3.0] 预登记疑似新物品 D suspect#%d cls=%d\n", key, d.cls_id);
+        printf("[3.0] 预登记疑似新物品 D suspect#%d cls=%d source=%s\n",
+               key, d.cls_id, suspect_source_name(track.suspect_source));
     }
 }
 
@@ -1344,8 +1637,14 @@ void SessionManager::apply_suspect_cover_evidence_(
     for (std::map<int, OperationTrack>::const_iterator dit = track_buffer_.begin();
          dit != track_buffer_.end(); ++dit) {
         const OperationTrack& d = dit->second;
-        if (!d.is_suspect_new || !d.has_last_hand_block_box) continue;
-        const BBox d_box = d.has_placed_box ? d.placed_box : d.last_hand_block_box;
+        if (!d.is_suspect_new ||
+            (!d.has_last_seen_box && !d.has_last_hand_block_box)) {
+            continue;
+        }
+        // C_POSITION_REPLACEMENT_D 可能已经离开手框，只有 last_seen_box，
+        // 不能再把 last_hand_block_box 当成 D 唯一可用的遮挡位置。
+        const BBox d_box = d.has_placed_box ? d.placed_box :
+            (d.has_last_seen_box ? d.last_seen_box : d.last_hand_block_box);
         for (std::map<int, OperationTrack>::iterator cit = track_buffer_.begin();
              cit != track_buffer_.end(); ++cit) {
             OperationTrack& c = cit->second;
@@ -1404,68 +1703,166 @@ void SessionManager::process_effective_hand_frame_(
     apply_suspect_cover_evidence_(hand_box, detections);
 }
 
+void SessionManager::register_post_hand_reveal_suspects_(
+        const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices) {
+    // 首次完整 B 必须紧接着本次手操作出现。若允许很久之后的任意无手框
+    // 触发，就会把普通漏检重现或静态误检错误写成 IN。
+    if (no_hand_streak_ <= 0 ||
+        no_hand_streak_ > FLOW3_POST_HAND_REVEAL_WINDOW_FRAMES) {
+        return;
+    }
+
+    for (size_t di = 0; di < detections.size(); ++di) {
+        const int detection_index = static_cast<int>(di);
+        if (claimed_detection_indices->count(detection_index)) continue;
+        const Detection& d = detections[di];
+
+        // 先完成旧 C、已有 D 的认领。剩余 B 若能合理属于任意旧库存或
+        // 活动轨迹，也必须保持未决，不能另建一个“全程被挡住的新 D”。
+        if (detection_matches_old_working_inventory(
+                d, working_inventory_, operation_start_inventory_) ||
+            detection_conflicts_with_active_track(d, track_buffer_)) {
+            continue;
+        }
+        if (!hand_track_touches_detection(hand_track_, d)) continue;
+
+        OperationTrack track;
+        const int key = new_suspect_id_();
+        track.suspect_id = key;
+        track.is_suspect_new = true;
+        track.suspect_source = SuspectSource::POST_HAND_REVEAL_D;
+        track.cls_id = d.cls_id;
+        // 这类 D 的 B 已经是完整框；它没有也不应伪造 first_hand_block_box。
+        track.original_box = d.box;
+        track.last_seen_box = d.box;
+        track.has_last_seen_box = true;
+        track.placed_box = d.box;
+        track.has_placed_box = true;
+        track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
+        track.shelter_or_hold = true;
+        track.self_match_count = 1;
+        track.hand_track_start_index = 0;
+        track.post_hand_reveal_no_hand_streak = no_hand_streak_;
+        track.track.push_back(d.box);
+        track_buffer_[key] = track;
+        claimed_detection_indices->insert(detection_index);
+        printf("[3.0] 手离开后预登记疑似新物品 D suspect#%d cls=%d source=%s\n",
+               key, d.cls_id, suspect_source_name(track.suspect_source));
+    }
+}
+
 void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detections) {
     std::set<int> claimed;
     std::vector<int> promote_keys;
-    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
-         it != track_buffer_.end(); ++it) {
-        OperationTrack& track = it->second;
-        if (track.state == OperationTrackState::NORMAL) continue;
-        BBox reference = track.has_placed_box ? track.placed_box : estimated_box(track);
-        if (track.state == OperationTrackState::PLACED && track.has_placed_box) {
-            reference = track.placed_box;
-        }
-        int found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                             reference, true, true);
-        if (found < 0 && track.original_box.area() > 0.0f) {
-            found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                              track.original_box, true, false);
-        }
-        // D 刚放下时，完整框可能和“手中局部框 + 手位移”差异很大。它已经
-        // 通过贴手出现建立了链路，收尾首帧应优先尝试自身最近一次真实观测，
-        // 而不是因为估计框误差把 D 丢掉。普通旧库存不走这个宽松兜底。
-        if (found < 0 && track.is_suspect_new && track.has_last_seen_box) {
-            found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                              track.last_seen_box, true, true);
-        }
-        if (found < 0 && track.is_suspect_new && track.has_last_hand_block_box) {
-            found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                              track.last_hand_block_box, true, true);
-        }
-        if (found < 0) continue;
-        const Detection& d = detections[found];
-        claimed.insert(found);
-        track.last_seen_box = d.box;
-        track.has_last_seen_box = true;
+    std::set<int> discard_keys;
 
-        if (track.is_suspect_new && !track.promoted_to_working_inventory) {
-            ++track.self_match_count;
-            if (track.self_match_count >= NEW_ITEM_CONFIRM_FRAMES) {
-                promote_keys.push_back(it->first);
+    // 认领顺序必须是：已有 C -> 没有手离开后新建的已有 D -> 剩余 B 的
+    // POST_HAND_REVEAL_D。track_buffer_ 的负 id 是 D，若直接按 map 遍历，
+    // D 会先于 C 抢框，故显式分两轮处理。
+    for (int phase = 0; phase < 2; ++phase) {
+        const bool process_suspects = phase == 1;
+        for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+             it != track_buffer_.end(); ++it) {
+            OperationTrack& track = it->second;
+            if (track.is_suspect_new != process_suspects ||
+                track.state == OperationTrackState::NORMAL) {
+                continue;
+            }
+            BBox reference = track.has_placed_box ? track.placed_box : estimated_box(track);
+            if (track.state == OperationTrackState::PLACED && track.has_placed_box) {
+                reference = track.placed_box;
+            }
+            int found = unique_detection_for_box(detections, claimed, track.cls_id,
+                                                 reference, true, true);
+            if (found < 0 && track.original_box.area() > 0.0f) {
+                found = unique_detection_for_box(detections, claimed, track.cls_id,
+                                                  track.original_box, true, false);
+            }
+            // D 刚放下时，完整框可能和“手中局部框 + 手位移”差异很大。它已经
+            // 通过前序来源建立了链路，收尾首帧应优先尝试自身最近一次真实观测。
+            // 普通旧库存不走这个宽松兜底。
+            if (found < 0 && track.is_suspect_new && track.has_last_seen_box) {
+                found = unique_detection_for_box(detections, claimed, track.cls_id,
+                                                  track.last_seen_box, true, true);
+            }
+            if (found < 0 && track.is_suspect_new && track.has_last_hand_block_box) {
+                found = unique_detection_for_box(detections, claimed, track.cls_id,
+                                                  track.last_hand_block_box, true, true);
+            }
+            if (found < 0 && track.is_suspect_new) {
+                found = unique_d_reappearance_detection_for_track(
+                    detections, claimed, it->first, track, working_inventory_, track_buffer_);
+                if (found >= 0) {
+                    printf("[3.0] suspect#%d 通过局部→完整路径重现匹配到无手检测\n",
+                           track.suspect_id);
+                }
+            }
+            if (found < 0) {
+                // POST_HAND_REVEAL_D 的第一张完整 B 就是它唯一的初始证据。
+                // 下一张有效无手帧无法自匹配，说明该 B 不稳定，直接丢弃，
+                // 而不是让它在后续随机帧中重新凑够次数。
+                if (track.is_suspect_new && !track.promoted_to_working_inventory &&
+                    track.suspect_source == SuspectSource::POST_HAND_REVEAL_D &&
+                    no_hand_streak_ > track.post_hand_reveal_no_hand_streak) {
+                    discard_keys.insert(it->first);
+                }
+                continue;
+            }
+            const Detection& d = detections[found];
+            claimed.insert(found);
+            track.last_seen_box = d.box;
+            track.has_last_seen_box = true;
+
+            if (track.is_suspect_new && !track.promoted_to_working_inventory) {
+                ++track.self_match_count;
+                if (track.self_match_count >= NEW_ITEM_CONFIRM_FRAMES) {
+                    promote_keys.push_back(it->first);
+                }
+            }
+            if (track.is_suspect_new && track.promoted_to_working_inventory) {
+                track.placed_box = d.box;
+                track.has_placed_box = true;
+                track.drop_confirmed = true;
+                std::map<int, InventoryItem>::iterator item =
+                    working_inventory_.find(track.item_id);
+                if (item != working_inventory_.end()) {
+                    update_seen(item->second, d, 0);
+                    item->second.base_box = d.box;
+                }
+                continue;
+            }
+            if (!track.is_suspect_new) {
+                if (partial_match_box(track.cls_id, track.original_box, d.cls_id, d.box,
+                                      FLOW3_TRACK_PARTIAL_IOM)) {
+                    std::map<int, InventoryItem>::iterator item =
+                        working_inventory_.find(track.item_id);
+                    if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                    release_not_held_(track, false);
+                } else if (track.hold_and_move || !track.move_values.empty()) {
+                    confirm_rearrange_(track, d.box, d.score, 0);
+                }
             }
         }
-        if (track.is_suspect_new && track.promoted_to_working_inventory) {
-            track.placed_box = d.box;
-            track.has_placed_box = true;
-            track.drop_confirmed = true;
-            std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
-            if (item != working_inventory_.end()) {
-                update_seen(item->second, d, 0);
-                item->second.base_box = d.box;
-            }
-            continue;
-        }
-        if (!track.is_suspect_new) {
-            if (partial_match_box(track.cls_id, track.original_box, d.cls_id, d.box,
-                                  FLOW3_TRACK_PARTIAL_IOM)) {
-                std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
-                if (item != working_inventory_.end()) update_seen(item->second, d, 0);
-                release_not_held_(track, false);
-            } else if (track.hold_and_move || !track.move_values.empty()) {
-                confirm_rearrange_(track, d.box, d.score, 0);
-            }
+
+        // 第一轮 C 处理结束后，正常静态 C 也要先保留自己的严格框，再让 D
+        // 用宽松的局部/路径规则查找。这样严格属于旧库存的 B 不会被 D 抢走。
+        if (phase == 0) {
+            reserve_unique_no_hand_static_inventory_detections(
+                detections, working_inventory_, operation_start_inventory_, track_buffer_,
+                &claimed);
         }
     }
+
+    for (std::set<int>::const_iterator discard = discard_keys.begin();
+         discard != discard_keys.end(); ++discard) {
+        std::map<int, OperationTrack>::iterator track = track_buffer_.find(*discard);
+        if (track == track_buffer_.end()) continue;
+        printf("[3.0] suspect#%d 的手离开后完整框未连续确认，丢弃候选\n",
+               track->second.suspect_id);
+        track_buffer_.erase(track);
+    }
+
     for (size_t i = 0; i < promote_keys.size(); ++i) {
         std::map<int, OperationTrack>::iterator track = track_buffer_.find(promote_keys[i]);
         if (track == track_buffer_.end() || !track->second.has_last_seen_box) continue;
@@ -1478,6 +1875,10 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
         track->second.has_placed_box = true;
         track->second.drop_confirmed = true;
     }
+
+    // 所有旧 C、已有 D 都已优先处理完成；此时剩余 B 才能成为“全程被手
+    // 遮挡、手离开后首次显现”的 D。
+    register_post_hand_reveal_suspects_(detections, &claimed);
 }
 
 void SessionManager::mark_pending_out_(int item_id) {
