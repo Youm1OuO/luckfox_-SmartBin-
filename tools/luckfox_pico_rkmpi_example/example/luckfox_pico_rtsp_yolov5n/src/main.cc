@@ -5,8 +5,8 @@
 //  每帧流水线：
 //    1. 摄像头采集 + YOLO推理 + 坐标映射
 //    2. ByteTrack-Lite 每帧更新（只用于 OSD 显示）
-//    3. SessionManager 更新轻量 OperationTrack；有手时清空稳定缓冲
-//    4. 连续 N 帧无手稳定 → 形成一个稳定快照并直接比较库存表
+//    3. SessionManager 在手操作期间维护 3.0 工作库存、HAND_* 和疑似 D
+//    4. 连续 N 帧无手稳定 → 以工作库存和稳定快照完成一次原子提交
 //    5. 事件上报 + 画面绘制 + RTSP推流
 // ============================================================================
 #include <assert.h>
@@ -324,6 +324,7 @@ int main(int argc, char *argv[]) {
 	//  业务模块初始化
 	// ============================================================
 	fridge::SessionManager session;
+	printf("[VERSION] 库存流程 %s\n", fridge::FLOW3_BUILD_TAG);
 	fridge::CloudUploader cloud;
 	bool cloud_enabled = fridge::CLOUD_ENABLED;
 	if (const char* env_cloud_enabled = getenv("FRIDGE_CLOUD_ENABLED")) {
@@ -558,8 +559,8 @@ int main(int argc, char *argv[]) {
 				}
 			}
 
-			// 新业务层自己维护“连续无手稳定 N 帧”的快照缓冲，并在有手时
-			// 更新轻量 OperationTrack；旧 ByteTrack 不参与本程序运行。
+			// 3.0 业务层自己维护连续无手稳定快照；有手时只改工作库存和
+			// HAND_*/D 运行时状态，正式库存只在稳定收尾时提交。
 			fridge::FrameProcessResult frame_result =
 				session.process_frame(food_dets, hand_boxes, g_frame_id, now_ms);
 
@@ -726,7 +727,7 @@ int main(int argc, char *argv[]) {
 			//  画面绘制：bbox + 系统状态
 			// ============================================================
 			for (const auto& d : detections) {
-				if (fridge::is_hand(d.cls_id)) continue;
+				// if (fridge::is_hand(d.cls_id)) continue;
 				bool should_display_raw =
 					d.score >= fridge::SNAPSHOT_MIN_SCORE;
 				if (!should_display_raw) continue;

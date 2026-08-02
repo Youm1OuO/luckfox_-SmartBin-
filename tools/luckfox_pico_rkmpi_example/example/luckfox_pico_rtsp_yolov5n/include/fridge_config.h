@@ -8,6 +8,9 @@
 
 namespace fridge {
 
+// 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r4";
+
 // =========================================================================
 //  类别 ID 配置
 // -------------------------------------------------------------------------
@@ -188,11 +191,11 @@ constexpr int TRACK_BUFFER_FRAMES = 60;
 constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 
 // =========================================================================
-//  2.0 库存 / 快照流程超参数
+//  3.0 库存 / 快照流程超参数
 // -------------------------------------------------------------------------
 //  这里的常量只给出可运行的初始值；部署前必须按该摄像头、该模型和实际
 //  冰箱格局标定。详细的“地址 + 含义 + 调整方向”见：
-//  另一种业务流程(2.0var—库存与快照对比；不是逐帧)/超参数修改说明.md
+//  另另一种业务流程(3.0var).md/超参数位置与调节说明.txt
 // =========================================================================
 
 // 连续无手稳定快照。
@@ -213,18 +216,30 @@ constexpr float INVENTORY_STRICT_CENTER_NORM = 0.26f;
 constexpr float INVENTORY_STRICT_WIDTH_RATIO = 0.25f;
 constexpr float INVENTORY_STRICT_HEIGHT_RATIO = 0.25f;
 
-// “局部匹配”：类别相同且 IoM 接近 1。可见物品没有 blocker 时不应无故变大。
+// “局部匹配”：类别相同且 IoM 接近 1。
 constexpr float INVENTORY_PARTIAL_IOM = 0.84f;
-constexpr float VISIBLE_AREA_GROWTH_RATIO_EPS = 0.10f;
-constexpr float BASE_BOX_CONTAIN_EPS = 5.0f;
+
+// 3.0 身份/轨迹匹配。严格匹配用于稳定位置；轨迹匹配允许手持物体
+// 的 YOLO 框略有抖动或局部遮挡，但仍要求类别和大致形状一致。
+constexpr float FLOW3_TRACK_CENTER_NORM = 0.75f;
+constexpr float FLOW3_TRACK_PARTIAL_IOM = 0.50f;
+constexpr float FLOW3_TRACK_WIDTH_RATIO = 0.65f;
+constexpr float FLOW3_TRACK_HEIGHT_RATIO = 0.65f;
+constexpr float FLOW3_OLD_POSITION_OVERLAP_AREA = 16.0f;
+
+// 物品刚被手挡住时，YOLO 输出的是完整框的一部分，不能继续用库存/快照的
+// 高 IoM 阈值直接否定它。以下仅用于“当前手确实影响该框”的已有物品优先认领，
+// 不用于普通无手库存匹配，也不单独生成身份。
+constexpr float FLOW3_HAND_PARTIAL_MIN_OBSERVED_COVER = 0.30f;
+constexpr float FLOW3_HAND_PARTIAL_MAX_AREA_RATIO = 1.35f;
+constexpr float FLOW3_HAND_PARTIAL_CENTER_NORM = 0.85f;
 
 // 动态矩形遮挡 / block_ids。
 constexpr float BLOCK_OVERLAP_AREA_EPS = 4.0f;
 constexpr float COVER_REMAINING_AREA_EPS = 4.0f;
-// YOLO 框存在边缘抖动时，刚由 Track 确认移动到前方的物品覆盖旧物品达到该比例，
-// 且旧物品在稳定快照中消失，可按“被遮挡”处理。仅用于本轮 MOVED 的前景物品，
-// 不会放宽普通静态缺失 / OUT 的判定。
-constexpr float TRACKED_BLOCKER_OCCLUSION_COVER_RATIO = 0.60f;
+// 3.0 的 D→C 遮挡在 D 已确认放下时才写入 block_ids。新 D 只部分覆盖
+// C 但 C 已处于 HAND_* 时，达到该比例可以作为“先保留 C，不判 OUT”的证据。
+constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
 // 当前尚未对接后台，允许首次无手稳定快照建立本地测试库存。
 // 接入可信后台后建议改为 false：此时冷启动快照只做只读校验，不负责建库。
@@ -240,28 +255,32 @@ constexpr float OSD_STRONG_HAND_SCORE_THRESH = 0.45f;
 constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
 
 // =========================================================================
-//  OperationTrack 参数
+//  3.0 HAND_* / Track 参数
 // -------------------------------------------------------------------------
-// Track 是 2.0 中确认“整理 / 出库”的唯一来源；静态快照不能单独判 OUT。
+// 每个被手影响物品各自保存 move_values 和完整估计轨迹；正式事件仍在无手
+// 稳定快照提交时生成。对已有完整库存物品 A，先计算：
+//   r = intersection(hand.box, A.box) / area(A.box)
+// r < e2 不进入 HAND_*；e2 <= r < e1 为 HAND_PARTIAL；r >= e1 才为
+// HAND_FULL。e2/e1 只使用 A 的完整可靠框，不能使用被遮挡后缩小的检测框。
 // =========================================================================
-constexpr float TRACK_ASSOCIATE_CENTER_NORM  = 1.00f;
-constexpr float TRACK_ASSOCIATE_WIDTH_RATIO  = 0.70f;
-constexpr float TRACK_ASSOCIATE_HEIGHT_RATIO = 0.70f;
-constexpr float TRACK_START_REAPPEAR_CENTER_NORM = 0.55f;
-constexpr float TRACK_HAND_NEAR_NORM         = 1.25f;
-constexpr float TRACK_HAND_OVERLAP           = 0.12f;
-constexpr float TRACK_FULL_OCCLUSION_OVERLAP = 0.58f;
-constexpr float TRACK_CARRY_OVERLAP          = 0.20f;
 constexpr float TRACK_HAND_MOVE_EPS          = 12.0f;
-constexpr float TRACK_OBJECT_MOVE_EPS        = 10.0f;
-constexpr float TRACK_MOVE_DIRECTION_COS_MIN = 0.65f;
-constexpr float TRACK_MOVE_MAGNITUDE_RATIO_MIN = 0.25f;
-constexpr float TRACK_MOVE_MAGNITUDE_RATIO_MAX = 3.50f;
-constexpr int   TRACK_STILL_AT_START_FRAME_LIMIT = 3;
-constexpr int   TRACK_LOST_FRAME_LIMIT = 4;
-constexpr float TRACK_SETTLEMENT_CENTER_EPS = 38.0f;
-constexpr float TRACK_SETTLEMENT_WIDTH_EPS  = 28.0f;
-constexpr float TRACK_SETTLEMENT_HEIGHT_EPS = 28.0f;
+// 连续两帧都有手但手框几乎没有变化时，整帧跳过（不更新 old_hand、轨迹和计数）。
+// 调大可减少重复计算但会漏掉小幅有效动作；调小更敏感但计算量和抖动增加。
+constexpr float HAND_MICRO_MOVE_SKIP_EPS     = 6.0f;
+// 疑似 D 连续有效观察次数达到该值后，认为身份稳定，可在结算时入库。
+constexpr int   NEW_ITEM_CONFIRM_FRAMES      = 2;
+constexpr int   FLOW3_HOLD_EVIDENCE_REQUIRED = 2;
+constexpr int   FLOW3_NOT_HOLD_EVIDENCE_REQUIRED = 2;
+constexpr float FLOW3_HAND_ATTACH_DISTANCE   = 28.0f;
+constexpr float FLOW3_HAND_NEAR_MAX_INTERSECTION_AREA = 900.0f;
+// e2：手至少覆盖完整物品面积的 30%，才把已有库存物品加入 HAND_*。
+constexpr float FLOW3_HAND_PARTIAL_COVER_RATIO = 0.30f;
+// e1：只有接近完全覆盖（当前 88%）才称为 HAND_FULL；中间均是 HAND_PARTIAL。
+constexpr float FLOW3_HAND_FULL_COVER_RATIO  = 0.88f;
+// 仅供“D 是否和手相贴/相交”和放下判断使用，不参与已有库存物品的 HAND 状态。
+constexpr float FLOW3_HAND_DETECTION_OVERLAP_AREA = 300.0f;
+constexpr float FLOW3_DROP_FALL_BEHIND_RATIO = 0.45f;
+constexpr float FLOW3_COMMIT_MOVE_CENTER_DISTANCE = 28.0f;
 
 // =========================================================================
 //  门状态机（CLOSED / OPENING / OPEN / CLOSING）

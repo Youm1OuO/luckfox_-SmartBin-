@@ -1,11 +1,15 @@
 // ============================================================================
 //  session.h
-//  2.0 会话业务层：持久库存 + 手后 Track + 稳定快照原子结算
+//  3.0 会话业务层：正式库存 + 手操作工作库存 + 逐帧候选状态机
+//
+//  正式 InventoryDB 只在一段连续手操作收尾时提交。手在画面中时，所有
+//  HAND_*、疑似新物品 D、轨迹、遮挡和出库判断都保存在工作副本中。
 // ============================================================================
 #ifndef __FRIDGE_SESSION_H
 #define __FRIDGE_SESSION_H
 
 #include <map>
+#include <set>
 #include <vector>
 
 #include "inventory.h"
@@ -13,21 +17,19 @@
 
 namespace fridge {
 
-// IN / OUT / MOVED 会上报云端；OCCLUDED / REVEALED 只表示本地可见状态变化。
 enum class EventKind { IN, OUT, MOVED, OCCLUDED, REVEALED };
 
 struct InventoryEvent {
-    EventKind kind;
-    int item_id;
-    int cls_id;
-    BBox box;          // IN / OUT 的位置；MOVED 时等于 after_box
-    BBox before_box;   // 仅 MOVED 使用
-    BBox after_box;    // 仅 MOVED 使用
-    float score;
+    EventKind kind = EventKind::IN;
+    int item_id = -1;
+    int cls_id = -1;
+    BBox box;
+    BBox before_box;
+    BBox after_box;
+    float score = 0.0f;
 };
 
 struct SettlementResult {
-    // committed 表示 working_inventory 已完整替换正式库存。失败时 events 必为空。
     bool committed = false;
     bool happened = false;
     std::vector<InventoryEvent> events;
@@ -38,11 +40,9 @@ struct FrameProcessResult {
     SettlementResult settlement;
 };
 
-// 冷启动首次快照与正式手后结算严格分开，不能借 operation_pending 混用。
 enum class InitialCheckState {
     NONE,
     WAITING,
-    // 仅后台不可用的本地测试兜底：首次快照建立本地库存，不是只读校验。
     BOOTSTRAP_FROM_SNAPSHOT,
     DONE,
     SKIPPED,
@@ -55,51 +55,62 @@ enum class BackendStatus {
     NO_TRUSTED_BACKEND,
 };
 
+// 只存在于一段连续手操作内的状态；InventoryItem 不保存 HAND_* 状态。
 enum class OperationTrackState {
-    VISIBLE,
-    HAND_OCCLUDED,
+    NORMAL,
+    HAND_PARTIAL_BLOCKED,
+    HAND_FULL_BLOCKED,
     PLACED,
-    INVALID,
 };
 
+struct MoveValue {
+    float dx = 0.0f;
+    float dy = 0.0f;
+};
+
+// 一条运行时记录既可代表已有库存物品，也可代表 suspect_id < 0 的疑似 D。
+// item_id 为正式工作库存 id；未提升的 D 只有 suspect_id。
 struct OperationTrack {
-    int bound_item_id = -1;
+    int item_id = -1;
+    int suspect_id = 0;
+    bool is_suspect_new = false;
+    bool promoted_to_working_inventory = false;
     int cls_id = -1;
 
-    BBox start_box;                 // 从 A.base_box 复制，表示可靠起点
-    BBox proxy_box;                 // 仅有已验证移动时才更新的完整物品代理框
-    BBox last_item_box;
-    bool has_last_item_box = false;
-    BBox last_hand_box;
-    bool has_last_hand_box = false;
+    // original_box 在进入 HAND_* 时固定；主轨迹只从它叠加 move_values 得到。
+    BBox original_box;
+    BBox last_seen_box;
+    bool has_last_seen_box = false;
+    BBox first_hand_block_box;
+    bool has_first_hand_block_box = false;
+    BBox last_hand_block_box;
+    bool has_last_hand_block_box = false;
+    BBox placed_box;
+    bool has_placed_box = false;
 
-    OperationTrackState state = OperationTrackState::VISIBLE;
-    bool shelter_or_hold = false;   // 已有手接触 / 遮挡候选证据
-    bool hold_and_move = false;     // 已同时确认接触和有效移动
-    bool seen_hand_contact = false;
-    bool seen_effective_move = false;
-    int still_at_start_count = 0;
-    int missing_without_hand_count = 0;
+    OperationTrackState state = OperationTrackState::NORMAL;
+    bool hold_and_move = false;
+    bool shelter_or_hold = false;
+    bool drop_confirmed = false;
+    int hold_evidence_count = 0;
+    int not_hold_evidence_count = 0;
+    int self_match_count = 0;
+    int hand_track_start_index = -1;
 
-    BBox release_box;
-    bool has_release_box = false;
-    std::vector<BBox> hand_path;
-    std::vector<BBox> proxy_path;
-    bool frozen = false;
+    std::vector<MoveValue> move_values;
+    std::vector<BBox> track;       // 每个点均为完整物品坐标系的估计框
 };
 
 class SessionManager {
 public:
     SessionManager();
 
-    // 新 Session 只清理会话数据，绝不清空跨关门的 inventory / next_item_id。
     void start_new_session(long long time_ms = 0);
     void init_from_backend(const std::vector<InventoryItem>& items,
                            bool authoritative_empty = false);
     void mark_backend_unavailable();
     void finish_session(long long time_ms = 0);
 
-    // 门进入 CLOSING 时暂停证据链；若误判恢复 OPEN，按文档有条件丢弃 Track。
     void begin_closing_guard();
     void resume_after_false_closing();
 
@@ -117,7 +128,7 @@ public:
                initial_check_state_ != InitialCheckState::WAITING;
     }
     bool hand_present() const { return hand_present_; }
-    bool operation_pending() const { return operation_pending_; }
+    bool operation_pending() const { return working_inventory_active_; }
     int no_hand_streak() const { return no_hand_streak_; }
     InitialCheckState initial_check_state() const { return initial_check_state_; }
     const InventoryDB& inventory() const { return inventory_; }
@@ -129,45 +140,87 @@ public:
     void print_inventory() const;
 
 private:
-    bool should_collect_snapshot_() const;
-    void save_previous_yolo_result_(const std::vector<Detection>& food_detections,
-                                    bool current_has_hand);
+    // 会话/初始化
     void rebuild_persistent_item_index_();
-
+    void reset_operation_runtime_();
+    void begin_working_operation_(const BBox& hand_box,
+                                  const std::vector<Detection>& detections);
     void finalize_initial_check_before_hand_();
     void validate_initial_snapshot_(const Snapshot& snapshot) const;
     void initialize_from_bootstrap_snapshot_(const Snapshot& snapshot);
 
-    void update_tracks_while_hand_present_(const std::vector<Detection>& detections,
-                                           const BBox& hand_box, int frame_id);
-    void update_track_by_visible_item_(OperationTrack& track, const Detection& detection,
-                                       const BBox& hand_box);
-    void update_track_by_hand_or_mark_invalid_(OperationTrack& track,
-                                                const std::vector<Detection>& detections,
-                                                const BBox& hand_box);
-    void create_candidate_tracks_(const std::vector<Detection>& detections,
-                                  const BBox& hand_box, bool first_hand_frame);
-    void freeze_all_tracks_();
-    void clear_tracks_after_settlement_();
-    void discard_tracks_and_mark_ambiguous_();
+    // 有手逐帧处理
+    void process_effective_hand_frame_(const BBox& hand_box,
+                                       const std::vector<Detection>& detections,
+                                       bool first_hand_frame);
+    void append_move_to_existing_hand_tracks_(const MoveValue& delta);
+    void update_existing_hand_tracks_(const BBox& hand_box,
+                                      const std::vector<Detection>& detections,
+                                      const MoveValue& delta,
+                                      std::set<int>* claimed_detection_indices,
+                                      std::map<int, int>* known_item_owner);
+    void scan_or_update_suspects_(const BBox& hand_box,
+                                  const std::vector<Detection>& detections,
+                                  std::set<int>* claimed_detection_indices,
+                                  const std::map<int, int>& known_item_owner,
+                                  bool first_hand_frame);
+    void mark_newly_hand_blocked_items_(const BBox& hand_box,
+                                        const std::vector<Detection>& detections,
+                                        std::set<int>* claimed_detection_indices,
+                                        std::map<int, int>* known_item_owner);
+    // 在逐帧 D 预扫描前，为本帧仍处于普通可见状态的旧库存保留其唯一的
+    // 严格匹配框。这样同类新 D 即使贴着旧物品出现，也不会被旧物品的
+    // “局部可能匹配”吞掉。
+    void reserve_visible_known_detections_(
+        const BBox& hand_box,
+        const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices,
+        std::map<int, int>* known_item_owner);
+    void apply_suspect_cover_evidence_(const BBox& hand_box,
+                                       const std::vector<Detection>& detections);
 
-    SettlementResult settle_snapshot_(const Snapshot& snapshot);
+    // 手离开后的收尾与提交
+    void observe_no_hand_frame_(const std::vector<Detection>& detections);
+    SettlementResult settle_stable_snapshot_(const Snapshot& snapshot);
+    void clear_runtime_after_commit_();
 
-    InventoryDB inventory_;
-    // 持久索引只引用 inventory_ 的 map 元素；replace_all 后必须重建。
+    // 运行时对象与工作库存操作
+    int runtime_key_for_item_(int item_id) const { return item_id; }
+    int new_suspect_id_();
+    OperationTrack* find_runtime_for_item_(int item_id);
+    const OperationTrack* find_runtime_for_item_(int item_id) const;
+    void promote_suspect_(int runtime_key, const Detection& detection,
+                          int frame_id);
+    void confirm_rearrange_(OperationTrack& track, const BBox& release_box,
+                            float score, int frame_id);
+    void release_not_held_(OperationTrack& track, bool occluded);
+    void mark_pending_out_(int item_id);
+    void refresh_confirmed_blockers_(const std::set<int>& observed_working_ids);
+
+    InventoryDB inventory_;  // 正式库存
     std::map<int, InventoryItem*> item_by_id_;
 
-    SnapshotBuffer no_hand_buffer_;
-    std::map<int, OperationTrack> track_buffer_;
-    std::vector<OperationTrack> frozen_tracks_;
+    // 手操作期间唯一可写的库存副本。
+    std::map<int, InventoryItem> working_inventory_;
+    std::map<int, InventoryItem> operation_start_inventory_;
+    int working_next_item_id_ = 1;
+    bool working_inventory_active_ = false;
 
-    std::vector<Detection> previous_food_detections_;
-    bool previous_had_hand_ = false;
-    bool track_session_is_ambiguous_ = false;
-    bool operation_pending_ = false;
+    // key 为 item_id（>=1）或 suspect_id（<0）。
+    std::map<int, OperationTrack> track_buffer_;
+    std::set<int> pending_in_ids_;
+    std::set<int> pending_out_ids_;
+    std::set<int> confirmed_moved_ids_;
+    std::set<int> released_hand_candidate_ids_;
+    std::vector<BBox> hand_track_;
+    BBox old_hand_box_;
+    bool has_old_hand_box_ = false;
+    int next_suspect_id_ = -1;
+
+    SnapshotBuffer no_hand_buffer_;
     bool hand_present_ = false;
-    bool has_local_inventory_ = false;
     bool session_active_ = false;
+    bool has_local_inventory_ = false;
     int no_hand_streak_ = 0;
     long long current_time_ms_ = 0;
     InitialCheckState initial_check_state_ = InitialCheckState::NONE;
