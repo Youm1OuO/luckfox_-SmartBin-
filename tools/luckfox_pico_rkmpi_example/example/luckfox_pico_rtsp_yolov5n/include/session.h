@@ -63,6 +63,14 @@ enum class OperationTrackState {
     PLACED,
 };
 
+// 与 HAND_* 正交的低覆盖率接触状态。它只存在于一次手操作的运行时轨迹中，
+// 不写入 InventoryItem；普通可见/遮挡物品的默认值为 NONE。
+enum class ContactState {
+    NONE,
+    CONTACT_CANDIDATE,
+    CONTACT_MOVING,
+};
+
 // 疑似新物品 D 的首次发现来源。来源只决定后续需要哪一条确认链路；
 // 无论哪一种，正式 IN 都仍要等无手稳定快照提交。
 enum class SuspectSource {
@@ -87,7 +95,7 @@ struct OperationTrack {
     SuspectSource suspect_source = SuspectSource::NONE;
     int cls_id = -1;
 
-    // original_box 在进入 HAND_* 时固定；主轨迹只从它叠加 move_values 得到。
+    // original_box 在本次手操作开始影响物品时固定。
     BBox original_box;
     BBox last_seen_box;
     bool has_last_seen_box = false;
@@ -101,8 +109,14 @@ struct OperationTrack {
     bool has_reappear_candidate_box = false;
     BBox placed_box;
     bool has_placed_box = false;
+    // CONTACT_* 转为 HAND_* 时，不能再从 original_box（旧位置）开始推算。
+    // 这里保存接触阶段最后一次可靠真实框；之后 move_values 仅累计转入
+    // HAND_* 之后的手位移，original_box 仍保留给最终“是否移动”比较。
+    BBox hand_estimate_anchor_box;
+    bool has_hand_estimate_anchor_box = false;
 
     OperationTrackState state = OperationTrackState::NORMAL;
+    ContactState contact_state = ContactState::NONE;
     bool hold_and_move = false;
     bool shelter_or_hold = false;
     bool drop_confirmed = false;
@@ -120,8 +134,17 @@ struct OperationTrack {
     // 后续一张有效无手帧若不能自匹配，就丢弃该候选而不产生事件。
     int post_hand_reveal_no_hand_streak = -1;
 
+    // HAND_* 的手位移估计路径。CONTACT_* 不使用它来推算物品位置。
     std::vector<MoveValue> move_values;
-    std::vector<BBox> track;       // 每个点均为完整物品坐标系的估计框
+    std::vector<BBox> track;       // HAND_* 的完整物品坐标系估计框
+    // CONTACT_* 的实际物品观测路径；它不受手腕/手臂位移方向影响。
+    std::vector<MoveValue> observed_move_values;
+    std::vector<BBox> observed_track;
+    // 可选的手部辅助记录。它只描述手，不参与 CONTACT_* 的身份/终点判断。
+    std::vector<MoveValue> hand_move_values;
+    bool contact_started_touching_hand = false;
+    // 当前帧存在可解释但不唯一的 CONTACT B；此时手离开后不能直接 OUT。
+    bool contact_path_ambiguous = false;
 };
 
 class SessionManager {
@@ -177,6 +200,14 @@ private:
                                        const std::vector<Detection>& detections,
                                        bool first_hand_frame);
     void append_move_to_existing_hand_tracks_(const MoveValue& delta);
+    void update_existing_contact_tracks_(
+        const BBox& hand_box, const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices,
+        std::map<int, int>* known_item_owner);
+    void mark_new_contact_candidates_(
+        const BBox& hand_box, const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices,
+        std::map<int, int>* known_item_owner);
     void update_existing_hand_tracks_(const BBox& hand_box,
                                       const std::vector<Detection>& detections,
                                       const MoveValue& delta,

@@ -15,7 +15,7 @@ tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/session.c
 修改参数后必须重新交叉编译。建议一次只改一项，并保存“参数版本 + 视频 +
 事件日志”；多个阈值一起放宽，出现误匹配时会无法判断是哪一项造成的。
 
-当前版本（3.0-r7）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
+当前版本（3.0-r8）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
 自己的唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用
 的框才有机会进入疑似 D 链路。若某个 HAND_* 旧 C 没有自己的检测框，而同类贴手
 B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_candidate` 暂存，不能
@@ -98,10 +98,37 @@ FLOW3_OLD_POSITION_OVERLAP_AREA
 ----------------
 
 HAND_MICRO_MOVE_SKIP_EPS（当前 6 像素）
-    连续两帧都有手时，手框中心移动小于该值，当前帧完全跳过：不更新 old_hand、
-    轨迹、D、移动值或证据计数。
-    调大：减少计算和手框抖动影响，但慢速真实移动可能被吞掉。
-    调小：更灵敏，但会让手框抖动反复进入业务判断。
+    没有任何未决 HAND_* / CONTACT_* 轨迹时，连续两帧手框四条边的差异都小于该值，
+    当前帧才会跳过。存在活动轨迹时，即使手框不动也继续检查物品检测框，避免漏掉
+    手指推动。该跳过只减少业务层计算；如果上游已经先完成 YOLO 推理，不会减少推理本身。
+    调大：普通静止手帧计算更少，但可能吞掉小幅手框变化。
+    调小：更灵敏，但普通手框抖动会带来更多业务层处理。
+
+FLOW3_CONTACT_PATH_CENTER_NORM（当前 1.10）
+    CONTACT_* 中，当前物品框相对 A 的原框或 observed_track 某一点的最大归一化中心
+    距离。仍需同时满足类别和宽高比例条件。
+    调大：能容忍快速推拉或 YOLO 框跳动，但相邻同类物品串身份风险上升。
+    调小：身份更安全，但快速移动时容易暂时找不到 B。
+
+FLOW3_CONTACT_WIDTH_RATIO、FLOW3_CONTACT_HEIGHT_RATIO（当前均 0.35）
+    CONTACT_* 的 B 与 A 完整框/历史真实框的相对宽高差容差。
+    调大：容忍视角和检测框尺寸变化，但同类邻居更容易被吸收。
+    调小：形状约束更严格，但框抖动或轻微尺度变化可能使候选保持未决。
+
+FLOW3_CONTACT_OBJECT_MOVE_EPS（当前 12 像素）
+    CONTACT_CANDIDATE 中，物品相对上一真实观测框的最小中心移动量；超过它才累积
+    hold 证据。它同时用于低覆盖率候选判断“是否仍在原位置”。
+    调大：更能过滤 YOLO 抖动和手指微动，但小幅整理可能无法确认。
+    调小：小幅推拉更容易确认，但误移动和原位判断抖动风险上升。
+
+CONTACT_* 的固定规则（不是单独超参数）：接触状态保存在 OperationTrack.contact_state，
+不写入 InventoryItem。CONTACT_* 只保存物品真实 observed_track/observed_move_values；
+手部 hand_track 和 hand_move_values 仅作辅助，不用手腕位移计算物品终点。首次有效 B
+需要与手相贴，连续两次真实移动证据才进入 CONTACT_MOVING；没有可靠 B 时两个证据计数
+都暂停。手离开后先查原位置，再查 observed_track；两者都没有时先保持未决，稳定无手
+帧持续缺失且没有遮挡解释后才允许 OUT。若接触候选后来达到 e2/e1 转入 HAND_*，
+会把接触阶段最后一次真实 B 保存为 HAND_* 的估计锚点，但仍保留 original_box 作为
+最终原位置比较基准，避免“已推开但仍与旧框局部重叠”被释放为未移动。
 
 FLOW3_HAND_ATTACH_DISTANCE
     手与新物品 D 的边缘最大距离；用于“相贴”而不是“遮挡”。除有手阶段的
@@ -168,12 +195,14 @@ FLOW3_HOLD_EVIDENCE_REQUIRED（当前 2）
     连续多少次有效“物品出现在自己的预计轨迹上、旧位置干净”的证据后，才把
     hold_and_move 设为 True。
     调大：更谨慎，减少误判拿起；确认整理/出库更慢，短动作可能不够证据。
-    调小：响应更快，但一次误匹配就可能变成移动候选。
+    调小：响应更快，但一次误匹配就可能变成移动候选。CONTACT_CANDIDATE 也使用
+    此门槛；只有达到后才把 contact_state 设为 CONTACT_MOVING。
 
 FLOW3_NOT_HOLD_EVIDENCE_REQUIRED（当前 2）
     连续多少次有效“物品仍在旧位置”的证据后，释放 HAND_* 候选。
     调大：更能容忍一帧错误旧位置匹配，但候选持续更久。
-    调小：很快释放，可能错过随后真正拿起的动作。
+    调小：很快释放，可能错过随后真正拿起或推拉的动作。CONTACT_CANDIDATE 只有在
+    A 真实回到原位置时才增加该计数；漏检或歧义帧不会增加。
 
 FLOW3_DROP_FALL_BEHIND_RATIO
     手继续移动而物品框移动明显较少时，“掉队”的比例。它只是放下证据的必要条件；
@@ -261,7 +290,7 @@ BLOCK_OVERLAP_AREA_EPS、COVER_REMAINING_AREA_EPS
 2. 再调 INVENTORY_STRICT_* 与 INVENTORY_PARTIAL_IOM：确保静态库存不产生
    新 item_id，也不合并相邻同类物品。
 3. 调手框参数与 HAND_MICRO_MOVE_SKIP_EPS：先让“手经过但没拿”不产生移动。
-4. 最后调 FLOW3_TRACK_*、两类 evidence 阈值、放下与遮挡参数。
+4. 最后调 FLOW3_TRACK_*、FLOW3_CONTACT_*、两类 evidence 阈值、放下与遮挡参数。
    若“移动旧 C 却误报 IN”，先检查/小幅调大 FLOW3_REAPPEAR_CANDIDATE_*；若
    “真正相邻同类 IN 长期保持未决”，再小幅调小它们，并保留回放验证。
 
@@ -273,6 +302,8 @@ BLOCK_OVERLAP_AREA_EPS、COVER_REMAINING_AREA_EPS
 - 取出 A；
 - 放入新 D；
 - 同类物品无法唯一判断时，库存数量不得增加，状态应保持未决。
+- 手腕基本不动、手指推动物品时，旧 item_id 不得变成新的 D；应先出现
+  CONTACT_CANDIDATE，连续真实框移动后才变为 CONTACT_MOVING。
 
 重要原则：稳定快照中“没有绑定 item_id 的框”不会自动入库。只有具有 D 的
 “有手阶段已发现（贴手或替代 C 原位置）→ 连续自匹配 → 稳定存在”，或

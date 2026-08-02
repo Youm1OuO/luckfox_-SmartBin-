@@ -162,13 +162,25 @@ MoveValue total_move(const OperationTrack& track) {
 }
 
 BBox estimated_box(const OperationTrack& track) {
-    return move_box(track.original_box, total_move(track));
+    const BBox& anchor = track.has_hand_estimate_anchor_box
+        ? track.hand_estimate_anchor_box : track.original_box;
+    return move_box(anchor, total_move(track));
 }
 
 bool is_active_existing_hand_track(const OperationTrack& track) {
     return !track.is_suspect_new && track.item_id > 0 &&
            (track.state == OperationTrackState::HAND_PARTIAL_BLOCKED ||
             track.state == OperationTrackState::HAND_FULL_BLOCKED);
+}
+
+bool is_active_contact_track(const OperationTrack& track) {
+    return !track.is_suspect_new && track.item_id > 0 &&
+           track.contact_state != ContactState::NONE;
+}
+
+bool is_active_runtime_track(const OperationTrack& track) {
+    return track.state != OperationTrackState::NORMAL ||
+           track.contact_state != ContactState::NONE;
 }
 
 bool reappear_candidate_is_confirmed(const OperationTrack& track) {
@@ -564,6 +576,175 @@ bool detection_strictly_matches_other_item(const Detection& detection,
     return false;
 }
 
+// CONTACT_* 只使用物品自己的真实观测路径。手框位移不能替代这里的 BBox
+// 位移，因为手腕不动时手指仍可能推动物品。
+float contact_reference_cost(const OperationTrack& track,
+                             const BBox& reference,
+                             const Detection& observed) {
+    if (reference.area() <= 0.0f || observed.box.area() <= 0.0f ||
+        track.cls_id != observed.cls_id ||
+        ratio_difference(reference.w(), observed.box.w()) >
+            FLOW3_CONTACT_WIDTH_RATIO ||
+        ratio_difference(reference.h(), observed.box.h()) >
+            FLOW3_CONTACT_HEIGHT_RATIO) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const float center = normalized_nearby_distance(reference, observed.box);
+    if (center > FLOW3_CONTACT_PATH_CENTER_NORM &&
+        !track_match_box(track.cls_id, reference, observed.cls_id, observed.box)) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return center + 0.35f * ratio_difference(reference.w(), observed.box.w()) +
+        0.35f * ratio_difference(reference.h(), observed.box.h());
+}
+
+float contact_path_match_cost(const OperationTrack& track,
+                              const Detection& observed) {
+    // C 一旦从 CONTACT_* 过渡成 HAND_*，此前真实看见过的物品路径仍然
+    // 有价值，不能因为状态转换而丢掉。只有既不是 CONTACT_*、也没有任何
+    // 真实观测时，才说明它不存在可用的 contact 路径。
+    if ((track.contact_state == ContactState::NONE && track.observed_track.empty()) ||
+        track.cls_id != observed.cls_id || observed.box.area() <= 0.0f) {
+        return std::numeric_limits<float>::infinity();
+    }
+
+    float best = std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < track.observed_track.size(); ++i) {
+        best = std::min(best, contact_reference_cost(track,
+                                                      track.observed_track[i], observed));
+    }
+    if (track.has_last_seen_box) {
+        best = std::min(best, contact_reference_cost(track, track.last_seen_box, observed));
+    }
+    if (track.original_box.area() > 0.0f) {
+        best = std::min(best, contact_reference_cost(track, track.original_box, observed));
+    }
+    return best;
+}
+
+void append_contact_observation(OperationTrack* track, const Detection& detection,
+                                bool touching_hand) {
+    if (!track) return;
+    if (track->has_last_seen_box) {
+        MoveValue delta;
+        delta.dx = detection.box.cx() - track->last_seen_box.cx();
+        delta.dy = detection.box.cy() - track->last_seen_box.cy();
+        track->observed_move_values.push_back(delta);
+    }
+    track->observed_track.push_back(detection.box);
+    track->last_seen_box = detection.box;
+    track->has_last_seen_box = true;
+    track->contact_path_ambiguous = false;
+    if (touching_hand) {
+        track->last_hand_block_box = detection.box;
+        track->has_last_hand_block_box = true;
+        track->contact_started_touching_hand = true;
+    }
+}
+
+bool contact_detection_is_at_original(const OperationTrack& track,
+                                      const Detection& detection) {
+    if (track.original_box.area() <= 0.0f ||
+        detection.cls_id != track.cls_id) {
+        return false;
+    }
+    // CONTACT_* 不能使用 HAND_* 的宽松 IoM 单独认定“仍在原位”：物品
+    // 已经移动一小段时仍可能与原框重叠超过 0.5。先要求中心移动不超过
+    // 物品抖动阈值，再接受严格/局部的形状匹配。
+    if (center_distance(track.original_box, detection.box) >
+        FLOW3_CONTACT_OBJECT_MOVE_EPS) {
+        return false;
+    }
+    return intersection_area(track.original_box, detection.box) >=
+               FLOW3_OLD_POSITION_OVERLAP_AREA &&
+        (strict_match_box(track.cls_id, track.original_box,
+                          detection.cls_id, detection.box) ||
+         partial_match_box(track.cls_id, track.original_box,
+                           detection.cls_id, detection.box,
+                           FLOW3_TRACK_PARTIAL_IOM));
+}
+
+int unique_contact_original_detection(const std::vector<Detection>& detections,
+                                      const std::set<int>& claimed,
+                                      const OperationTrack& track,
+                                      const std::map<int, InventoryItem>& working) {
+    int result = -1;
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (claimed.count(static_cast<int>(i)) ||
+            detection_strictly_matches_other_item(detections[i], track.item_id, working) ||
+            !contact_detection_is_at_original(track, detections[i])) {
+            continue;
+        }
+        if (result >= 0) return -1;
+        result = static_cast<int>(i);
+    }
+    return result;
+}
+
+// 为一个 CONTACT_* C 在当前帧找唯一的真实 B。候选必须不严格属于其他库存，
+// 且不能同时落在另一条活动 CONTACT_* 轨迹上；否则保持未决，不能按遍历顺序抢框。
+int unique_contact_detection_for_track(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        const OperationTrack& track, const std::map<int, InventoryItem>& working,
+        const std::map<int, OperationTrack>& tracks) {
+    float best_cost = std::numeric_limits<float>::infinity();
+    int best_index = -1;
+    bool tied = false;
+    for (size_t di = 0; di < detections.size(); ++di) {
+        const int detection_index = static_cast<int>(di);
+        const Detection& detection = detections[di];
+        if (claimed.count(detection_index) ||
+            detection.cls_id != track.cls_id ||
+            detection_strictly_matches_other_item(detection, track.item_id, working)) {
+            continue;
+        }
+        const float cost = contact_path_match_cost(track, detection);
+        if (!(cost < std::numeric_limits<float>::infinity())) continue;
+
+        bool competing_contact = false;
+        for (std::map<int, OperationTrack>::const_iterator other = tracks.begin();
+             other != tracks.end(); ++other) {
+            const OperationTrack& other_track = other->second;
+            if (other_track.item_id <= 0 || other_track.item_id == track.item_id ||
+                other_track.is_suspect_new ||
+                other_track.contact_state == ContactState::NONE) {
+                continue;
+            }
+            if (contact_path_match_cost(other_track, detection) <
+                std::numeric_limits<float>::infinity()) {
+                competing_contact = true;
+                break;
+            }
+        }
+        if (competing_contact) continue;
+
+        if (cost + 0.0001f < best_cost) {
+            best_cost = cost;
+            best_index = detection_index;
+            tied = false;
+        } else if (std::fabs(cost - best_cost) <= 0.0001f) {
+            tied = true;
+        }
+    }
+    return tied ? -1 : best_index;
+}
+
+bool has_contact_path_candidate(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        const OperationTrack& track, const std::map<int, InventoryItem>& working) {
+    for (size_t di = 0; di < detections.size(); ++di) {
+        if (claimed.count(static_cast<int>(di)) ||
+            detection_strictly_matches_other_item(detections[di], track.item_id, working)) {
+            continue;
+        }
+        if (contact_path_match_cost(track, detections[di]) <
+            std::numeric_limits<float>::infinity()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // 一张未认领的同类贴手 B，只能在“恰好一个没有自己检测框的 HAND_* C”
 // 的完整候选轨迹附近时，先暂存为该 C 的重新出现候选。返回 -2 表示多个 C
 // 都同样合理；调用方必须保持未决，不能把 B 改登记为 D。
@@ -799,9 +980,15 @@ int unique_d_reappearance_detection_for_track(
 // 能合理解释 B，就不把 B 另建成 POST_HAND_REVEAL_D。
 bool detection_can_belong_to_active_track(const Detection& detection,
                                           const OperationTrack& track) {
-    if (track.state == OperationTrackState::NORMAL ||
-        track.cls_id != detection.cls_id) {
+    if (!is_active_runtime_track(track) || track.cls_id != detection.cls_id) {
         return false;
+    }
+    // 即便 CONTACT_* 已升级为 HAND_*，也优先尊重此前由真实检测框建立的
+    // observed_track；这能避免低覆盖率推/拉后把同一个 B 又预登记成 D。
+    if (!track.observed_track.empty() &&
+        contact_path_match_cost(track, detection) <
+            std::numeric_limits<float>::infinity()) {
+        return true;
     }
     const BBox reference = track.has_placed_box ? track.placed_box : estimated_box(track);
     if (strict_match_box(track.cls_id, reference, detection.cls_id, detection.box) ||
@@ -884,8 +1071,7 @@ bool has_active_runtime_for_item(const std::map<int, OperationTrack>& tracks,
                                  int item_id) {
     for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
          it != tracks.end(); ++it) {
-        if (it->second.item_id == item_id &&
-            it->second.state != OperationTrackState::NORMAL) {
+        if (it->second.item_id == item_id && is_active_runtime_track(it->second)) {
             return true;
         }
     }
@@ -977,6 +1163,13 @@ BBox choose_primary_hand(const std::vector<BBox>& hand_boxes) {
     return best;
 }
 
+bool hand_boxes_effectively_same(const BBox& a, const BBox& b) {
+    return std::fabs(a.x1 - b.x1) <= HAND_MICRO_MOVE_SKIP_EPS &&
+           std::fabs(a.y1 - b.y1) <= HAND_MICRO_MOVE_SKIP_EPS &&
+           std::fabs(a.x2 - b.x2) <= HAND_MICRO_MOVE_SKIP_EPS &&
+           std::fabs(a.y2 - b.y2) <= HAND_MICRO_MOVE_SKIP_EPS;
+}
+
 // 给稳定快照建立严格的一对一绑定：只有 item 和 snapshot 两侧都唯一才绑定。
 void bind_mutually_unique(const std::map<int, InventoryItem>& items,
                           const std::set<int>& candidate_item_ids,
@@ -1046,6 +1239,13 @@ float track_path_match_cost(const InventoryItem& item, const OperationTrack& tra
         return std::numeric_limits<float>::infinity();
     }
     float best_cost = std::numeric_limits<float>::infinity();
+    if (!track.observed_track.empty()) {
+        Detection detection;
+        detection.cls_id = observed.cls_id;
+        detection.box = observed.box;
+        detection.score = observed.best_score;
+        best_cost = contact_path_match_cost(track, detection);
+    }
     for (size_t pi = 0; pi < track.track.size(); ++pi) {
         const BBox& reference = track.track[pi];
         float cost = std::numeric_limits<float>::infinity();
@@ -1364,12 +1564,195 @@ void SessionManager::append_move_to_existing_hand_tracks_(const MoveValue& delta
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
+        if (track.contact_state != ContactState::NONE) {
+            // 仅作调试/未来扩展记录；CONTACT_* 的物品位置不能由手位移推算。
+            track.hand_move_values.push_back(delta);
+        }
         if (track.state != OperationTrackState::HAND_PARTIAL_BLOCKED &&
             track.state != OperationTrackState::HAND_FULL_BLOCKED) {
             continue;
         }
         track.move_values.push_back(delta);
         track.track.push_back(estimated_box(track));
+    }
+}
+
+void SessionManager::update_existing_contact_tracks_(
+        const BBox& hand_box, const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices,
+        std::map<int, int>* known_item_owner) {
+    std::vector<int> release_keys;
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (!is_active_contact_track(track)) continue;
+
+        // 若 CONTACT_* 已经用真实 B 看见过物品的新位置，覆盖率必须相对
+        // 当前真实位置计算；仍拿最初 A.box 计算会使“先推、后握住”永远
+        // 停留在 CONTACT_*。
+        const BBox reference = track.has_last_seen_box ? track.last_seen_box
+            : track.original_box;
+        if (reference.area() <= 0.0f) continue;
+
+        // 覆盖率达到 e2 后，接触候选转入已有 HAND_* 流程；同一帧稍后由
+        // update_existing_hand_tracks_ 继续处理，避免两套逻辑同时认领。
+        if (hand_fully_covers(hand_box, reference) || hand_affects(hand_box, reference)) {
+            // 保留 contact 阶段的真实位置作为之后 HAND_* 估计的原点。
+            // original_box 不能改，它还要用于判断最终是否发生整理/出库。
+            track.hand_estimate_anchor_box = reference;
+            track.has_hand_estimate_anchor_box = true;
+            track.move_values.clear();
+            track.track.clear();
+            track.track.push_back(reference);
+            track.contact_state = ContactState::NONE;
+            track.state = hand_fully_covers(hand_box, reference)
+                ? OperationTrackState::HAND_FULL_BLOCKED
+                : OperationTrackState::HAND_PARTIAL_BLOCKED;
+            if (track.has_last_seen_box) {
+                track.first_hand_block_box = track.last_seen_box;
+                track.last_hand_block_box = track.last_seen_box;
+                track.has_first_hand_block_box = true;
+                track.has_last_hand_block_box = true;
+            }
+            continue;
+        }
+
+        const int observed_index = unique_contact_detection_for_track(
+            detections, *claimed_detection_indices, track, working_inventory_,
+            track_buffer_);
+        if (observed_index < 0) {
+            // 漏检、多个同类候选或与其他库存冲突都不是“未持有”的证据。
+            if (has_contact_path_candidate(detections, *claimed_detection_indices,
+                                           track, working_inventory_)) {
+                track.contact_path_ambiguous = true;
+            }
+            continue;
+        }
+
+        const Detection& detection = detections[observed_index];
+        const bool touching_hand = hand_is_near(hand_box, detection.box);
+        const bool had_touch_before = track.contact_started_touching_hand;
+        const BBox previous = track.has_last_seen_box
+            ? track.last_seen_box : track.original_box;
+        const bool at_original = contact_detection_is_at_original(track, detection);
+        const float object_move = center_distance(previous, detection.box);
+
+        claimed_detection_indices->insert(observed_index);
+        if (track.item_id > 0) (*known_item_owner)[track.item_id] = observed_index;
+        append_contact_observation(&track, detection, touching_hand);
+
+        if (track.contact_state == ContactState::CONTACT_MOVING) {
+            std::map<int, InventoryItem>::iterator item =
+                working_inventory_.find(track.item_id);
+            if (item != working_inventory_.end()) update_seen(item->second, detection, 0);
+            continue;
+        }
+
+        if (at_original) {
+            ++track.not_hold_evidence_count;
+            track.hold_evidence_count = 0;
+        } else if (object_move >= FLOW3_CONTACT_OBJECT_MOVE_EPS &&
+                   (had_touch_before || touching_hand)) {
+            // 只要第一次有效 B 已经与手相贴，后续 B 可在手离开后继续沿
+            // observed_track 确认，不把手框方向当作物品方向。
+            ++track.hold_evidence_count;
+            track.not_hold_evidence_count = 0;
+        }
+
+        if (track.not_hold_evidence_count >= FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
+            release_keys.push_back(it->first);
+            continue;
+        }
+        if (track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
+            track.contact_state = ContactState::CONTACT_MOVING;
+            track.hold_and_move = true;
+            track.hold_evidence_count = 0;
+            track.not_hold_evidence_count = 0;
+            track.shelter_or_hold = true;
+            printf("[3.0] item#%d 确认低覆盖率推/拉，进入 CONTACT_MOVING\n",
+                   track.item_id);
+        }
+    }
+
+    for (size_t i = 0; i < release_keys.size(); ++i) {
+        std::map<int, OperationTrack>::iterator it = track_buffer_.find(release_keys[i]);
+        if (it != track_buffer_.end() &&
+            it->second.contact_state == ContactState::CONTACT_CANDIDATE) {
+            release_not_held_(it->second, false);
+        }
+    }
+}
+
+void SessionManager::mark_new_contact_candidates_(
+        const BBox& hand_box, const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices,
+        std::map<int, int>* known_item_owner) {
+    // 已释放的候选在手仍停留附近时不反复创建；手离开该物品后才允许下一次
+    // 接触重新建立候选。
+    for (std::set<int>::iterator released = released_hand_candidate_ids_.begin();
+         released != released_hand_candidate_ids_.end();) {
+        std::map<int, InventoryItem>::const_iterator item =
+            working_inventory_.find(*released);
+        if (item == working_inventory_.end() ||
+            !hand_is_near(hand_box, item->second.base_box.area() > 0.0f
+                                      ? item->second.base_box : item->second.box)) {
+            released = released_hand_candidate_ids_.erase(released);
+        } else {
+            ++released;
+        }
+    }
+
+    for (std::map<int, InventoryItem>::const_iterator it = working_inventory_.begin();
+         it != working_inventory_.end(); ++it) {
+        const InventoryItem& item = it->second;
+        if (item.status == ItemStatus::OCCLUDED ||
+            released_hand_candidate_ids_.count(item.item_id)) {
+            continue;
+        }
+        OperationTrack* existing = find_runtime_for_item_(item.item_id);
+        if (existing && is_active_runtime_track(*existing)) continue;
+
+        const BBox reference = item.base_box.area() > 0.0f
+            ? item.base_box : item.box;
+        if (reference.area() <= 0.0f || hand_cover_ratio(hand_box, reference) >=
+                FLOW3_HAND_PARTIAL_COVER_RATIO ||
+            !hand_is_near(hand_box, reference)) {
+            continue;
+        }
+
+        OperationTrack track;
+        track.item_id = item.item_id;
+        track.cls_id = item.cls_id;
+        track.original_box = reference;
+        track.contact_state = ContactState::CONTACT_CANDIDATE;
+        track.shelter_or_hold = true;
+        track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
+        track_buffer_[item.item_id] = track;
+        OperationTrack& created = track_buffer_[item.item_id];
+
+        int observed_index = -1;
+        std::map<int, int>::const_iterator owner = known_item_owner->find(item.item_id);
+        if (owner != known_item_owner->end() &&
+            owner->second >= 0 &&
+            owner->second < static_cast<int>(detections.size()) &&
+            contact_path_match_cost(created, detections[owner->second]) <
+                std::numeric_limits<float>::infinity()) {
+            observed_index = owner->second;
+        } else {
+            observed_index = unique_contact_detection_for_track(
+                detections, *claimed_detection_indices, created,
+                working_inventory_, track_buffer_);
+        }
+        if (observed_index >= 0) {
+            const bool touching = hand_is_near(hand_box, detections[observed_index].box);
+            if (!claimed_detection_indices->count(observed_index)) {
+                claimed_detection_indices->insert(observed_index);
+            }
+            (*known_item_owner)[item.item_id] = observed_index;
+            append_contact_observation(&created, detections[observed_index], touching);
+        }
+        printf("[3.0] item#%d 进入 CONTACT_CANDIDATE（低覆盖率且手相贴）\n",
+               item.item_id);
     }
 }
 
@@ -1415,7 +1798,7 @@ void SessionManager::reserve_visible_known_detections_(
                 continue;
             }
             const OperationTrack* runtime = find_runtime_for_item_(item->first);
-            if (runtime && runtime->state != OperationTrackState::NORMAL) continue;
+            if (runtime && is_active_runtime_track(*runtime)) continue;
 
             const BBox reference = item->second.base_box.area() > 0.0f
                 ? item->second.base_box : item->second.box;
@@ -1508,6 +1891,7 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     track.has_placed_box = true;
     track.drop_confirmed = true;
     track.state = OperationTrackState::PLACED;
+    track.contact_state = ContactState::NONE;
     confirmed_moved_ids_.insert(track.item_id);
 }
 
@@ -1519,6 +1903,7 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded) {
         released_hand_candidate_ids_.insert(track.item_id);
     }
     track.state = OperationTrackState::NORMAL;
+    track.contact_state = ContactState::NONE;
     track.shelter_or_hold = false;
     track.hold_and_move = false;
     track.hold_evidence_count = 0;
@@ -1530,8 +1915,13 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded) {
     track.reappear_candidate_started_touching_hand = false;
     track.has_first_hand_block_box = false;
     track.has_last_hand_block_box = false;
+    track.has_hand_estimate_anchor_box = false;
     track.move_values.clear();
     track.track.clear();
+    track.observed_move_values.clear();
+    track.observed_track.clear();
+    track.hand_move_values.clear();
+    track.contact_started_touching_hand = false;
     track.hand_track_start_index = -1;
 }
 
@@ -1606,8 +1996,17 @@ void SessionManager::update_existing_hand_tracks_(
             }
             observed_matches_reappear_candidate = observed_index >= 0;
         }
-        const int old_position_index = unique_detection_at_old_position(
+        int old_position_index = unique_detection_at_old_position(
             detections, *claimed_detection_indices, track);
+        // CONTACT_* 转入 HAND_* 后，B 仍可能与最初 A.box 有较大 IoM。
+        // 普通 HAND_* 的“局部重叠即旧位置”规则在这里会把已经推开的 B
+        // 误当成 A 原地未动。因此该分支只接受真正仍贴近 original_box 的
+        // 真实框；其他框交给 observed_track / 稳定快照收尾。
+        if (track.has_hand_estimate_anchor_box && old_position_index >= 0 &&
+            !contact_detection_is_at_original(
+                track, detections[old_position_index])) {
+            old_position_index = -1;
+        }
         const bool old_clean = old_position_is_clean(detections, track, working_inventory_);
 
         if (track.is_suspect_new) {
@@ -1857,7 +2256,8 @@ void SessionManager::scan_or_update_suspects_(
                 continue;
             }
             const OperationTrack* runtime = find_runtime_for_item_(it->first);
-            if (runtime && is_active_existing_hand_track(*runtime)) continue;
+            if (runtime && (is_active_existing_hand_track(*runtime) ||
+                            is_active_contact_track(*runtime))) continue;
             const BBox reference = it->second.base_box.area() > 0.0f
                 ? it->second.base_box : it->second.box;
             if (strict_match(it->second, d) || partial_match(it->second, d) ||
@@ -1927,6 +2327,19 @@ void SessionManager::scan_or_update_suspects_(
             }
         }
 
+        // CONTACT_* 的 B 即使本帧因框跳动没有被 update 认领，也不能直接
+        // 进入 D。先保留为旧物品的未决解释，等待下一帧真实观测。
+        bool belongs_to_contact_track = false;
+        for (std::map<int, OperationTrack>::const_iterator it = track_buffer_.begin();
+             it != track_buffer_.end(); ++it) {
+            if (is_active_contact_track(it->second) &&
+                detection_can_belong_to_active_track(d, it->second)) {
+                belongs_to_contact_track = true;
+                break;
+            }
+        }
+        if (belongs_to_contact_track) continue;
+
         // 如果没有在 update_existing_hand_tracks_ 中找到，是一个真正新的 D。
         OperationTrack track;
         const int key = new_suspect_id_();
@@ -1978,7 +2391,7 @@ void SessionManager::mark_newly_hand_blocked_items_(
          it != working_inventory_.end(); ++it) {
         InventoryItem& item = it->second;
         OperationTrack* existing = find_runtime_for_item_(item.item_id);
-        if (existing && existing->state != OperationTrackState::NORMAL &&
+        if (existing && is_active_runtime_track(*existing) &&
             existing->state != OperationTrackState::PLACED) {
             continue;
         }
@@ -2105,11 +2518,17 @@ void SessionManager::process_effective_hand_frame_(
     std::set<int> claimed;
     std::map<int, int> known_item_owner;
     if (!first_hand_frame) {
+        // 低覆盖率 CONTACT_* 先用物品真实检测框更新；这里不能使用手位移
+        // 推算的 estimated_box。
+        update_existing_contact_tracks_(hand_box, detections, &claimed,
+                                        &known_item_owner);
         update_existing_hand_tracks_(hand_box, detections, delta, &claimed,
                                      &known_item_owner);
     }
     reserve_visible_known_detections_(hand_box, detections, &claimed,
                                       &known_item_owner);
+    mark_new_contact_candidates_(hand_box, detections, &claimed,
+                                 &known_item_owner);
     mark_newly_hand_blocked_items_(hand_box, detections, &claimed,
                                    &known_item_owner);
     scan_or_update_suspects_(hand_box, detections, &claimed, known_item_owner,
@@ -2180,7 +2599,66 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
              it != track_buffer_.end(); ++it) {
             OperationTrack& track = it->second;
             if (track.is_suspect_new != process_suspects ||
-                track.state == OperationTrackState::NORMAL) {
+                !is_active_runtime_track(track)) continue;
+
+            // CONTACT_* 在有手阶段保持 state=NORMAL，因此不能落入旧的
+            // HAND_* 分支。手离开后只按原位置和真实 observed_track 收尾。
+            if (!track.is_suspect_new &&
+                track.contact_state != ContactState::NONE) {
+                int contact_found = unique_contact_original_detection(
+                    detections, claimed, track, working_inventory_);
+                if (contact_found >= 0) {
+                    const Detection& d = detections[contact_found];
+                    claimed.insert(contact_found);
+                    const bool was_moving =
+                        track.contact_state == ContactState::CONTACT_MOVING;
+                    append_contact_observation(&track, d, false);
+                    track.hold_evidence_count = 0;
+                    ++track.not_hold_evidence_count;
+                    if (track.not_hold_evidence_count >=
+                        FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
+                        std::map<int, InventoryItem>::iterator item =
+                            working_inventory_.find(track.item_id);
+                        if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                        release_not_held_(track, false);
+                    } else if (was_moving) {
+                        std::map<int, InventoryItem>::iterator item =
+                            working_inventory_.find(track.item_id);
+                        if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                    }
+                    continue;
+                }
+
+                const int contact_found_on_path = unique_contact_detection_for_track(
+                    detections, claimed, track, working_inventory_, track_buffer_);
+                if (contact_found_on_path >= 0) {
+                    const Detection& d = detections[contact_found_on_path];
+                    claimed.insert(contact_found_on_path);
+                    const bool was_moving =
+                        track.contact_state == ContactState::CONTACT_MOVING;
+                    if (!was_moving) {
+                        const bool candidate_ready = update_reappear_candidate(
+                            &track, d, false);
+                        if (candidate_ready) {
+                            track.contact_state = ContactState::CONTACT_MOVING;
+                            track.hold_and_move = true;
+                            track.hold_evidence_count = 0;
+                            track.not_hold_evidence_count = 0;
+                        }
+                    }
+                    append_contact_observation(&track, d, false);
+                    if (track.item_id > 0) {
+                        std::map<int, InventoryItem>::iterator item =
+                            working_inventory_.find(track.item_id);
+                        if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                    }
+                    continue;
+                }
+                if (has_contact_path_candidate(detections, claimed, track,
+                                               working_inventory_)) {
+                    track.contact_path_ambiguous = true;
+                }
+                // 没有原位置或唯一轨迹 B 时保持未决；不能仅因一帧缺失 OUT。
                 continue;
             }
             BBox reference = track.has_placed_box ? track.placed_box : estimated_box(track);
@@ -2197,6 +2675,13 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 found = unique_detection_for_box(detections, claimed, track.cls_id,
                                                   track.original_box, true, false);
                 found_at_original_position = found >= 0;
+                // 同上：由 CONTACT_* 转来的物品已拥有真实 B 路径。B 与
+                // 原框局部重叠并不等于它仍在原位，必须再检查中心位移。
+                if (track.has_hand_estimate_anchor_box && found >= 0 &&
+                    !contact_detection_is_at_original(track, detections[found])) {
+                    found = -1;
+                    found_at_original_position = false;
+                }
             }
             // 已在有手阶段看到过 B 时，真实 B 候选比“旧框 + 手位移”的估计
             // 更可信，但它同样需要连续自匹配，不能在本帧直接确认整理。
@@ -2279,9 +2764,12 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 continue;
             }
             if (!track.is_suspect_new) {
-                if (found_at_original_position ||
-                    partial_match_box(track.cls_id, track.original_box, d.cls_id, d.box,
-                                      FLOW3_TRACK_PARTIAL_IOM)) {
+                const bool still_at_original = found_at_original_position ||
+                    (!track.has_hand_estimate_anchor_box &&
+                     partial_match_box(track.cls_id, track.original_box,
+                                       d.cls_id, d.box,
+                                       FLOW3_TRACK_PARTIAL_IOM));
+                if (still_at_original) {
                     std::map<int, InventoryItem>::iterator item =
                         working_inventory_.find(track.item_id);
                     if (item != working_inventory_.end()) update_seen(item->second, d, 0);
@@ -2374,6 +2862,9 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         else if (runtime && runtime->is_suspect_new && runtime->has_last_seen_box) {
             references[it->first] = runtime->last_seen_box;
         }
+        else if (runtime && !runtime->observed_track.empty()) {
+            references[it->first] = runtime->observed_track.back();
+        }
         else if (runtime && !runtime->is_suspect_new &&
                  reappear_candidate_is_confirmed(*runtime)) {
             references[it->first] = runtime->reappear_candidate_box;
@@ -2381,6 +2872,7 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         else if (runtime && !runtime->track.empty()) references[it->first] = runtime->track.back();
         if (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first) ||
             (runtime && (runtime->hold_and_move ||
+                         runtime->contact_state != ContactState::NONE ||
                          (!runtime->move_values.empty() &&
                           runtime->state != OperationTrackState::NORMAL)))) {
             track_priority_ids.insert(it->first);
@@ -2428,8 +2920,23 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         std::map<int, InventoryItem>::const_iterator original =
             operation_start_inventory_.find(it->first);
         if (!runtime || original == operation_start_inventory_.end() ||
-            runtime->state == OperationTrackState::NORMAL ||
-            runtime->move_values.empty()) {
+            !is_active_runtime_track(*runtime)) {
+            continue;
+        }
+        // CONTACT_CANDIDATE 必须先凑够两次有效 B 才能确认整理；仅有一条
+        // observed_move_values 不能绕过 CONTACT_MOVING 门槛。普通 HAND_*
+        // 仍保留原有的 move_values/hold_and_move 收尾规则。
+        const bool has_contact_confirmation =
+            runtime->contact_state == ContactState::CONTACT_MOVING &&
+            runtime->hold_and_move;
+        const bool has_hand_confirmation = runtime->contact_state == ContactState::NONE &&
+            (runtime->hold_and_move || !runtime->move_values.empty());
+        if (!has_contact_confirmation && !has_hand_confirmation &&
+            runtime->observed_move_values.empty()) {
+            continue;
+        }
+        if (runtime->contact_state != ContactState::NONE &&
+            !has_contact_confirmation) {
             continue;
         }
         const bool matches_endpoint = track_match_box(
@@ -2509,9 +3016,15 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         // 上完成过有效移动；即使两次正向证据尚未凑满，也要按文档在收尾
         // 阶段把“整条候选路径都找不到 C”作为出库证据。没有任何有效移动
         // 的普通漏检仍然保留，不会凭空 OUT。
+        const bool contact_out_evidence = runtime &&
+            runtime->contact_state == ContactState::CONTACT_MOVING &&
+            !runtime->contact_path_ambiguous &&
+            (runtime->hold_and_move || !runtime->observed_move_values.empty());
+        const bool hand_out_evidence = runtime && !is_active_contact_track(*runtime) &&
+            runtime->state != OperationTrackState::NORMAL &&
+            (runtime->hold_and_move || !runtime->move_values.empty());
         const bool strong_out_evidence = pending_out_ids_.count(it->first) ||
-            (runtime && runtime->state != OperationTrackState::NORMAL &&
-             (runtime->hold_and_move || !runtime->move_values.empty()));
+            contact_out_evidence || hand_out_evidence;
         if (strong_out_evidence) {
             mark_pending_out_(it->first);
         } else {
@@ -2639,9 +3152,19 @@ FrameProcessResult SessionManager::process_frame(
             begin_working_operation_(hand, food_detections);
             return output;
         }
-        // 文档定义：微小移动帧整体不存在，不能更新 old_hand、D、轨迹或计数。
-        if (has_old_hand_box_ &&
-            center_distance(old_hand_box_, hand) < HAND_MICRO_MOVE_SKIP_EPS) {
+        // 手框不动时只有在没有任何未决 HAND_* / CONTACT_* 轨迹的情况下
+        // 才能整帧跳过。手指可能在手腕不动时推动物品，所以活动轨迹必须
+        // 继续逐帧检查真实物品检测框。
+        bool has_active_runtime = false;
+        for (std::map<int, OperationTrack>::const_iterator it =
+                 track_buffer_.begin(); it != track_buffer_.end(); ++it) {
+            if (is_active_runtime_track(it->second)) {
+                has_active_runtime = true;
+                break;
+            }
+        }
+        if (!has_active_runtime && has_old_hand_box_ &&
+            hand_boxes_effectively_same(old_hand_box_, hand)) {
             return output;
         }
         process_effective_hand_frame_(hand, food_detections, false);

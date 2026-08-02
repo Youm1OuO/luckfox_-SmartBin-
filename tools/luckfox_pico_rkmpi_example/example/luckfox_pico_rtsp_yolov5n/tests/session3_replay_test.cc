@@ -740,6 +740,137 @@ void test_moved_front_item_occludes_then_reveals() {
     assert(has_event(second, fridge::EventKind::REVEALED, 2));
 }
 
+// 手指框很小、手腕完全不动时，物品仍应进入 CONTACT_*，而不是被登记成 D。
+void test_low_coverage_contact_move_keeps_identity() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    const fridge::BBox finger(90, 145, 105, 160);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, finger), &frame);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 120, 100, 220, 200)),
+               std::vector<fridge::BBox>(1, finger), &frame);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 140, 100, 240, 200)),
+               std::vector<fridge::BBox>(1, finger), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    assert(tracks.find(1) != tracks.end());
+    assert(tracks.find(1)->second.contact_state ==
+           fridge::ContactState::CONTACT_MOVING);
+    assert(tracks.find(1)->second.hold_and_move);
+    assert(tracks.find(1)->second.observed_track.size() >= 3);
+
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 140, 100, 240, 200)), &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
+// 低覆盖率候选一直没有可靠 B 时，手离开后的缺失不能单凭一帧直接 OUT。
+void test_low_coverage_contact_without_endpoint_stays_pending() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    const fridge::BBox finger(90, 145, 105, 160);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, finger), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, finger), &frame);
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(), &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+}
+
+// CONTACT_CANDIDATE 在原位置连续重新出现时应释放，不能因为手框接近就重复创建 D。
+void test_low_coverage_contact_candidate_releases_at_original() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    const std::vector<fridge::Detection> stable(1, det(0, 100, 100, 200, 200));
+    initial_snapshot(&session, stable, &frame);
+
+    const fridge::BBox finger(90, 145, 105, 160);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, finger), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, finger), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, finger), &frame);
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    assert(tracks.find(1) == tracks.end() ||
+           tracks.find(1)->second.contact_state == fridge::ContactState::NONE);
+
+    fridge::SettlementResult result = settle_after_hand(&session, stable, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
+// 先用手指推开、随后改为大面积握住时，HAND_* 的估计原点必须是最后一次
+// 真实 B，而不是最初 A.box；否则小幅移动仍与旧框局部重叠时会被错误释放。
+void test_contact_to_hand_transition_keeps_observed_anchor() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    const fridge::BBox finger(90, 145, 105, 160);
+    const fridge::BBox covering_hand(140, 80, 240, 220);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, finger), &frame);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 130, 100, 230, 200)),
+               std::vector<fridge::BBox>(1, finger), &frame);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 130, 100, 230, 200)),
+               std::vector<fridge::BBox>(1, covering_hand), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    assert(tracks.find(1) != tracks.end());
+    assert(tracks.find(1)->second.contact_state == fridge::ContactState::NONE);
+    assert(tracks.find(1)->second.state ==
+           fridge::OperationTrackState::HAND_FULL_BLOCKED);
+    assert(tracks.find(1)->second.has_hand_estimate_anchor_box);
+    assert(tracks.find(1)->second.hand_estimate_anchor_box.x1 == 130.0f);
+    assert(tracks.find(1)->second.observed_track.size() >= 2);
+
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 130, 100, 230, 200)), &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
 }  // namespace
 
 int main() {
@@ -765,5 +896,9 @@ int main() {
     test_adjacent_same_class_new_item_gets_its_own_d_chain();
     test_unbound_stable_box_never_auto_in();
     test_moved_front_item_occludes_then_reveals();
+    test_low_coverage_contact_move_keeps_identity();
+    test_low_coverage_contact_without_endpoint_stays_pending();
+    test_low_coverage_contact_candidate_releases_at_original();
+    test_contact_to_hand_transition_keeps_observed_anchor();
     return 0;
 }

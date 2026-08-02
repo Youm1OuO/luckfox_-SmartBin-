@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r7";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r8";
 
 // =========================================================================
 //  类别 ID 配置
@@ -269,8 +269,8 @@ constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
 // HAND_FULL。e2/e1 只使用 A 的完整可靠框，不能使用被遮挡后缩小的检测框。
 // =========================================================================
 constexpr float TRACK_HAND_MOVE_EPS          = 12.0f;
-// 连续两帧都有手但手框几乎没有变化时，整帧跳过（不更新 old_hand、轨迹和计数）。
-// 调大可减少重复计算但会漏掉小幅有效动作；调小更敏感但计算量和抖动增加。
+// 没有任何未决 HAND_* / CONTACT_* 轨迹时，连续两帧手框几乎没有变化才跳过。
+// 只要有活动轨迹，即使手腕不动也必须继续检查物品框，避免漏掉手指推动。
 constexpr float HAND_MICRO_MOVE_SKIP_EPS     = 6.0f;
 // 疑似 D 连续有效观察次数达到该值后，认为身份稳定，可在结算时入库。
 constexpr int   NEW_ITEM_CONFIRM_FRAMES      = 2;
@@ -284,6 +284,13 @@ constexpr float FLOW3_HAND_PARTIAL_COVER_RATIO = 0.30f;
 constexpr float FLOW3_HAND_FULL_COVER_RATIO  = 0.88f;
 // 仅供“D 是否和手相贴/相交”和放下判断使用，不参与已有库存物品的 HAND 状态。
 constexpr float FLOW3_HAND_DETECTION_OVERLAP_AREA = 300.0f;
+// CONTACT_* 的实际物品框关联。中心容差比普通严格匹配宽，但仍要求类别和
+// 宽高比例接近；它只用于低覆盖率推/拉，不用于普通库存匹配。
+constexpr float FLOW3_CONTACT_PATH_CENTER_NORM = 1.10f;
+constexpr float FLOW3_CONTACT_WIDTH_RATIO = 0.35f;
+constexpr float FLOW3_CONTACT_HEIGHT_RATIO = 0.35f;
+// 物品相对上一真实观测框至少移动多少，才算一条有效推/拉证据。
+constexpr float FLOW3_CONTACT_OBJECT_MOVE_EPS = 12.0f;
 // D 初次仅有局部框、手离开后重新出现完整框时的专用路径匹配。
 // B 覆盖路径中预测局部框达到该比例，或中心偏移足够小，才允许局部→完整重现。
 constexpr float FLOW3_D_REAPPEAR_MIN_PARTIAL_COVER = 0.35f;
