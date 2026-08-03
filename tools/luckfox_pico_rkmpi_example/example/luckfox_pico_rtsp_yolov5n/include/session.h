@@ -158,13 +158,9 @@ struct OperationTrack {
     int not_hold_evidence_count = 0;
     int self_match_count = 0;
     int reappear_candidate_match_count = 0;
-    // 新建的旧库存 CONTACT_* / HAND_* 轨迹保护期。保护期内仍可把
-    // 同类 B 记录为 tentative_b，但不能将 B 写入本帧排他认领表。
-    int claim_grace_remaining = 0;
-    BBox tentative_b_box;
-    bool has_tentative_b_box = false;
-    int tentative_b_match_count = 0;
-    bool tentative_b_started_touching_hand = false;
+    // `reappear_candidate` 的连续性只按相邻直接帧累计。同一张直接帧可能
+    // 先由局部轨迹看到、再由全局 FrameOwnership 确认，不能重复加一次。
+    int reappear_candidate_last_direct_frame = -1;
     int drop_evidence_count = 0;
     // 只用于已有 C：上一有效有手帧没有可靠看到 C 时，下一次同类 B 即使
     // 正好落在预计轨迹上，也先走重新出现候选的二次确认。
@@ -190,7 +186,7 @@ struct OperationTrack {
     bool contact_started_touching_hand = false;
     // 当前帧存在可解释但不唯一的 CONTACT B；此时手离开后不能直接 OUT。
     bool contact_path_ambiguous = false;
-    // 同类 HAND_* C 对同一个 B 存在多个成熟解释时，稳定结算也不能按
+    // 同类 HAND_* C 对同一个 B 存在多个解释时，稳定结算也不能按
     // item_id 顺序强行绑定；直到后续帧给出唯一解释前保持未决。
     bool b_claim_ambiguous = false;
 };
@@ -256,8 +252,7 @@ private:
     void mark_new_contact_candidates_(
         const BBox& hand_box, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
-        std::map<int, int>* known_item_owner,
-        std::set<int>* new_existing_track_ids);
+        std::map<int, int>* known_item_owner);
     void update_existing_hand_tracks_(const BBox& hand_box,
                                       const std::vector<Detection>& detections,
                                       const MoveValue& delta,
@@ -271,8 +266,7 @@ private:
     void mark_newly_hand_blocked_items_(const BBox& hand_box,
                                         const std::vector<Detection>& detections,
                                         std::set<int>* claimed_detection_indices,
-                                        std::map<int, int>* known_item_owner,
-                                        std::set<int>* new_existing_track_ids);
+                                        std::map<int, int>* known_item_owner);
     // 在逐帧 D 预扫描前，为本帧仍处于普通可见状态的旧库存保留其唯一的
     // 严格匹配框。这样同类新 D 即使贴着旧物品出现，也不会被旧物品的
     // “局部可能匹配”吞掉。
@@ -284,13 +278,15 @@ private:
     void apply_suspect_cover_evidence_(const BBox& hand_box,
                                        const std::vector<Detection>& detections,
                                        bool hand_moved);
-    void advance_claim_grace_(const std::set<int>& new_existing_track_ids);
 
     // 每张有效直接帧只建立一份 C/B 归属。局部 HAND/CONTACT 状态机可以
     // 继续积累路径证据，但 D 准入和最终提交只能读取这里的结果。
     void begin_direct_frame_(const std::vector<Detection>& detections);
     void reset_frame_ownership_(size_t detection_count);
     void build_frame_ownership_(const std::vector<Detection>& detections);
+    void synchronize_frame_ownership_candidates_(
+        const std::vector<Detection>& detections, const BBox* hand_box);
+    void log_frame_ownership_() const;
     void assign_frame_owner_(int item_id, int detection_index,
                              IdentityResolution resolution);
     void detect_baseline_collision_groups_();

@@ -21,6 +21,11 @@ SnapshotBuffer，不做投票、检测框平均或结算阶段的第二套匹配
 候选关系不等于 owner，C/B 任一侧有同等合理解释时保持 UNRESOLVED，不能按 item_id、
 map 顺序或检测顺序强行选择。
 
+唯一的路径 C->B 在当前直接帧立刻写入 FrameOwnership，并阻止 D 使用同一个 B；
+`reappear_candidate` 的连续自匹配只确认后续的 AT_NEW_POSITION/MOVED，不能作为
+延迟当前帧归属的“成熟期”。最终 AT_NEW_POSITION 还要有有效手部/CONTACT 物体移动或
+已确认放下证据。B 断帧、跳到不连续路径或变成多 C 歧义时，候选计数清零。
+
 旧 C 只有 AT_ORIGIN、AT_NEW_POSITION、OCCLUDED_CONFIRMED、OUT_CONFIRMED 四种已
 解决结论。PLACED 只是放下候选；必须在无手直接帧独占同一个 B 后才是
 AT_NEW_POSITION。若一个同类 B 仍可能属于 UNRESOLVED 的旧 C，则它进入 claim，不能
@@ -118,23 +123,12 @@ FLOW3_CONTACT_OBJECT_MOVE_EPS（当前 12 像素）
     调大：更能过滤 YOLO 抖动和手指微动，但小幅整理可能无法确认。
     调小：小幅推拉更容易确认，但误移动和原位判断抖动风险上升。
 
-FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES（当前 2）
-    新建旧库存 CONTACT_* / HAND_* 轨迹的 B 认领保护期长度，单位是“后续已实际
-    处理的有效帧”。新建帧本身记为 t0，不递减；当前值 2 的时间线是 t0 建立、t1
-    第一张后续帧、t2 第二张后续帧，t3 才允许把连续且唯一的 tentative B 升级为
-    排他候选。保护期内不禁止本地匹配，也不禁止保存 observed_track/轨迹，只禁止
-    抢占全局 B；无手收尾帧同样会推进计数，微小手框被跳过的帧不会推进。
-    调大：同类物品多、手框跳动大时更保守，能减少路过物品抢 B 和重复 D，但确认
-    整理/取出会变慢，并可能让短操作在无手直接帧中仍保持未决。
-    调小：响应更快，但新建 CONTACT/HAND 更容易在证据不足时抢占同类 B；设为 0
-    等于关闭保护期，不建议在同类物品较多的画面使用。
-
 CONTACT_* 的固定规则（不是单独超参数）：接触状态保存在 OperationTrack.contact_state，
 不写入 InventoryItem。CONTACT_* 只保存物品真实 observed_track/observed_move_values；
 手部 hand_track 和 hand_move_values 仅作辅助，不用手腕位移计算物品终点。首次有效 B
 需要与手相贴，连续两次真实移动证据才进入 CONTACT_MOVING；没有可靠 B 时两个证据计数
-都暂停；新建 CONTACT_* 的两帧保护期内仍累计本地证据，但不排他认领 B。手离开后先查原位置，再查 observed_track；两者都没有时先保持未决，连续无手直接
-帧持续缺失且没有遮挡解释后才允许 OUT。若接触候选后来达到 e2/e1 转入 HAND_*，
+都暂停，但唯一 B 仍会立即参与当前帧归属。手离开后先查原位置，再查 observed_track；
+两者都没有时先保持未决，连续无手直接帧持续缺失且没有遮挡解释后才允许 OUT。若接触候选后来达到 e2/e1 转入 HAND_*，
 会把接触阶段最后一次真实 B 保存为 HAND_* 的估计锚点，但仍保留 original_box 作为
 最终原位置比较基准，避免“已推开但仍与旧框局部重叠”被释放为未移动。
 
@@ -220,9 +214,11 @@ FLOW3_DROP_FALL_BEHIND_RATIO
     调小：更严格，放下确认更慢，更多依赖无手直接帧的重新出现确认。
 
 FLOW3_REAPPEAR_CANDIDATE_CONFIRM_FRAMES（当前 2）
-    `reappear_candidate` 首次出现后，需要连续多少次能匹配到同一个 B，才可把 B
-    作为旧 C 的已确认重新出现位置。若 B 是在无手第一帧才首次可见，也同样使用
-    这个门槛；随后仍须通过当前无手直接帧的 owner 与提交门。
+    `reappear_candidate` 首次唯一出现时，当帧已经归旧 C 使用；此参数规定后续还要
+    连续多少张直接帧匹配同一条 B 链，才可把 C 设为 AT_NEW_POSITION 并最终产生 MOVED。
+    无手首帧首次可见也相同：第一张只形成暂归属，下一张连续无手直接帧才可能确认。
+    连续帧以外还必须已有有效移动/放下证据；B 消失、跳到另一条不连续路径或变成多个
+    C 都可解释时计数清零。
     调大：对一帧误检、同类串身份更稳，但快速操作后确认整理更慢。
     调小：更快恢复 C 的身份，但单帧 YOLO 跳动更容易造成错误整理。
 
