@@ -2,10 +2,14 @@
 // 不依赖摄像头或 RKNN，只喂入已经得到的 Detection / hand box。
 #include <assert.h>
 
+#include <map>
+#include <set>
 #include <vector>
 
 #include "fridge_config.h"
+#define private public
 #include "session.h"
+#undef private
 
 // inventory.cc 的调试打印会引用该符号；回放测试不链接完整 postprocess。
 char* coco_cls_to_name(int) {
@@ -1334,6 +1338,63 @@ void test_path_interruption_keeps_old_c_identity_not_in() {
     assert(!has_event(result, fridge::EventKind::IN, 2));
 }
 
+// 细节10：当前帧的 C 路径可能因为检测框跳动而暂时断开，但只要 B 仍
+// 连续匹配此前的 claim，且 claim 关联的旧 C 还未解决，手离开后的
+// POST_HAND_REVEAL_D 就必须被阻止。这里直接构造已经由前一直接帧留下的
+// claim，隔离验证 D 门不能只看本帧 possible_old_owners。
+void test_historical_claim_blocks_post_hand_reveal_after_current_path_gap() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    // 手的轨迹覆盖右侧 B，但旧 C 的原位置和任何当前活动路径都不匹配它。
+    // 因此若不读取历史 claim，POST_HAND_REVEAL_D 会在下一张无手帧被放行。
+    const fridge::BBox hand(300, 100, 400, 200);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, hand), &frame);
+    assert(session.operation_tracks().empty());
+
+    fridge::UnresolvedSameClassClaim claim;
+    claim.cls_id = 0;
+    claim.first_box = fridge::BBox(300, 100, 400, 200);
+    claim.last_box = claim.first_box;
+    claim.has_last_box = true;
+    claim.direct_self_match_count = 1;
+    claim.has_hand_source = true;
+    claim.last_seen_direct_frame = session.direct_frame_sequence_;
+    claim.possible_old_item_ids.insert(1);
+    session.unresolved_same_class_claims_.push_back(claim);
+
+    const std::vector<fridge::Detection> revealed(
+        1, det(0, 300, 100, 400, 200));
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult blocked = session.process_frame(
+        revealed, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(blocked.no_hand_frame_processed);
+    assert(!blocked.settlement.committed);
+    assert(session.operation_tracks().empty());
+    assert(session.unresolved_same_class_claims_.size() == 1);
+    assert(session.inventory().size() == 1);
+    assert(!has_event(blocked.settlement, fridge::EventKind::IN, 2));
+
+    // 当旧 C 在另一检测框上已经独立解决时，同一位置的 claim 才可解除；
+    // 当前 B 从这一帧开始成为 D 的首帧，而不是复用 claim 期间的计数。
+    std::vector<fridge::Detection> resolved_and_new;
+    resolved_and_new.push_back(det(0, 100, 100, 200, 200));
+    resolved_and_new.push_back(revealed[0]);
+    session.reset_frame_ownership_(resolved_and_new.size());
+    session.frame_ownership_.old_item_to_detection[1] = 0;
+    session.frame_ownership_.detection_to_old_item[0] = 1;
+    session.old_item_resolution_[1] = fridge::IdentityResolution::AT_ORIGIN;
+    assert(session.can_start_new_d_for_detection_(1, resolved_and_new, false, true));
+    assert(session.unresolved_same_class_claims_.empty());
+}
+
 // 同类 B 在旧 C 的路径候选期间不能提前计为 D。旧 C 后来重新得到自己的
 // 原位 B 后，才允许该同类 B 从当前帧开始走 D 的确认链路。
 void test_same_class_d_starts_after_old_c_resolves() {
@@ -1497,6 +1558,7 @@ int main() {
     test_out_requires_two_direct_missing_frames();
     test_no_hand_occlusion_uses_cover_union();
     test_path_interruption_keeps_old_c_identity_not_in();
+    test_historical_claim_blocks_post_hand_reveal_after_current_path_gap();
     test_same_class_d_starts_after_old_c_resolves();
     test_overlapping_same_class_baseline_blocks_same_class_in();
     test_separate_same_class_baseline_commits_with_distinct_owners();

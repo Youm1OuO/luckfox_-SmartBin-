@@ -2031,6 +2031,52 @@ bool SessionManager::can_start_new_d_for_detection_(
                detections[detection_index].cls_id);
         return false;
     }
+
+    // 当前帧的几何候选可能因检测框跳动而短暂为空，但若 B 仍连续匹配
+    // 之前留下的 claim，claim 关联的旧 C 还没有独立结论，就不能把同一
+    // 条路径改写成 D。begin_direct_frame_ 已经负责更新 claim 的位置和
+    // 连续计数；这里仅补充本帧的手操作来源并作为 D 门的持久守卫。
+    const Detection& detection = detections[detection_index];
+    std::set<int> claim_blocking_old_item_ids;
+    for (std::vector<UnresolvedSameClassClaim>::iterator claim =
+             unresolved_same_class_claims_.begin();
+         claim != unresolved_same_class_claims_.end(); ++claim) {
+        if (claim->cls_id != detection.cls_id || !claim->has_last_box ||
+            !track_match_box(claim->cls_id, claim->last_box,
+                             detection.cls_id, detection.box)) {
+            continue;
+        }
+
+        bool claim_has_unresolved_old_item = false;
+        for (std::set<int>::const_iterator item_id =
+                 claim->possible_old_item_ids.begin();
+             item_id != claim->possible_old_item_ids.end(); ++item_id) {
+            if (!old_item_is_resolved_(*item_id)) {
+                claim_blocking_old_item_ids.insert(*item_id);
+                claim_has_unresolved_old_item = true;
+            }
+        }
+        if (claim_has_unresolved_old_item) {
+            claim->has_hand_source = claim->has_hand_source || has_hand_source;
+            claim->first_seen_in_post_hand_window =
+                claim->first_seen_in_post_hand_window ||
+                first_seen_in_post_hand_window;
+        }
+    }
+    if (!claim_blocking_old_item_ids.empty()) {
+        printf("[D-GATE] frame=%d B=%d allow=0 blocked_by=claim:",
+               direct_frame_sequence_, detection_index);
+        for (std::set<int>::const_iterator item_id =
+                 claim_blocking_old_item_ids.begin();
+             item_id != claim_blocking_old_item_ids.end(); ++item_id) {
+            printf("%sC#%d", item_id == claim_blocking_old_item_ids.begin()
+                   ? "" : ",", *item_id);
+        }
+        printf("\n");
+        printf("[3.0] B cls=%d 延续未决 claim，旧 C 未解决，不建立 D\n",
+               detection.cls_id);
+        return false;
+    }
     if (!has_hand_source && !first_seen_in_post_hand_window) {
         log_gate(false, "no-hand-source");
         return false;
@@ -2055,15 +2101,25 @@ bool SessionManager::can_start_new_d_for_detection_(
         }
     }
 
-    // claim 守卫已经解除时，当前帧才是 D 的第 1 张确认帧。删除同一 B 的
-    // 旧声明，防止它在 D 已开始后继续无意义地阻挡提交。
+    // 走到这里的匹配 claim 不再含 UNRESOLVED 旧 C，且当前 B 已通过
+    // 来源和同类歧义检查。只有此时才能解除 claim，并把当前帧作为 D 的
+    // 第 1 张确认帧；claim 期间的帧数绝不能借给 D。
     for (std::vector<UnresolvedSameClassClaim>::iterator claim =
              unresolved_same_class_claims_.begin();
          claim != unresolved_same_class_claims_.end();) {
-        if (claim->cls_id == detections[detection_index].cls_id && claim->has_last_box &&
+        bool all_possible_old_items_resolved = true;
+        for (std::set<int>::const_iterator item_id =
+                 claim->possible_old_item_ids.begin();
+             item_id != claim->possible_old_item_ids.end(); ++item_id) {
+            if (!old_item_is_resolved_(*item_id)) {
+                all_possible_old_items_resolved = false;
+                break;
+            }
+        }
+        if (all_possible_old_items_resolved &&
+            claim->cls_id == detection.cls_id && claim->has_last_box &&
             track_match_box(claim->cls_id, claim->last_box,
-                            detections[detection_index].cls_id,
-                            detections[detection_index].box)) {
+                            detection.cls_id, detection.box)) {
             claim = unresolved_same_class_claims_.erase(claim);
         } else {
             ++claim;
