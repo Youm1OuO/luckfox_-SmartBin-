@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r8";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r9";
 
 // =========================================================================
 //  类别 ID 配置
@@ -276,6 +276,9 @@ constexpr float HAND_MICRO_MOVE_SKIP_EPS     = 6.0f;
 constexpr int   NEW_ITEM_CONFIRM_FRAMES      = 2;
 constexpr int   FLOW3_HOLD_EVIDENCE_REQUIRED = 2;
 constexpr int   FLOW3_NOT_HOLD_EVIDENCE_REQUIRED = 2;
+// 新建的旧库存 CONTACT_* / HAND_* 轨迹在后续两张有效帧内只能做本地
+// 匹配和累计证据，不能把同类 B 作为排他归属；两张后续帧结束后才成熟。
+constexpr int   FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES = 2;
 constexpr float FLOW3_HAND_ATTACH_DISTANCE   = 28.0f;
 constexpr float FLOW3_HAND_NEAR_MAX_INTERSECTION_AREA = 900.0f;
 // e2：手至少覆盖完整物品面积的 30%，才把已有库存物品加入 HAND_*。

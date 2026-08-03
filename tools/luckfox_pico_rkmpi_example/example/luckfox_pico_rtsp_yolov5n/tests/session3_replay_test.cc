@@ -575,6 +575,138 @@ void test_fast_same_class_b_becomes_c_candidate_not_d() {
     assert(!has_event(result, fridge::EventKind::IN, 2));
 }
 
+// 细节7：新建 C 在 t0/t1/t2 的保护期内仍会累计自己的 tentative B，
+// 但不能将 B 排他认领、更不能把它建成同类 D；t3 成熟后才允许升级。
+void test_new_track_claim_grace_defers_same_class_d() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    const fridge::BBox hand0(80, 80, 220, 220);
+    const fridge::BBox hand1(200, 80, 340, 220);
+    const std::vector<fridge::Detection> moved(1, det(0, 220, 100, 320, 200));
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, hand0), &frame);  // t0
+    send_frame(&session, moved, std::vector<fridge::BBox>(1, hand1), &frame);  // t1
+    const fridge::OperationTrack& after_t1 = session.operation_tracks().find(1)->second;
+    assert(after_t1.claim_grace_remaining == 1);
+    assert(after_t1.has_tentative_b_box);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    send_frame(&session, moved, std::vector<fridge::BBox>(1, hand1), &frame);  // t2
+    const fridge::OperationTrack& after_t2 = session.operation_tracks().find(1)->second;
+    assert(after_t2.claim_grace_remaining == 0);
+    assert(after_t2.tentative_b_match_count >= 2);
+
+    send_frame(&session, moved, std::vector<fridge::BBox>(1, hand1), &frame);  // t3
+    const fridge::OperationTrack& after_t3 = session.operation_tracks().find(1)->second;
+    assert(after_t3.hold_and_move);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    fridge::SettlementResult result = settle_after_hand(&session, moved, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
+// 两个成熟同类 C 都能解释同一个 B 时，B 必须保持歧义；不能由 map
+// 遍历顺序让第一个 C 抢走，也不能退化成新 D。
+void test_mature_same_class_tracks_keep_shared_b_ambiguous() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 0, 220, 100, 320, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 220, 100, 320, 200));
+    initial_snapshot(&session, stable, &frame);
+
+    const fridge::BBox hand(80, 80, 340, 220);
+    const std::vector<fridge::Detection> shared(1, det(0, 160, 100, 260, 200));
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, hand), &frame);  // t0
+    send_frame(&session, shared, std::vector<fridge::BBox>(1, hand), &frame);  // t1
+    send_frame(&session, shared, std::vector<fridge::BBox>(1, hand), &frame);  // t2
+    send_frame(&session, shared, std::vector<fridge::BBox>(1, hand), &frame);  // t3
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    assert(tracks.find(1) != tracks.end());
+    assert(tracks.find(2) != tracks.end());
+    assert(tracks.find(1)->second.claim_grace_remaining == 0);
+    assert(tracks.find(2)->second.claim_grace_remaining == 0);
+    assert(!tracks.find(1)->second.hold_and_move);
+    assert(!tracks.find(2)->second.hold_and_move);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    fridge::SettlementResult result = settle_after_hand(&session, shared, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    assert(!has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::MOVED, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+    assert(!has_event(result, fridge::EventKind::IN, 3));
+}
+
+// 手离开后的无手帧也要推进保护期。第一张无手 B 只能成为 fresh C 的
+// tentative，不能被 POST_HAND_REVEAL_D 抢走；成熟后才恢复旧 C 的身份。
+void test_no_hand_frame_respects_new_track_claim_grace() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_snapshot(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 340, 220)), &frame);
+
+    const std::vector<fridge::Detection> moved(1, det(0, 220, 100, 320, 200));
+    const int first_no_hand = frame++;
+    session.process_frame(moved, std::vector<fridge::BBox>(), first_no_hand,
+                          first_no_hand);
+    const std::map<int, fridge::OperationTrack>& after_first =
+        session.operation_tracks();
+    assert(after_first.find(1) != after_first.end());
+    assert(after_first.find(1)->second.claim_grace_remaining == 0);
+    assert(after_first.find(1)->second.has_tentative_b_box);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = after_first.begin();
+         it != after_first.end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    fridge::SettlementResult result = settle_after_hand(&session, moved, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
 // 放下不能因单帧“B 看起来掉队”就确认：需要连续两帧都满足
 // 手继续移动、B 基本停住、且 B 已与手脱离/更接近完整框的组合证据。
 void test_drop_requires_continuous_evidence() {
@@ -587,11 +719,14 @@ void test_drop_requires_continuous_evidence() {
     initial_snapshot(&session,
         std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
 
-    // 前两次跟手观察建立 hold_and_move。
+    // 新建 HAND_* 需先完整经过两张后续有效帧；随后成熟帧才可把连续
+    // 本地 B 升级为正式候选。
     send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
                std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
     send_frame(&session, std::vector<fridge::Detection>(1, det(0, 220, 100, 320, 200)),
                std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 300, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(320, 80, 420, 220)), &frame);
     send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
                std::vector<fridge::BBox>(1, fridge::BBox(320, 80, 420, 220)), &frame);
     assert(session.operation_tracks().find(1)->second.hold_and_move);
@@ -761,13 +896,20 @@ void test_low_coverage_contact_move_keeps_identity() {
     send_frame(&session,
                std::vector<fridge::Detection>(1, det(0, 140, 100, 240, 200)),
                std::vector<fridge::BBox>(1, finger), &frame);
+    // t0/t1/t2 是新建 CONTACT_* 的保护期；t3 才可以把连续 tentative B
+    // 升级为正式 CONTACT_MOVING。
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 160, 100, 260, 200)),
+               std::vector<fridge::BBox>(1, finger), &frame);
 
     const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
     assert(tracks.find(1) != tracks.end());
     assert(tracks.find(1)->second.contact_state ==
            fridge::ContactState::CONTACT_MOVING);
     assert(tracks.find(1)->second.hold_and_move);
-    assert(tracks.find(1)->second.observed_track.size() >= 3);
+    // 保护期内的 B 是 tentative，不会写入正式 observed_track；转 HAND
+    // 时仍会以最新 tentative B 作为估计锚点。
+    assert(tracks.find(1)->second.observed_track.size() >= 1);
 
     fridge::SettlementResult result = settle_after_hand(
         &session, std::vector<fridge::Detection>(1, det(0, 140, 100, 240, 200)), &frame);
@@ -860,7 +1002,9 @@ void test_contact_to_hand_transition_keeps_observed_anchor() {
            fridge::OperationTrackState::HAND_FULL_BLOCKED);
     assert(tracks.find(1)->second.has_hand_estimate_anchor_box);
     assert(tracks.find(1)->second.hand_estimate_anchor_box.x1 == 130.0f);
-    assert(tracks.find(1)->second.observed_track.size() >= 2);
+    // 保护期内的 B 不写入正式 observed_track；不过它已被提升为 HAND
+    // 的 estimate anchor，因此只需保留最初可靠观测即可。
+    assert(tracks.find(1)->second.observed_track.size() >= 1);
 
     fridge::SettlementResult result = settle_after_hand(
         &session, std::vector<fridge::Detection>(1, det(0, 130, 100, 230, 200)), &frame);
@@ -891,6 +1035,9 @@ int main() {
     test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
     test_partial_existing_item_is_not_registered_as_new_d();
     test_fast_same_class_b_becomes_c_candidate_not_d();
+    test_new_track_claim_grace_defers_same_class_d();
+    test_mature_same_class_tracks_keep_shared_b_ambiguous();
+    test_no_hand_frame_respects_new_track_claim_grace();
     test_drop_requires_continuous_evidence();
     test_ambiguous_hand_partial_box_does_not_create_d();
     test_adjacent_same_class_new_item_gets_its_own_d_chain();
