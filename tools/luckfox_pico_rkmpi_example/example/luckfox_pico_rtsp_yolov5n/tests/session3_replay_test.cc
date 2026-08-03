@@ -408,7 +408,7 @@ void test_new_item_replacing_c_old_position_is_registered_without_hand_contact()
     }
     assert(found_replacement_source);
 
-    // 第二张有效有手帧让 D 完成一次自匹配；随后稳定无手快照正式结算。
+    // 第二张有效有手帧让 D 完成一次自匹配；后续无手直接帧确认后结算。
     send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 220, 220)),
                std::vector<fridge::BBox>(1, fridge::BBox(500, 80, 640, 220)), &frame);
     fridge::SettlementResult result = settle_after_hand(
@@ -664,8 +664,8 @@ void test_mature_same_class_tracks_keep_shared_b_ambiguous() {
     }
 
     fridge::SettlementResult result = settle_after_hand(&session, shared, &frame);
-    // 同类 B 的归属仍冲突时，逐帧无手收尾必须继续保留工作库存，不能像
-    // 固定窗口快照那样强制提交一个任意绑定结果。
+    // 同类 B 的归属仍冲突时，逐帧无手收尾必须继续保留工作库存，不能强制
+    // 提交一个任意绑定结果。
     assert(!result.committed);
     assert(session.operation_pending());
     assert(session.inventory().size() == 2);
@@ -1179,8 +1179,11 @@ void test_no_hand_occlusion_uses_cover_union() {
         initial_no_hand_frame(&session,
             std::vector<fridge::Detection>(1, det(2, 100, 100, 200, 200)), &frame);
 
-        const std::vector<fridge::Detection> left_d(
-            1, det(0, 50, 100, 150, 200));
+        // 部分前景不能替代旧 C 的直接归属。这里仍给出 C 的独立 B，验证
+        // D 只覆盖一半时不会把它写成 OCCLUDED。
+        std::vector<fridge::Detection> left_d;
+        left_d.push_back(det(0, 50, 100, 150, 200));
+        left_d.push_back(det(2, 100, 100, 200, 200));
         const fridge::BBox left_hand(30, 145, 45, 160);
         send_frame(&session, left_d, std::vector<fridge::BBox>(1, left_hand), &frame);
         send_frame(&session, left_d, std::vector<fridge::BBox>(1, left_hand), &frame);
@@ -1238,6 +1241,161 @@ void test_no_hand_occlusion_uses_cover_union() {
     }
 }
 
+// 细节8：旧 C 的路径在有手阶段短暂中断后，手离开时重新出现的同类 B
+// 必须先回到 C 的 reappear 链路。第二张直接无手帧确认后只能产生 MOVED，
+// 不能把旧 #1 留在原位并额外登记一个 IN。
+void test_path_interruption_keeps_old_c_identity_not_in() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(2, 100, 100, 200, 200)), &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1, det(2, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(2, 220, 100, 320, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 340, 220)), &frame);
+    // 手还在继续移动，但此帧漏掉物品检测；不能因此释放旧 C 或开始 D。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(340, 80, 480, 220)), &frame);
+
+    const std::vector<fridge::Detection> reappeared(
+        1, det(2, 220, 100, 320, 200));
+    fridge::SettlementResult result = settle_after_hand(&session, reappeared, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
+// 同类 B 在旧 C 的路径候选期间不能提前计为 D。旧 C 后来重新得到自己的
+// 原位 B 后，才允许该同类 B 从当前帧开始走 D 的确认链路。
+void test_same_class_d_starts_after_old_c_resolves() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    // C 先被手遮住；第二帧出现的 B 落在 C 的预计路径上，因此只能是 C 的
+    // reappear 候选，不能从这张帧开始累计 D。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 220, 100, 320, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 440, 220)), &frame);
+    for (std::map<int, fridge::OperationTrack>::const_iterator track =
+             session.operation_tracks().begin();
+         track != session.operation_tracks().end(); ++track) {
+        assert(!track->second.is_suspect_new);
+    }
+
+    // C 的原位置随后有独立 B。右侧 B 的 D 守卫此时才解除，这一帧是 D 的
+    // 第 1 帧，而不是沿用前一帧的计数。
+    std::vector<fridge::Detection> both;
+    both.push_back(det(0, 100, 100, 200, 200));
+    both.push_back(det(0, 220, 100, 320, 200));
+    send_frame(&session, both,
+               std::vector<fridge::BBox>(1, fridge::BBox(210, 80, 450, 220)), &frame);
+    int suspect_count = 0;
+    for (std::map<int, fridge::OperationTrack>::const_iterator track =
+             session.operation_tracks().begin();
+         track != session.operation_tracks().end(); ++track) {
+        if (!track->second.is_suspect_new) continue;
+        ++suspect_count;
+        assert(track->second.self_match_count == 1);
+    }
+    assert(suspect_count == 1);
+
+    // 第二张有手直接帧完成 D 的有手自匹配；两张无手直接帧再完成无手确认。
+    send_frame(&session, both,
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 80, 460, 220)), &frame);
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        both, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        both, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(second.settlement, fridge::EventKind::IN, 2));
+}
+
+// 两个同类初始框几乎重叠时，一个中央 B 不能同时证明两个 item_id 可见。
+// 右侧同类 B 即使连续出现，也先是 claim，操作不得提交，更不能产生 IN。
+void test_overlapping_same_class_baseline_blocks_same_class_in() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(2, 0, 100, 100, 200, 200));
+    initial.push_back(item(4, 0, 102, 101, 202, 201));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 101, 100, 201, 200)), &frame);
+
+    std::vector<fridge::Detection> ambiguous;
+    ambiguous.push_back(det(0, 101, 100, 201, 200));
+    ambiguous.push_back(det(0, 350, 100, 450, 200));
+    send_frame(&session, ambiguous,
+               std::vector<fridge::BBox>(1, fridge::BBox(330, 80, 470, 220)), &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        ambiguous, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        ambiguous, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(!second.settlement.committed);
+    assert(session.operation_pending());
+    assert(session.inventory().size() == 2);
+    assert(!has_event(second.settlement, fridge::EventKind::IN, 5));
+}
+
+// 同类旧 C 只要在同一帧各自得到不同的唯一 B，就不应被基线碰撞保护误伤。
+void test_separate_same_class_baseline_commits_with_distinct_owners() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(2, 0, 100, 100, 200, 200));
+    initial.push_back(item(4, 0, 420, 100, 520, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 420, 100, 520, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(700, 80, 800, 220)), &frame);
+    const int no_hand = frame++;
+    fridge::FrameProcessResult result = session.process_frame(
+        stable, std::vector<fridge::BBox>(), no_hand, no_hand);
+    assert(result.no_hand_frame_processed);
+    assert(result.settlement.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(session.inventory().find_by_item(4) != 0);
+    assert(!has_event(result.settlement, fridge::EventKind::IN, 5));
+}
+
 }  // namespace
 
 int main() {
@@ -1275,5 +1433,9 @@ int main() {
     test_c_reappear_commits_after_second_direct_frame();
     test_out_requires_two_direct_missing_frames();
     test_no_hand_occlusion_uses_cover_union();
+    test_path_interruption_keeps_old_c_identity_not_in();
+    test_same_class_d_starts_after_old_c_resolves();
+    test_overlapping_same_class_baseline_blocks_same_class_in();
+    test_separate_same_class_baseline_commits_with_distinct_owners();
     return 0;
 }

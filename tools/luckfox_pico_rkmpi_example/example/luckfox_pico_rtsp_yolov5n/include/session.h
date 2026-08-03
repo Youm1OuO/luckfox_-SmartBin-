@@ -72,6 +72,39 @@ enum class ContactState {
     CONTACT_MOVING,
 };
 
+// 一次连续手操作内，旧库存 C 的身份结论。它不写入 InventoryItem：正式
+// 库存仍只有 VISIBLE / OCCLUDED，未决状态只用于阻止错误提交。
+enum class IdentityResolution {
+    UNRESOLVED,
+    AT_ORIGIN,
+    AT_NEW_POSITION,
+    OCCLUDED_CONFIRMED,
+    OUT_CONFIRMED,
+};
+
+// 当前一张直接帧中，旧库存 C 与检测框 B 的统一归属。候选关系保留所有
+// 合理解释；只有双方唯一的关系才写入 owner 表。
+struct FrameOwnership {
+    std::map<int, int> old_item_to_detection;
+    std::vector<int> detection_to_old_item;
+    std::map<int, std::vector<int> > item_candidates;
+    std::map<int, std::vector<int> > detection_candidates;
+};
+
+// 同类 B 还可能是旧 C 时的跨帧声明。它不是 D，也不允许累计为 IN 证据；
+// 只有全部可能旧 C 得到独立结论后，当前直接帧才可重新作为 D 的首帧。
+struct UnresolvedSameClassClaim {
+    int cls_id = -1;
+    BBox first_box;
+    BBox last_box;
+    bool has_last_box = false;
+    int direct_self_match_count = 0;
+    bool has_hand_source = false;
+    bool first_seen_in_post_hand_window = false;
+    std::set<int> possible_old_item_ids;
+    int last_seen_direct_frame = -1;
+};
+
 // 疑似新物品 D 的首次发现来源。来源只决定后续需要哪一条确认链路；
 // 无论哪一种，正式 IN 都仍要等后续无手帧完成直接确认并提交。
 enum class SuspectSource {
@@ -253,15 +286,44 @@ private:
                                        bool hand_moved);
     void advance_claim_grace_(const std::set<int>& new_existing_track_ids);
 
+    // 每张有效直接帧只建立一份 C/B 归属。局部 HAND/CONTACT 状态机可以
+    // 继续积累路径证据，但 D 准入和最终提交只能读取这里的结果。
+    void begin_direct_frame_(const std::vector<Detection>& detections);
+    void reset_frame_ownership_(size_t detection_count);
+    void build_frame_ownership_(const std::vector<Detection>& detections);
+    void assign_frame_owner_(int item_id, int detection_index,
+                             IdentityResolution resolution);
+    void detect_baseline_collision_groups_();
+    bool old_item_is_resolved_(int item_id) const;
+    bool baseline_collision_group_resolved_(const std::set<int>& group) const;
+    std::set<int> possible_old_owners_for_detection_(
+        int detection_index, const std::vector<Detection>& detections) const;
+    void upsert_unresolved_same_class_claim_(
+        const Detection& detection, const std::set<int>& possible_old_item_ids,
+        bool has_hand_source, bool first_seen_in_post_hand_window);
+    void refresh_unresolved_same_class_claims_(
+        const std::vector<Detection>& detections);
+    void capture_unresolved_same_class_claims_(
+        const std::vector<Detection>& detections);
+    void discard_claims_resolved_by_old_owner_(
+        const std::vector<Detection>& detections);
+    bool can_start_new_d_for_detection_(
+        int detection_index, const std::vector<Detection>& detections,
+        bool has_hand_source,
+        bool first_seen_in_post_hand_window);
+    void mark_current_d_owner_(int runtime_key, int detection_index);
+
     // 手离开后的收尾与提交
-    void observe_no_hand_frame_(const std::vector<Detection>& detections);
+    void observe_no_hand_frame_(const std::vector<Detection>& detections,
+                                int frame_id);
+    void apply_no_hand_direct_frame_(const std::vector<Detection>& detections,
+                                     int frame_id);
+    void advance_no_hand_old_item_resolutions_();
     void register_post_hand_reveal_suspects_(
         const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices);
-    SettlementResult settle_no_hand_frame_(const std::vector<Detection>& detections,
-                                           int frame_id);
-    bool has_unresolved_no_hand_state_(const std::set<int>& observed_item_ids,
-                                       const std::set<int>& fully_occluded_item_ids);
+    SettlementResult settle_no_hand_frame_();
+    bool has_unresolved_no_hand_state_();
     void clear_runtime_after_commit_();
 
     // 运行时对象与工作库存操作
@@ -275,13 +337,15 @@ private:
                             float score, int frame_id);
     void release_not_held_(OperationTrack& track, bool occluded);
     void mark_pending_out_(int item_id);
-    void refresh_confirmed_blockers_(const std::set<int>& observed_working_ids);
 
     InventoryDB inventory_;  // 正式库存
     std::map<int, InventoryItem*> item_by_id_;
 
-    // 手操作期间唯一可写的库存副本。
+    // 手操作期间累积路径、放下和候选证据的库存副本。
     std::map<int, InventoryItem> working_inventory_;
+    // 当前无手直接帧的结算投影。它可以把本帧漏检暂时投影为原始 C，但
+    // 在提交前绝不覆盖 working_inventory_ 中已经积累的路径/放下证据。
+    std::map<int, InventoryItem> no_hand_direct_inventory_;
     std::map<int, InventoryItem> operation_start_inventory_;
     int working_next_item_id_ = 1;
     bool working_inventory_active_ = false;
@@ -292,6 +356,15 @@ private:
     std::set<int> pending_out_ids_;
     std::set<int> confirmed_moved_ids_;
     std::set<int> released_hand_candidate_ids_;
+    FrameOwnership frame_ownership_;
+    std::map<int, IdentityResolution> old_item_resolution_;
+    std::vector<UnresolvedSameClassClaim> unresolved_same_class_claims_;
+    std::vector<std::set<int> > baseline_collision_groups_;
+    // D 也必须只占用当前直接帧中的一个 B；它与旧 C owner 分开保存，避免
+    // 把尚未提升的 D 混入正式 item_id 映射。
+    std::map<int, int> current_d_runtime_to_detection_;
+    std::vector<int> current_detection_to_d_runtime_;
+    int direct_frame_sequence_ = 0;
     std::vector<BBox> hand_track_;
     BBox old_hand_box_;
     bool has_old_hand_box_ = false;

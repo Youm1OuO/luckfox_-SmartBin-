@@ -195,7 +195,7 @@ constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 // -------------------------------------------------------------------------
 //  这里的常量只给出可运行的初始值；部署前必须按该摄像头、该模型和实际
 //  冰箱格局标定。详细的“地址 + 含义 + 调整方向”见：
-//  另另一种业务流程(3.0var).md/超参数位置与调节说明.txt
+//  另另一种业务流程(3.0var)/超参数位置与调节说明.txt
 // =========================================================================
 
 // 历史多帧投票模块参数。3.0 的 SessionManager 不使用 SnapshotBuffer，
@@ -211,7 +211,7 @@ constexpr float SNAPSHOT_VOTE_CENTER_NORM = 0.30f;
 constexpr float SNAPSHOT_VOTE_WIDTH_RATIO = 0.25f;
 constexpr float SNAPSHOT_VOTE_HEIGHT_RATIO = 0.25f;
 
-// 库存 A 与快照 B 的“严格匹配”：类别相同 + 中心、宽、高均接近。
+// 旧库存 C 与当前直接帧 B 的“严格匹配”：类别相同 + 中心、宽、高均接近。
 constexpr float INVENTORY_STRICT_CENTER_NORM = 0.26f;
 constexpr float INVENTORY_STRICT_WIDTH_RATIO = 0.25f;
 constexpr float INVENTORY_STRICT_HEIGHT_RATIO = 0.25f;
@@ -232,7 +232,7 @@ constexpr float FLOW3_REAPPEAR_CANDIDATE_WIDTH_RATIO = 0.85f;
 constexpr float FLOW3_REAPPEAR_CANDIDATE_HEIGHT_RATIO = 0.85f;
 constexpr float FLOW3_OLD_POSITION_OVERLAP_AREA = 16.0f;
 
-// 物品刚被手挡住时，YOLO 输出的是完整框的一部分，不能继续用库存/快照的
+// 物品刚被手挡住时，YOLO 输出的是完整框的一部分，不能继续用库存原位的
 // 高 IoM 阈值直接否定它。以下仅用于“当前手确实影响该框”的已有物品优先认领，
 // 不用于普通无手库存匹配，也不单独生成身份。
 constexpr float FLOW3_HAND_PARTIAL_MIN_OBSERVED_COVER = 0.30f;

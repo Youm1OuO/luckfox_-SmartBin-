@@ -15,44 +15,33 @@ tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/session.c
 修改参数后必须重新交叉编译。建议一次只改一项，并保存“参数版本 + 视频 +
 事件日志”；多个阈值一起放宽，出现误匹配时会无法判断是哪一项造成的。
 
-当前版本（3.0-r9）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
-自己的唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用
-的框才有机会进入疑似 D 链路。若某个 HAND_* 旧 C 没有自己的检测框，而同类贴手
-B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_candidate` 暂存，不能
-立刻建立 D。多个 C 都合理时保持未决；单摄像头无法区分时不会凭类别相同强行增加数量。
-新建的旧库存 CONTACT_* / HAND_* C 还会经历两张后续有效帧保护期：保护期内仍
-逐帧匹配自己的原位置、预计位置和真实轨迹并累计本地 tentative/hold/not_hold 证据，
-但不能把同类 B 写入排他认领表；保护期结束后才参加 B 的唯一归属仲裁。保护期内的
-同类未认领框暂不创建 D，避免手路过造成库存数量膨胀。
-若保护期结束后仍有多个成熟 C 能解释同一个 B，稳定快照也会跳过这些 C 的宽松/
-轨迹绑定并保留旧库存；不会按 item_id 顺序强行选一个，更不会据此 OUT 或 IN。
-即使某个成熟 C 因框跳动暂时接不上 B，只要还有同类旧 C 没有得到独立的“原位/
-移动/明确 OUT”结论，B 也继续保持未决，不会趁候选失败的单帧改登记为 D。
+当前版本的固定规则（不是超参数）：3.0 对每张有效有手/无手帧直接处理，不使用
+SnapshotBuffer，不做投票、检测框平均或结算阶段的第二套匹配。每张直接帧先建立唯一
+的 FrameOwnership：一个 B 最多归属一个旧 C 或一个已有 D；一个 C 最多认领一个 B。
+候选关系不等于 owner，C/B 任一侧有同等合理解释时保持 UNRESOLVED，不能按 item_id、
+map 顺序或检测顺序强行选择。
+
+旧 C 只有 AT_ORIGIN、AT_NEW_POSITION、OCCLUDED_CONFIRMED、OUT_CONFIRMED 四种已
+解决结论。PLACED 只是放下候选；必须在无手直接帧独占同一个 B 后才是
+AT_NEW_POSITION。若一个同类 B 仍可能属于 UNRESOLVED 的旧 C，则它进入 claim，不能
+创建或提升 D、不能产生 IN。HAND_VISIBLE_D、C_POSITION_REPLACEMENT_D、
+POST_HAND_REVEAL_D 都走同一个 D 准入门。
+
+基线中同类旧框已经重叠、可能共享同一个 B 时，必须等组内每个 C 得到独立结论；未解除
+前不创建相关 D、不判 OUT、不提交。无手主流程先根据已经确认的 owner 和前景框计算
+完整遮挡、推进缺失证据；settle_no_hand_frame_ 只读取这些结果检查提交门并应用工作副本，
+不会重新把 B 分给 C 或 D。本次规则不新增可调数值参数。
 
 
-二、无手稳定快照
-------------------
+二、历史快照兼容参数
+----------------------
 
-SNAPSHOT_N（当前 3）
-    连续多少张无手帧合成一份稳定快照。
-    调大：抗 YOLO 漏检和框抖动更强，手离开后的确认更慢。
-    调小：响应更快，但单帧误检/漏检更容易影响提交。
-
-SNAPSHOT_S（当前 0.5）
-    物品在 N 帧中出现比例必须严格大于 N*S 才进入快照。
-    调大：更保守，误检更难进入快照，但部分露出物品可能被过滤。
-    调小：更容易保留暂时可见物品，也更容易让噪声进入快照。
-
-SNAPSHOT_MIN_SCORE、SNAPSHOT_MIN_BOX_WIDTH、SNAPSHOT_MIN_BOX_HEIGHT
-    快照投票前的最低置信度和最小框尺寸。
-    调大：去除小框噪声更有效，但远处、小物品或部分遮挡物品更容易丢失。
-    调小：召回率更高，但错误检测也更多。
-
-SNAPSHOT_VOTE_CENTER_NORM、SNAPSHOT_VOTE_WIDTH_RATIO、
+SNAPSHOT_N、SNAPSHOT_S、SNAPSHOT_MIN_SCORE、SNAPSHOT_MIN_BOX_WIDTH、
+SNAPSHOT_MIN_BOX_HEIGHT、SNAPSHOT_VOTE_CENTER_NORM、SNAPSHOT_VOTE_WIDTH_RATIO、
 SNAPSHOT_VOTE_HEIGHT_RATIO
-    同一稳定快照内部，跨帧 YOLO 框是否属于同一候选的容差。
-    调大：容忍抖动，但相邻同类物品可能被错误合并。
-    调小：物品之间更容易区分，但同一物品可能因抖动被拆成多票。
+    这些常量只为独立的 snapshot.cc 保留，供兼容编译使用；3.0 的
+    SessionManager 完全不读取它们。调节这些值不会改变 3.0 的库存判断、MOVED、
+    OUT、IN 或遮挡结果。
 
 
 三、库存身份匹配
@@ -60,7 +49,7 @@ SNAPSHOT_VOTE_HEIGHT_RATIO
 
 INVENTORY_STRICT_CENTER_NORM、INVENTORY_STRICT_WIDTH_RATIO、
 INVENTORY_STRICT_HEIGHT_RATIO
-    严格匹配：稳定位置上的同一物品判断。
+    严格匹配：当前直接帧中原位置上的同一物品判断。
     调大：框抖动时更容易保持同一 item_id，但同类相邻物品误认风险上升。
     调小：身份更保守，但轻微移动也可能匹配失败。
 
@@ -72,7 +61,7 @@ INVENTORY_PARTIAL_IOM
 FLOW3_HAND_PARTIAL_MIN_OBSERVED_COVER、
 FLOW3_HAND_PARTIAL_MAX_AREA_RATIO、FLOW3_HAND_PARTIAL_CENTER_NORM
     这三项只用于“手正在影响物品”时，把 YOLO 的局部框优先认领给已有库存
-    物品，避免移动旧物品时被错误建成新的 D。它们不参与无手稳定快照匹配。
+    物品，避免移动旧物品时被错误建成新的 D。它们不参与普通无手原位匹配。
     MIN_OBSERVED_COVER 调大：局部框必须更多地落在旧框内，较安全，但遮挡较深
     时容易把旧物品漏成 D；调小：更能容忍局部框偏移，但相邻同类物品误认风险升高。
     MAX_AREA_RATIO 调大：允许局部观测框比旧框略大，容忍 YOLO 抖动，但真正的新
@@ -91,7 +80,7 @@ FLOW3_REAPPEAR_CANDIDATE_CENTER_NORM、
 FLOW3_REAPPEAR_CANDIDATE_WIDTH_RATIO、FLOW3_REAPPEAR_CANDIDATE_HEIGHT_RATIO
     只用于 C 曾暂时看不见后，判断一个同类 B 是否足够接近 C 的完整候选路径，从而
     暂记为 `reappear_candidate`。它比普通 FLOW3_TRACK_* 略宽，但候选还必须连续
-    自匹配，且最终仍要通过无手稳定快照，所以它不会单帧产生 MOVED 或 IN。
+    自匹配；它不会单帧产生 MOVED 或 IN，仍需当前无手直接帧的独占确认和提交门。
     调大：更能抵抗手框/YOLO 在相邻有效帧间的大跳动，减少“移动 C 被误建成 D”；
     过大：较远的同类新物品也更可能被保守地暂认给 C，导致真实 IN 延后或保持未决。
     调小：同类身份更严格，但快速手移动或运动模糊时更容易重新落入 D 链路。
@@ -136,7 +125,7 @@ FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES（当前 2）
     排他候选。保护期内不禁止本地匹配，也不禁止保存 observed_track/轨迹，只禁止
     抢占全局 B；无手收尾帧同样会推进计数，微小手框被跳过的帧不会推进。
     调大：同类物品多、手框跳动大时更保守，能减少路过物品抢 B 和重复 D，但确认
-    整理/取出会变慢，并可能让短操作在快照前仍保持未决。
+    整理/取出会变慢，并可能让短操作在无手直接帧中仍保持未决。
     调小：响应更快，但新建 CONTACT/HAND 更容易在证据不足时抢占同类 B；设为 0
     等于关闭保护期，不建议在同类物品较多的画面使用。
 
@@ -144,7 +133,7 @@ CONTACT_* 的固定规则（不是单独超参数）：接触状态保存在 Ope
 不写入 InventoryItem。CONTACT_* 只保存物品真实 observed_track/observed_move_values；
 手部 hand_track 和 hand_move_values 仅作辅助，不用手腕位移计算物品终点。首次有效 B
 需要与手相贴，连续两次真实移动证据才进入 CONTACT_MOVING；没有可靠 B 时两个证据计数
-都暂停；新建 CONTACT_* 的两帧保护期内仍累计本地证据，但不排他认领 B。手离开后先查原位置，再查 observed_track；两者都没有时先保持未决，稳定无手
+都暂停；新建 CONTACT_* 的两帧保护期内仍累计本地证据，但不排他认领 B。手离开后先查原位置，再查 observed_track；两者都没有时先保持未决，连续无手直接
 帧持续缺失且没有遮挡解释后才允许 OUT。若接触候选后来达到 e2/e1 转入 HAND_*，
 会把接触阶段最后一次真实 B 保存为 HAND_* 的估计锚点，但仍保留 original_box 作为
 最终原位置比较基准，避免“已推开但仍与旧框局部重叠”被释放为未移动。
@@ -228,12 +217,12 @@ FLOW3_DROP_FALL_BEHIND_RATIO
     还必须同时满足 B 已与手脱离或 B 的宽高更接近完整 C.box，并连续达到
     FLOW3_DROP_EVIDENCE_REQUIRED 次才会进入 PLACED。
     调大：更容易累积放下证据，可能把手持但慢速移动的物品提前放下。
-    调小：更严格，放下确认更慢，更多依赖无手稳定快照。
+    调小：更严格，放下确认更慢，更多依赖无手直接帧的重新出现确认。
 
 FLOW3_REAPPEAR_CANDIDATE_CONFIRM_FRAMES（当前 2）
     `reappear_candidate` 首次出现后，需要连续多少次能匹配到同一个 B，才可把 B
     作为旧 C 的已确认重新出现位置。若 B 是在无手第一帧才首次可见，也同样使用
-    这个门槛；稳定快照仍是正式提交的最后一步。
+    这个门槛；随后仍须通过当前无手直接帧的 owner 与提交门。
     调大：对一帧误检、同类串身份更稳，但快速操作后确认整理更慢。
     调小：更快恢复 C 的身份，但单帧 YOLO 跳动更容易造成错误整理。
 
@@ -261,14 +250,24 @@ NEW_ITEM_CONFIRM_FRAMES（当前 2）
     调大：更难误入库，但手快速放下物品时确认会变慢。
     调小：实时性更高，但一帧误检更容易成为候选 D。
 
-    说明：D 在第二次有效观察达到该值后进入工作库存；正式 IN 仍要再等连续
-    SNAPSHOT_N 张无手稳定帧完成结算。若感觉“手已离开但一直不提交”，先看画面
-    左上角是否仍是 HAND / rawH>0；只要仍检测到手，稳定快照会被重置。
+    说明：D 在第二次有效观察达到该值后进入工作库存；正式 IN 还必须同时满足：
+    D 在当前无手直接帧拥有唯一 B、达到 FLOW3_NO_HAND_D_CONFIRM_FRAMES 的连续
+    无手自匹配，且所有 operation-start C、claim、同类基线碰撞组都已得到可提交结论。
 
     疑似 D 的发现入口有三个：贴手出现的 HAND_VISIBLE_D、无法认领且替代 C 原位置
     的 C_POSITION_REPLACEMENT_D、以及手离开后首次完整出现的 POST_HAND_REVEAL_D。
     前两者从有手帧开始计数；第三者以首张无手完整 B 记为第 1 次，下一张有效无手帧
-    必须自匹配才可提升。三者都不能绕过稳定快照直接正式 IN。
+    必须自匹配才可提升。若 D 守卫刚解除，当前帧才记为 D 的第 1 帧，不能借用 claim
+    期间的出现次数。
+
+FLOW3_NO_HAND_D_CONFIRM_FRAMES（当前 2）
+    已提升 D 在无手阶段所需的连续直接自匹配帧数。它验证“当前 D 仍是同一个 B”，
+    不是快照投票。调大更保守，调小更快但更容易受单帧误检影响。
+
+FLOW3_NO_HAND_OUT_MISSING_FRAMES（当前 2）
+    已有活动旧 C 在没有独占 B、没有完整遮挡、且已有足够拿走/移动上下文时，需要
+    连续缺失多少张无手直接帧才可 OUT。普通静态 C 或仍有 claim 的 C 不会靠此参数
+    自动 OUT。
 
 FLOW3_C_REPLACEMENT_MIN_COVER_RATIO（当前 0.30）
     有手阶段，若已有库存 C 已进入 HAND_*、本帧又没有自己的检测框，而一个未被
@@ -281,11 +280,10 @@ FLOW3_C_REPLACEMENT_MIN_COVER_RATIO（当前 0.30）
 
 FLOW3_POST_HAND_REVEAL_WINDOW_FRAMES（当前 2）
     手离开后，允许从“库存无法认领、且贴近本次 hand_track”的完整 B 创建
-    POST_HAND_REVEAL_D 的最早无手帧数。它必须留出至少一次后续无手自匹配，才可能
-    在当前稳定快照中正式 IN；当前 SNAPSHOT_N=3、NEW_ITEM_CONFIRM_FRAMES=2，因此
-    设为 2。
+    POST_HAND_REVEAL_D 的最早无手帧数。窗口内必须留出至少一次后续无手直接自匹配，
+    才可能完成 D 的确认并通过提交门；当前值为 2。
     调大：手离开稍晚才被 YOLO 看到的真实新物品更不容易漏掉；但会扩大“旧物重现或
-    误检被误建 D”的时间范围，而且过大时本轮稳定快照没有足够帧完成二次确认。
+    误检被误建 D”的时间范围，而且过大时当前操作更容易长期保持未决。
     调小：入库来源更紧贴手离开时刻，安全性更高；但首帧漏检时更容易漏掉全程被手
     遮挡的真实 D。
 
@@ -305,11 +303,10 @@ BLOCK_OVERLAP_AREA_EPS、COVER_REMAINING_AREA_EPS
 七、调参顺序
 --------------
 
-1. 先调 SNAPSHOT_*：确保没有手时同一物品的稳定框不会乱跳。
-2. 再调 INVENTORY_STRICT_* 与 INVENTORY_PARTIAL_IOM：确保静态库存不产生
+1. 先调 INVENTORY_STRICT_* 与 INVENTORY_PARTIAL_IOM：确保当前直接帧中的静态库存不产生
    新 item_id，也不合并相邻同类物品。
-3. 调手框参数与 HAND_MICRO_MOVE_SKIP_EPS：先让“手经过但没拿”不产生移动。
-4. 最后调 FLOW3_TRACK_*、FLOW3_CONTACT_*、两类 evidence 阈值、放下与遮挡参数。
+2. 调手框参数与 HAND_MICRO_MOVE_SKIP_EPS：先让“手经过但没拿”不产生移动。
+3. 最后调 FLOW3_TRACK_*、FLOW3_CONTACT_*、两类 evidence 阈值、放下与遮挡参数。
    若“移动旧 C 却误报 IN”，先检查/小幅调大 FLOW3_REAPPEAR_CANDIDATE_*；若
    “真正相邻同类 IN 长期保持未决”，再小幅调小它们，并保留回放验证。
 
@@ -321,13 +318,15 @@ BLOCK_OVERLAP_AREA_EPS、COVER_REMAINING_AREA_EPS
 - 取出 A；
 - 放入新 D；
 - 同类物品无法唯一判断时，库存数量不得增加，状态应保持未决。
+- 同类 B 先可能属于旧 C、旧 C 后来得到独立 B 时，D 只能从守卫解除后的当前帧开始计数。
+- 两个近乎重叠的同类旧 C 只看到一个中央 B 时，操作不得提交，也不得产生 IN。
 - 手腕基本不动、手指推动物品时，旧 item_id 不得变成新的 D；应先出现
   CONTACT_CANDIDATE，连续真实框移动后才变为 CONTACT_MOVING。
 
-重要原则：稳定快照中“没有绑定 item_id 的框”不会自动入库。只有具有 D 的
-“有手阶段已发现（贴手或替代 C 原位置）→ 连续自匹配 → 稳定存在”，或
-“手离开后首次显现且贴近本次 hand_track → 连续无手自匹配 → 稳定存在”证据链，
-才允许产生正式 IN 事件。
+重要原则：当前无手直接帧中“没有绑定 item_id 的框”不会自动入库。只有具有 D 的
+“有手阶段已发现（贴手或替代 C 原位置）→ 连续自匹配 → 无手直接确认”，或
+“手离开后首次显现且贴近本次 hand_track → 连续无手自匹配”证据链，才允许产生
+正式 IN 事件；任意未解决 C、claim、碰撞组或未直接确认的 D 都会阻止提交。
 
 同类相邻验证应分两种情况：
 
