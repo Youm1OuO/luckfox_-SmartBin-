@@ -81,6 +81,25 @@ enum class SuspectSource {
     POST_HAND_REVEAL_D,
 };
 
+// 旧库存 C 在一次手操作中的结算结论。它与 HAND_* / CONTACT_* 状态分离：
+// state=NORMAL 只表示当前没有活动遮挡状态，不能单独证明 C 已经结案。
+enum class ExistingItemResolution {
+    NONE,
+    STATIC_CONFIRMED,
+    MOVED_CONFIRMED,
+    OUT_CONFIRMED,
+    OCCLUDED_CONFIRMED,
+};
+
+// 最近一次将旧 C 退出活动 HAND/CONTACT 轨迹的直接原因。用于约束释放
+// 语义并生成可追溯日志，不能用模糊的“没匹配到”伪造 STATIC_CONFIRMED。
+enum class ReleaseReason {
+    NONE,
+    ORIGINAL_DETECTION,
+    CONTACT_RETURNED_ORIGINAL,
+    FULLY_OCCLUDED,
+};
+
 struct MoveValue {
     float dx = 0.0f;
     float dy = 0.0f;
@@ -118,6 +137,11 @@ struct OperationTrack {
 
     OperationTrackState state = OperationTrackState::NORMAL;
     ContactState contact_state = ContactState::NONE;
+    // 旧 C 从首次被手影响到本轮提交前都必须有明确结论。NORMAL 不会清掉
+    // 这个义务；只有 resolution 被确认后才允许结束无手结算。
+    ExistingItemResolution resolution = ExistingItemResolution::NONE;
+    ReleaseReason release_reason = ReleaseReason::NONE;
+    bool needs_no_hand_settlement = false;
     bool hold_and_move = false;
     bool shelter_or_hold = false;
     bool drop_confirmed = false;
@@ -160,6 +184,9 @@ struct OperationTrack {
     // 同类 HAND_* C 对同一个 B 存在多个成熟解释时，稳定结算也不能按
     // item_id 顺序强行绑定；直到后续帧给出唯一解释前保持未决。
     bool b_claim_ambiguous = false;
+    // 当前直接无手帧里存在一条可接上本 C 路径、但无法唯一归属的同类框。
+    // 它是逐帧证据，下一张无手帧重新计算；有它时不能累计 OUT。
+    bool no_hand_candidate_ambiguous = false;
 };
 
 class SessionManager {
@@ -230,6 +257,9 @@ private:
                                       const MoveValue& delta,
                                       std::set<int>* claimed_detection_indices,
                                       std::map<int, int>* known_item_owner);
+    void reopen_released_static_tracks_(const BBox& hand_box,
+                                        const std::vector<Detection>& detections,
+                                        const MoveValue& delta);
     void scan_or_update_suspects_(const BBox& hand_box,
                                   const std::vector<Detection>& detections,
                                   std::set<int>* claimed_detection_indices,
@@ -273,9 +303,16 @@ private:
                           int frame_id);
     void confirm_rearrange_(OperationTrack& track, const BBox& release_box,
                             float score, int frame_id);
-    void release_not_held_(OperationTrack& track, bool occluded);
+    void release_not_held_(OperationTrack& track, bool occluded,
+                           ReleaseReason reason,
+                           int evidence_detection_index = -1,
+                           const BBox* evidence_box = nullptr,
+                           const char* caller = nullptr);
     void mark_pending_out_(int item_id);
     void refresh_confirmed_blockers_(const std::set<int>& observed_working_ids);
+    void trace_(const char* tag, const char* format, ...) const;
+    void trace_track_(const char* tag, const OperationTrack& track,
+                      const char* reason) const;
 
     InventoryDB inventory_;  // 正式库存
     std::map<int, InventoryItem*> item_by_id_;
@@ -296,6 +333,10 @@ private:
     BBox old_hand_box_;
     bool has_old_hand_box_ = false;
     int next_suspect_id_ = -1;
+    int next_operation_id_ = 1;
+    int active_operation_id_ = 0;
+    int trace_frame_id_ = -1;
+    bool trace_hand_phase_ = false;
 
     bool hand_present_ = false;
     bool session_active_ = false;

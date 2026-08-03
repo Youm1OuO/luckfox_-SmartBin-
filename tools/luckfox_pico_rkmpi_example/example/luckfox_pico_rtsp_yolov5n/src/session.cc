@@ -6,6 +6,7 @@
 #include "fridge_config.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -127,6 +128,93 @@ const char* suspect_source_name(SuspectSource source) {
             break;
     }
     return "NONE";
+}
+
+const char* operation_track_state_name(OperationTrackState state) {
+    switch (state) {
+        case OperationTrackState::NORMAL:
+            return "NORMAL";
+        case OperationTrackState::HAND_PARTIAL_BLOCKED:
+            return "HAND_PARTIAL_BLOCKED";
+        case OperationTrackState::HAND_FULL_BLOCKED:
+            return "HAND_FULL_BLOCKED";
+        case OperationTrackState::PLACED:
+            return "PLACED";
+    }
+    return "UNKNOWN";
+}
+
+const char* contact_state_name(ContactState state) {
+    switch (state) {
+        case ContactState::NONE:
+            return "NONE";
+        case ContactState::CONTACT_CANDIDATE:
+            return "CONTACT_CANDIDATE";
+        case ContactState::CONTACT_MOVING:
+            return "CONTACT_MOVING";
+    }
+    return "UNKNOWN";
+}
+
+const char* existing_resolution_name(ExistingItemResolution resolution) {
+    switch (resolution) {
+        case ExistingItemResolution::NONE:
+            return "NONE";
+        case ExistingItemResolution::STATIC_CONFIRMED:
+            return "STATIC_CONFIRMED";
+        case ExistingItemResolution::MOVED_CONFIRMED:
+            return "MOVED_CONFIRMED";
+        case ExistingItemResolution::OUT_CONFIRMED:
+            return "OUT_CONFIRMED";
+        case ExistingItemResolution::OCCLUDED_CONFIRMED:
+            return "OCCLUDED_CONFIRMED";
+    }
+    return "UNKNOWN";
+}
+
+const char* release_reason_name(ReleaseReason reason) {
+    switch (reason) {
+        case ReleaseReason::NONE:
+            return "NONE";
+        case ReleaseReason::ORIGINAL_DETECTION:
+            return "ORIGINAL_DETECTION";
+        case ReleaseReason::CONTACT_RETURNED_ORIGINAL:
+            return "CONTACT_RETURNED_ORIGINAL";
+        case ReleaseReason::FULLY_OCCLUDED:
+            return "FULLY_OCCLUDED";
+    }
+    return "UNKNOWN";
+}
+
+const char* event_kind_name(EventKind kind) {
+    switch (kind) {
+        case EventKind::IN:
+            return "IN";
+        case EventKind::OUT:
+            return "OUT";
+        case EventKind::MOVED:
+            return "MOVED";
+        case EventKind::OCCLUDED:
+            return "OCCLUDED";
+        case EventKind::REVEALED:
+            return "REVEALED";
+    }
+    return "UNKNOWN";
+}
+
+bool existing_item_needs_settlement(const OperationTrack& track) {
+    return !track.is_suspect_new && track.item_id > 0 &&
+           track.needs_no_hand_settlement &&
+           track.resolution != ExistingItemResolution::MOVED_CONFIRMED &&
+           track.resolution != ExistingItemResolution::OUT_CONFIRMED &&
+           track.resolution != ExistingItemResolution::OCCLUDED_CONFIRMED;
+}
+
+bool existing_item_resolved_without_current_detection(const OperationTrack* track) {
+    if (!track || track->is_suspect_new) return false;
+    return track->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+           track->resolution == ExistingItemResolution::OUT_CONFIRMED ||
+           track->resolution == ExistingItemResolution::OCCLUDED_CONFIRMED;
 }
 
 // D 全程被手挡住时，手离开后的完整 B 可能位于手轨迹中段，而不是最后
@@ -871,6 +959,38 @@ int unique_no_hand_reappear_detection_for_track(
     return result;
 }
 
+// 与 unique_no_hand_reappear_detection_for_track 配套：它不尝试把歧义框
+// 分配给 C，只回答“本帧是否存在本可接上 C 路径、但因同类冲突无法唯一
+// 归属的框”。这类框不能作为 C 已缺失的 OUT 证据。
+bool has_ambiguous_no_hand_reappear_candidate(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        int runtime_key, const OperationTrack& track,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, OperationTrack>& tracks) {
+    if (!is_claim_mature(track)) return false;
+    const std::map<int, int> no_known_owner;
+    int viable_count = 0;
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (claimed.count(static_cast<int>(i)) ||
+            !reappear_candidate_path_matches(track, detections[i])) {
+            continue;
+        }
+        if (detection_strictly_matches_other_item(detections[i], track.item_id,
+                                                  working)) {
+            return true;
+        }
+        const int owner = unique_c_reappear_owner_for_detection(
+            detections[i], tracks, no_known_owner);
+        if (owner != runtime_key) {
+            if (owner >= 0 || owner == -2) return true;
+            continue;
+        }
+        ++viable_count;
+        if (viable_count > 1) return true;
+    }
+    return false;
+}
+
 // HAND_FULL + hold_and_move=False 时，只有“已确认”的其他库存/已经放下的 D
 // 才能解释 C 仍在旧位置被遮挡。未提升或未放下的 D 仍是模糊帧，不能拿它
 // 增加 not_hold 证据。
@@ -1474,6 +1594,49 @@ void bind_mutually_unique_track_paths(
 
 SessionManager::SessionManager() {}
 
+void SessionManager::trace_(const char* tag, const char* format, ...) const {
+    if (!FLOW3_DEBUG_TRACE_LOG) return;
+    printf("[3.0-TRACE][%s][op=%d][frame=%d][%s] ", tag,
+           active_operation_id_, trace_frame_id_,
+           trace_hand_phase_ ? "HAND" : "NO_HAND");
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    printf("\n");
+}
+
+void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
+                                  const char* reason) const {
+    const BBox expected = estimated_box(track);
+    trace_(tag,
+           "item=%d suspect=%d cls=%d state=%s contact=%s resolution=%s "
+           "needs_settle=%d grace=%d hold=%d not_hold=%d missing=%d ambiguous=%d "
+           "original=(%.1f,%.1f,%.1f,%.1f) expected=(%.1f,%.1f,%.1f,%.1f) "
+           "last=%d:(%.1f,%.1f,%.1f,%.1f) reappear=%d/%d:(%.1f,%.1f,%.1f,%.1f) "
+           "reason=%s",
+           track.item_id, track.suspect_id, track.cls_id,
+           operation_track_state_name(track.state),
+           contact_state_name(track.contact_state),
+           existing_resolution_name(track.resolution),
+           track.needs_no_hand_settlement ? 1 : 0,
+           track.claim_grace_remaining, track.hold_evidence_count,
+           track.not_hold_evidence_count, track.no_hand_missing_count,
+           (track.b_claim_ambiguous || track.contact_path_ambiguous ||
+            track.no_hand_candidate_ambiguous) ? 1 : 0,
+           track.original_box.x1, track.original_box.y1,
+           track.original_box.x2, track.original_box.y2,
+           expected.x1, expected.y1, expected.x2, expected.y2,
+           track.has_last_seen_box ? 1 : 0,
+           track.last_seen_box.x1, track.last_seen_box.y1,
+           track.last_seen_box.x2, track.last_seen_box.y2,
+           track.has_reappear_candidate_box ? 1 : 0,
+           track.reappear_candidate_match_count,
+           track.reappear_candidate_box.x1, track.reappear_candidate_box.y1,
+           track.reappear_candidate_box.x2, track.reappear_candidate_box.y2,
+           reason ? reason : "NONE");
+}
+
 void SessionManager::rebuild_persistent_item_index_() {
     item_by_id_.clear();
     std::map<int, InventoryItem>& items = inventory_.mutable_items();
@@ -1496,6 +1659,7 @@ void SessionManager::reset_operation_runtime_() {
     has_old_hand_box_ = false;
     next_suspect_id_ = -1;
     no_hand_streak_ = 0;
+    active_operation_id_ = 0;
 }
 
 void SessionManager::start_new_session(long long time_ms) {
@@ -1646,6 +1810,10 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     old_hand_box_ = hand_box;
     has_old_hand_box_ = true;
     no_hand_streak_ = 0;
+    active_operation_id_ = next_operation_id_++;
+    trace_("STATE", "begin operation inventory=%zu detections=%zu hand=(%.1f,%.1f,%.1f,%.1f)",
+           working_inventory_.size(), detections.size(), hand_box.x1, hand_box.y1,
+           hand_box.x2, hand_box.y2);
     process_effective_hand_frame_(hand_box, detections, true);
 }
 
@@ -1670,7 +1838,7 @@ void SessionManager::update_existing_contact_tracks_(
         const BBox& hand_box, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner) {
-    std::vector<int> release_keys;
+    std::vector<std::pair<int, int> > release_keys;
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
@@ -1703,6 +1871,7 @@ void SessionManager::update_existing_contact_tracks_(
                 track.has_first_hand_block_box = true;
                 track.has_last_hand_block_box = true;
             }
+            trace_track_("STATE", track, "contact-to-hand-transition");
             continue;
         }
 
@@ -1787,7 +1956,7 @@ void SessionManager::update_existing_contact_tracks_(
         }
 
         if (track.not_hold_evidence_count >= FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
-            release_keys.push_back(it->first);
+            release_keys.push_back(std::make_pair(it->first, observed_index));
             continue;
         }
         if (track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
@@ -1802,10 +1971,14 @@ void SessionManager::update_existing_contact_tracks_(
     }
 
     for (size_t i = 0; i < release_keys.size(); ++i) {
-        std::map<int, OperationTrack>::iterator it = track_buffer_.find(release_keys[i]);
+        std::map<int, OperationTrack>::iterator it = track_buffer_.find(release_keys[i].first);
         if (it != track_buffer_.end() &&
             it->second.contact_state == ContactState::CONTACT_CANDIDATE) {
-            release_not_held_(it->second, false);
+            release_not_held_(it->second, false,
+                              ReleaseReason::CONTACT_RETURNED_ORIGINAL,
+                              release_keys[i].second,
+                              &detections[release_keys[i].second].box,
+                              "hand-contact-returned-original");
         }
     }
 }
@@ -1853,6 +2026,7 @@ void SessionManager::mark_new_contact_candidates_(
         track.cls_id = item.cls_id;
         track.original_box = reference;
         track.contact_state = ContactState::CONTACT_CANDIDATE;
+        track.needs_no_hand_settlement = true;
         track.shelter_or_hold = true;
         track.claim_grace_remaining = FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES;
         track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
@@ -1895,6 +2069,7 @@ void SessionManager::mark_new_contact_candidates_(
         }
         printf("[3.0] item#%d 进入 CONTACT_CANDIDATE（低覆盖率且手相贴）\n",
                item.item_id);
+        trace_track_("STATE", created, "create-contact-candidate");
     }
 }
 
@@ -1916,6 +2091,7 @@ void SessionManager::promote_suspect_(int runtime_key, const Detection& detectio
     pending_in_ids_.insert(item_id);
     printf("[3.0] suspect#%d 已提升为工作库存 item#%d（尚未正式 IN）\n",
            track.suspect_id, item_id);
+    trace_track_("STATE", track, "promote-suspect-to-working-inventory");
 }
 
 void SessionManager::reserve_visible_known_detections_(
@@ -2034,16 +2210,38 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     track.drop_confirmed = true;
     track.state = OperationTrackState::PLACED;
     track.contact_state = ContactState::NONE;
+    track.resolution = ExistingItemResolution::MOVED_CONFIRMED;
+    track.release_reason = ReleaseReason::NONE;
+    track.needs_no_hand_settlement = false;
     track.b_claim_ambiguous = false;
+    track.no_hand_candidate_ambiguous = false;
     track.claim_grace_remaining = 0;
     track.no_hand_missing_count = 0;
     track.has_tentative_b_box = false;
     track.tentative_b_match_count = 0;
     track.tentative_b_started_touching_hand = false;
     confirmed_moved_ids_.insert(track.item_id);
+    trace_track_("STATE", track, "confirm-rearrange");
 }
 
-void SessionManager::release_not_held_(OperationTrack& track, bool occluded) {
+void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
+                                       ReleaseReason reason,
+                                       int evidence_detection_index,
+                                       const BBox* evidence_box,
+                                       const char* caller) {
+    const OperationTrackState old_state = track.state;
+    const ContactState old_contact_state = track.contact_state;
+    const int old_hold = track.hold_evidence_count;
+    const int old_not_hold = track.not_hold_evidence_count;
+    const bool had_reappear_candidate = track.has_reappear_candidate_box;
+    // 有手帧里的“仍在原位”只能说明当前这一刻没有移动。手可能在同一
+    // 连续操作中随后再次拿起它，因此要保留一个可重新激活的锚点，并等
+    // 无手直接帧完成真正静态结算。完整遮挡和无手原位证据才是终态。
+    const bool keep_reopen_anchor = !occluded && hand_present_ &&
+        (reason == ReleaseReason::ORIGINAL_DETECTION ||
+         reason == ReleaseReason::CONTACT_RETURNED_ORIGINAL);
+    const BBox reopen_anchor = track.has_last_seen_box
+        ? track.last_seen_box : track.original_box;
     if (track.item_id > 0) {
         std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
         if (item != working_inventory_.end()) item->second.status =
@@ -2052,6 +2250,11 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded) {
     }
     track.state = OperationTrackState::NORMAL;
     track.contact_state = ContactState::NONE;
+    track.release_reason = reason;
+    track.resolution = reason == ReleaseReason::FULLY_OCCLUDED
+        ? ExistingItemResolution::OCCLUDED_CONFIRMED
+        : ExistingItemResolution::STATIC_CONFIRMED;
+    track.needs_no_hand_settlement = keep_reopen_anchor;
     track.shelter_or_hold = false;
     track.hold_and_move = false;
     track.hold_evidence_count = 0;
@@ -2062,21 +2265,60 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded) {
     track.reappearance_pending = false;
     track.reappear_candidate_started_touching_hand = false;
     track.b_claim_ambiguous = false;
+    track.contact_path_ambiguous = false;
+    track.no_hand_candidate_ambiguous = false;
     track.claim_grace_remaining = 0;
     track.has_tentative_b_box = false;
     track.tentative_b_match_count = 0;
     track.tentative_b_started_touching_hand = false;
     track.has_first_hand_block_box = false;
     track.has_last_hand_block_box = false;
-    track.has_hand_estimate_anchor_box = false;
     track.move_values.clear();
     track.track.clear();
     track.observed_move_values.clear();
     track.observed_track.clear();
     track.hand_move_values.clear();
     track.contact_started_touching_hand = false;
-    track.hand_track_start_index = -1;
     track.no_hand_missing_count = 0;
+    if (keep_reopen_anchor) {
+        track.last_seen_box = reopen_anchor;
+        track.has_last_seen_box = reopen_anchor.area() > 0.0f;
+        track.hand_estimate_anchor_box = reopen_anchor;
+        track.has_hand_estimate_anchor_box = reopen_anchor.area() > 0.0f;
+        if (track.has_hand_estimate_anchor_box) track.track.push_back(reopen_anchor);
+        track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
+    } else {
+        track.has_hand_estimate_anchor_box = false;
+        track.hand_track_start_index = -1;
+    }
+    if (evidence_box) {
+        trace_("RELEASE",
+               "item=%d old_state=%s old_contact=%s -> NORMAL reason=%s "
+               "original_evidence=%d evidence_index=%d evidence_box=(%.1f,%.1f,%.1f,%.1f) "
+               "caller=%s hold=%d not_hold=%d candidate_cleared=%d provisional=%d",
+               track.item_id, operation_track_state_name(old_state),
+               contact_state_name(old_contact_state), release_reason_name(reason),
+               reason == ReleaseReason::ORIGINAL_DETECTION ||
+                       reason == ReleaseReason::CONTACT_RETURNED_ORIGINAL ? 1 : 0,
+               evidence_detection_index, evidence_box->x1, evidence_box->y1,
+               evidence_box->x2, evidence_box->y2, caller ? caller : "NONE",
+               old_hold, old_not_hold,
+               had_reappear_candidate ? 1 : 0,
+               keep_reopen_anchor ? 1 : 0);
+    } else {
+        trace_("RELEASE",
+               "item=%d old_state=%s old_contact=%s -> NORMAL reason=%s "
+               "original_evidence=0 evidence_index=-1 evidence_box=NONE hold=%d "
+               "not_hold=%d caller=%s candidate_cleared=%d provisional=%d",
+               track.item_id, operation_track_state_name(old_state),
+               contact_state_name(old_contact_state), release_reason_name(reason),
+               old_hold, old_not_hold, caller ? caller : "NONE",
+               had_reappear_candidate ? 1 : 0,
+               keep_reopen_anchor ? 1 : 0);
+    }
+    trace_track_("STATE", track, keep_reopen_anchor
+                 ? "provisional-static-confirmed-awaiting-no-hand"
+                 : "released-with-confirmed-resolution");
 }
 
 void SessionManager::advance_claim_grace_(
@@ -2100,6 +2342,7 @@ void SessionManager::advance_claim_grace_(
             seed_reappear_from_tentative_b(&track);
             printf("[3.0] item#%d 的 B 认领保护期结束，后续可参与唯一仲裁\n",
                    track.item_id);
+            trace_track_("STATE", track, "claim-grace-ended");
         }
     }
 }
@@ -2278,7 +2521,11 @@ void SessionManager::update_existing_hand_tracks_(
                     if (item != working_inventory_.end()) {
                         update_seen(item->second, old_d, 0);
                     }
-                    release_not_held_(track, false);
+                    release_not_held_(track, false,
+                                      ReleaseReason::ORIGINAL_DETECTION,
+                                      old_position_index,
+                                      &old_d.box,
+                                      "hand-track-protected-original");
                 }
             } else if (observed_index >= 0) {
                 const bool touching = hand_touches_detection(
@@ -2375,7 +2622,11 @@ void SessionManager::update_existing_hand_tracks_(
                 track.not_hold_evidence_count >= FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
                 std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
                 if (item != working_inventory_.end()) update_seen(item->second, old_d, 0);
-                release_not_held_(track, false);
+                release_not_held_(track, false,
+                                  ReleaseReason::ORIGINAL_DETECTION,
+                                  old_position_index,
+                                  &old_d.box,
+                                  "hand-track-original");
             }
             continue;
         }
@@ -2458,7 +2709,11 @@ void SessionManager::update_existing_hand_tracks_(
                     }
                     if (hand_moved && track.not_hold_evidence_count >=
                         FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
-                        release_not_held_(track, false);
+                        // 已确认的 blocker 只能说明 C 可能仍在旧位置被遮住，
+                        // 不能替代“C 原位置有独立检测”的静态结论。保留 C
+                        // 的轨迹和无手结算资格，避免之后把同一实体登记为 D。
+                        trace_track_("STATE", track,
+                                     "confirmed-blocker-keeps-unresolved");
                     }
                 } else if (hand_affects(hand_box, track.original_box)) {
                     // 手仍盖在 C 原位置：既不能说明拿起，也不能说明没拿起。
@@ -2485,6 +2740,93 @@ void SessionManager::update_existing_hand_tracks_(
         d.cls_id = track->second.cls_id;
         d.score = 0.0f;
         promote_suspect_(promote_keys[i], d, 0);
+    }
+}
+
+void SessionManager::reopen_released_static_tracks_(
+        const BBox& hand_box, const std::vector<Detection>& detections,
+        const MoveValue& delta) {
+    // 有手阶段已确认“目前仍在原位”的 C 不是一次操作的最终结论。若同一
+    // 只手随后发生有效位移，并且本帧没有 C 自己的唯一原位检测，就把它
+    // 恢复为 HAND_*，从最后一个可靠原位框重新开始记录手部路径。
+    if (move_length(delta) < TRACK_HAND_MOVE_EPS) return;
+
+    const std::set<int> no_claimed_detections;
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (track.is_suspect_new || track.item_id <= 0 ||
+            track.state != OperationTrackState::NORMAL ||
+            track.contact_state != ContactState::NONE ||
+            !track.needs_no_hand_settlement ||
+            track.resolution != ExistingItemResolution::STATIC_CONFIRMED) {
+            continue;
+        }
+        if (unique_detection_at_old_position(detections, no_claimed_detections,
+                                             track) >= 0) {
+            trace_track_("STATE", track,
+                         "provisional-static-kept-by-current-original-detection");
+            continue;
+        }
+
+        const BBox anchor = track.has_last_seen_box ? track.last_seen_box : track.original_box;
+        if (anchor.area() <= 0.0f) {
+            trace_track_("STATE", track,
+                         "cannot-reopen-static-track-without-valid-anchor");
+            continue;
+        }
+
+        released_hand_candidate_ids_.erase(track.item_id);
+        track.state = hand_fully_covers(hand_box, move_box(anchor, delta))
+            ? OperationTrackState::HAND_FULL_BLOCKED
+            : OperationTrackState::HAND_PARTIAL_BLOCKED;
+        track.contact_state = ContactState::NONE;
+        track.resolution = ExistingItemResolution::NONE;
+        track.release_reason = ReleaseReason::NONE;
+        track.needs_no_hand_settlement = true;
+        track.shelter_or_hold = true;
+        track.hold_and_move = false;
+        track.hold_evidence_count = 0;
+        track.not_hold_evidence_count = 0;
+        track.drop_confirmed = false;
+        track.drop_evidence_count = 0;
+        track.claim_grace_remaining = 0;
+        track.has_tentative_b_box = false;
+        track.tentative_b_match_count = 0;
+        track.tentative_b_started_touching_hand = false;
+        track.has_reappear_candidate_box = false;
+        track.reappear_candidate_match_count = 0;
+        track.reappear_candidate_started_touching_hand = false;
+        track.reappearance_pending = true;
+        track.contact_path_ambiguous = false;
+        track.b_claim_ambiguous = false;
+        track.no_hand_candidate_ambiguous = false;
+        track.no_hand_missing_count = 0;
+        track.last_seen_box = anchor;
+        track.has_last_seen_box = true;
+        track.first_hand_block_box = anchor;
+        track.last_hand_block_box = anchor;
+        track.has_first_hand_block_box = true;
+        track.has_last_hand_block_box = true;
+        track.hand_estimate_anchor_box = anchor;
+        track.has_hand_estimate_anchor_box = true;
+        track.move_values.clear();
+        track.track.clear();
+        track.observed_move_values.clear();
+        track.observed_track.clear();
+        track.hand_move_values.clear();
+        track.track.push_back(anchor);
+        track.move_values.push_back(delta);
+        track.track.push_back(estimated_box(track));
+        track.hand_track_start_index = std::max(
+            0, static_cast<int>(hand_track_.size()) - 2);
+        trace_("STATE",
+               "item=%d reopen-after-static-release-lost-original anchor=(%.1f,%.1f,%.1f,%.1f) "
+               "delta=(%.1f,%.1f) expected=(%.1f,%.1f,%.1f,%.1f)",
+               track.item_id, anchor.x1, anchor.y1, anchor.x2, anchor.y2,
+               delta.dx, delta.dy, estimated_box(track).x1, estimated_box(track).y1,
+               estimated_box(track).x2, estimated_box(track).y2);
+        trace_track_("STATE", track, "reopen-after-static-release-lost-original");
     }
 }
 
@@ -2584,9 +2926,19 @@ void SessionManager::scan_or_update_suspects_(
                         track_match_box(c->second.cls_id,
                                         c->second.reappear_candidate_box,
                                         d.cls_id, d.box)) {
-                        update_reappear_candidate(&c->second, d, true);
+                        const bool candidate_ready =
+                            update_reappear_candidate(&c->second, d, true);
+                        trace_("MATCH",
+                               "item=%d detection=%zu source=hand-reappear update=1 count=%d ready=%d",
+                               c->second.item_id, di,
+                               c->second.reappear_candidate_match_count,
+                               candidate_ready ? 1 : 0);
                     } else {
                         start_reappear_candidate(&c->second, d, true);
+                        trace_("MATCH",
+                               "item=%d detection=%zu source=hand-reappear start=1 count=%d",
+                               c->second.item_id, di,
+                               c->second.reappear_candidate_match_count);
                     }
                     claimed_detection_indices->insert(static_cast<int>(di));
                     effective_known_item_owner[c->second.item_id] =
@@ -2699,6 +3051,7 @@ void SessionManager::scan_or_update_suspects_(
         claimed_detection_indices->insert(static_cast<int>(di));
         printf("[3.0] 预登记疑似新物品 D suspect#%d cls=%d source=%s\n",
                key, d.cls_id, suspect_source_name(track.suspect_source));
+        trace_track_("STATE", track_buffer_[key], "create-hand-visible-suspect");
     }
 }
 
@@ -2758,6 +3111,7 @@ void SessionManager::mark_newly_hand_blocked_items_(
         track.item_id = item.item_id;
         track.cls_id = item.cls_id;
         track.original_box = reference;
+        track.needs_no_hand_settlement = true;
         track.shelter_or_hold = true;
         track.claim_grace_remaining = FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES;
         track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
@@ -2789,11 +3143,18 @@ void SessionManager::mark_newly_hand_blocked_items_(
         // 已经放下过又再次被手接触时，覆盖旧运行时记录即可。
         for (std::map<int, OperationTrack>::iterator rt = track_buffer_.begin();
              rt != track_buffer_.end();) {
-            if (rt->second.item_id == item.item_id) rt = track_buffer_.erase(rt);
-            else ++rt;
+            if (rt->second.item_id == item.item_id) {
+                trace_track_("STATE", rt->second,
+                             "replace-runtime-with-new-hand-blocked-track");
+                rt = track_buffer_.erase(rt);
+            } else {
+                ++rt;
+            }
         }
         track_buffer_[item.item_id] = track;
         if (new_existing_track_ids) new_existing_track_ids->insert(item.item_id);
+        trace_track_("STATE", track_buffer_[item.item_id],
+                     "create-hand-blocked-existing-item");
     }
 }
 
@@ -2839,7 +3200,9 @@ void SessionManager::apply_suspect_cover_evidence_(
                     item->second.status = ItemStatus::OCCLUDED;
                     item->second.block_ids.insert(d.item_id);
                 }
-                release_not_held_(c, true);
+                release_not_held_(c, true, ReleaseReason::FULLY_OCCLUDED,
+                                  -1, nullptr,
+                                  "hand-confirmed-full-occlusion");
             }
         }
     }
@@ -2872,6 +3235,9 @@ void SessionManager::process_effective_hand_frame_(
                                         &known_item_owner);
         update_existing_hand_tracks_(hand_box, detections, delta, &claimed,
                                      &known_item_owner);
+        // 原位暂时确认后的 C 若在本帧再次随手离开原位置，必须先恢复
+        // HAND_* 身份链，再让静态预约或 D 扫描处理剩余检测框。
+        reopen_released_static_tracks_(hand_box, detections, delta);
     }
     reserve_visible_known_detections_(hand_box, detections, &claimed,
                                       &known_item_owner);
@@ -2902,13 +3268,26 @@ void SessionManager::register_post_hand_reveal_suspects_(
 
         // 先完成旧 C、已有 D 的认领。剩余 B 若能合理属于任意旧库存或
         // 活动轨迹，也必须保持未决，不能另建一个“全程被挡住的新 D”。
-        if (detection_matches_old_working_inventory(
-                d, working_inventory_, operation_start_inventory_) ||
-            detection_conflicts_with_active_track(d, track_buffer_) ||
-            protected_existing_track_blocks_post_hand_d(d, track_buffer_)) {
+        const bool matches_old_inventory = detection_matches_old_working_inventory(
+            d, working_inventory_, operation_start_inventory_);
+        const bool conflicts_active_track =
+            detection_conflicts_with_active_track(d, track_buffer_);
+        const bool blocked_by_protected_track =
+            protected_existing_track_blocks_post_hand_d(d, track_buffer_);
+        if (matches_old_inventory || conflicts_active_track ||
+            blocked_by_protected_track) {
+            trace_("D-GUARD",
+                   "candidate=%d cls=%d reject=known-old:%d active-track:%d protected:%d",
+                   detection_index, d.cls_id, matches_old_inventory ? 1 : 0,
+                   conflicts_active_track ? 1 : 0,
+                   blocked_by_protected_track ? 1 : 0);
             continue;
         }
-        if (!hand_track_touches_detection(hand_track_, d)) continue;
+        if (!hand_track_touches_detection(hand_track_, d)) {
+            trace_("D-GUARD", "candidate=%d cls=%d reject=outside-hand-track",
+                   detection_index, d.cls_id);
+            continue;
+        }
 
         // 同类旧 C 若在本轮仍没有自己的独立检测/轨迹结论，手离开后
         // 首次出现的 B 也只能保持未决。否则 C 的一次漏检会被误写成
@@ -2923,7 +3302,13 @@ void SessionManager::register_post_hand_reveal_suspects_(
             }
             const OperationTrack* runtime = find_runtime_for_item_(old->first);
             if (runtime && runtime->is_suspect_new) continue;
-            if (runtime && runtime->state == OperationTrackState::PLACED) continue;
+            if (existing_item_resolved_without_current_detection(runtime)) {
+                trace_("D-GUARD",
+                       "candidate=%d cls=%d old=%d disposition=terminal-%s",
+                       detection_index, d.cls_id, old->first,
+                       existing_resolution_name(runtime->resolution));
+                continue;
+            }
             bool independent_detection = false;
             for (size_t oi = 0; oi < detections.size(); ++oi) {
                 if (detections[oi].cls_id != old->second.cls_id ||
@@ -2939,20 +3324,42 @@ void SessionManager::register_post_hand_reveal_suspects_(
                     break;
                 }
             }
-            if ((runtime && (runtime->b_claim_ambiguous ||
-                             runtime->contact_path_ambiguous)) ||
-                (runtime && is_active_runtime_track(*runtime) &&
-                 !independent_detection) ||
-                (!runtime && !independent_detection)) {
+            const bool runtime_ambiguous = runtime &&
+                (runtime->b_claim_ambiguous || runtime->contact_path_ambiguous ||
+                 runtime->no_hand_candidate_ambiguous);
+            // 即使 runtime 指针存在，只要它只是 NORMAL 且没有独立静态框，
+            // 也不能把它当成已解决。STATIC_CONFIRMED 只对当前确有独立框的
+            // 情形成立；离开当前帧后缺少该框仍要阻止同类 D。
+            const bool old_still_unresolved = !independent_detection &&
+                !existing_item_resolved_without_current_detection(runtime);
+            if (runtime_ambiguous || old_still_unresolved) {
+                trace_("D-GUARD",
+                       "candidate=%d cls=%d blocked-by-old=%d independent=%d "
+                       "runtime=%s resolution=%s ambiguous=%d",
+                       detection_index, d.cls_id, old->first,
+                       independent_detection ? 1 : 0,
+                       runtime ? operation_track_state_name(runtime->state) : "NONE",
+                       runtime ? existing_resolution_name(runtime->resolution) : "NONE",
+                       runtime_ambiguous ? 1 : 0);
                 unresolved_same_class_old = true;
                 break;
             }
+            trace_("D-GUARD",
+                   "candidate=%d cls=%d old=%d disposition=independent-static runtime=%s resolution=%s",
+                   detection_index, d.cls_id, old->first,
+                   runtime ? operation_track_state_name(runtime->state) : "NONE",
+                   runtime ? existing_resolution_name(runtime->resolution) : "NONE");
         }
         if (unresolved_same_class_old) {
             printf("[3.0] 手离开后同类旧 C 尚未解决，B cls=%d 保持未决\n",
                    d.cls_id);
+            trace_("D-GUARD", "candidate=%d cls=%d result=keep-unresolved",
+                   detection_index, d.cls_id);
             continue;
         }
+        trace_("D-GUARD",
+               "candidate=%d cls=%d result=create-d all-same-class-old-settled",
+               detection_index, d.cls_id);
 
         OperationTrack track;
         const int key = new_suspect_id_();
@@ -2977,6 +3384,7 @@ void SessionManager::register_post_hand_reveal_suspects_(
         claimed_detection_indices->insert(detection_index);
         printf("[3.0] 手离开后预登记疑似新物品 D suspect#%d cls=%d source=%s\n",
                key, d.cls_id, suspect_source_name(track.suspect_source));
+        trace_track_("D-GUARD", track_buffer_[key], "create-post-hand-reveal-d");
     }
 }
 
@@ -2984,6 +3392,15 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
     std::set<int> claimed;
     std::vector<int> promote_keys;
     std::set<int> discard_keys;
+
+    // “本帧存在无法唯一归属的路径候选”是瞬时证据；每张直接无手帧都重新
+    // 计算，不能让上一帧歧义永久阻塞，也不能把本帧歧义拿去累计 OUT。
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        if (!it->second.is_suspect_new) {
+            it->second.no_hand_candidate_ambiguous = false;
+        }
+    }
 
     // 认领顺序必须是：已有 C -> 没有手离开后新建的已有 D -> 剩余 B 的
     // POST_HAND_REVEAL_D。track_buffer_ 的负 id 是 D，若直接按 map 遍历，
@@ -2993,8 +3410,12 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
         for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
              it != track_buffer_.end(); ++it) {
             OperationTrack& track = it->second;
+            const bool existing_needs_settlement =
+                existing_item_needs_settlement(track);
             if (track.is_suspect_new != process_suspects ||
-                !is_active_runtime_track(track)) continue;
+                (!is_active_runtime_track(track) && !existing_needs_settlement)) {
+                continue;
+            }
 
             // CONTACT_* 在有手阶段保持 state=NORMAL，因此不能落入旧的
             // HAND_* 分支。手离开后只按原位置和真实 observed_track 收尾。
@@ -3021,7 +3442,11 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         std::map<int, InventoryItem>::iterator item =
                             working_inventory_.find(track.item_id);
                         if (item != working_inventory_.end()) update_seen(item->second, d, 0);
-                        release_not_held_(track, false);
+                        release_not_held_(track, false,
+                                          ReleaseReason::CONTACT_RETURNED_ORIGINAL,
+                                          contact_found,
+                                          &d.box,
+                                          "no-hand-contact-returned-original");
                     } else if (was_moving) {
                         std::map<int, InventoryItem>::iterator item =
                             working_inventory_.find(track.item_id);
@@ -3065,8 +3490,10 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 if (has_contact_path_candidate(detections, claimed, track,
                                                working_inventory_)) {
                     track.contact_path_ambiguous = true;
+                    trace_track_("MATCH", track, "contact-path-ambiguous");
                 }
                 // 没有原位置或唯一轨迹 B 时保持未决；不能仅因一帧缺失 OUT。
+                trace_track_("MATCH", track, "contact-no-unique-candidate");
                 continue;
             }
             BBox reference = track.has_placed_box ? track.placed_box : estimated_box(track);
@@ -3175,12 +3602,33 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         if (item != working_inventory_.end()) {
                             update_seen(item->second, provisional, 0);
                         }
-                        release_not_held_(track, false);
+                        release_not_held_(track, false,
+                                          ReleaseReason::ORIGINAL_DETECTION,
+                                          found,
+                                          &provisional.box,
+                                          "no-hand-protected-original");
                     }
                 } else {
                     record_tentative_b(&track, provisional, false);
                     track.reappearance_pending = true;
                 }
+                continue;
+            }
+            if (!track.is_suspect_new && found >= 0 &&
+                !found_at_original_position &&
+                !contact_detection_is_at_original(track, detections[found]) &&
+                detection_strictly_matches_other_item(
+                    detections[found], track.item_id, working_inventory_)) {
+                // A 的预计轨迹可以碰巧经过 B 的原位，但一个完整框若已经
+                // 严格属于另一件旧库存 B，就不能被 A 先抢走。它既不是 A
+                // 的 MOVED 证据，也不是 A 缺失的 OUT 证据，应保持未决。
+                track.reappearance_pending = true;
+                track.no_hand_candidate_ambiguous = true;
+                trace_("MATCH",
+                       "item=%d detection=%d reject=strictly-belongs-to-other-old-item",
+                       track.item_id, found);
+                trace_track_("MATCH", track,
+                             "no-hand-candidate-strictly-belongs-to-other-old-item");
                 continue;
             }
             if (!track.is_suspect_new && found >= 0 &&
@@ -3193,15 +3641,29 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     mark_mature_hand_b_ambiguity(detections[found], &track_buffer_,
                                                   no_known_owner);
                     track.reappearance_pending = true;
+                    track.no_hand_candidate_ambiguous = true;
+                    trace_track_("MATCH", track, "no-hand-shared-candidate");
                     continue;
                 }
                 if (mature_owner >= 0 && mature_owner != track.item_id) {
                     track.reappearance_pending = true;
+                    track.no_hand_candidate_ambiguous = true;
+                    trace_track_("MATCH", track, "no-hand-candidate-owned-by-other-c");
                     continue;
                 }
                 track.b_claim_ambiguous = false;
             }
             if (found < 0) {
+                if (!track.is_suspect_new) {
+                    track.no_hand_candidate_ambiguous =
+                        has_ambiguous_no_hand_reappear_candidate(
+                            detections, claimed, it->first, track,
+                            working_inventory_, track_buffer_);
+                    trace_track_("MATCH", track,
+                                 track.no_hand_candidate_ambiguous
+                                     ? "no-hand-path-ambiguous"
+                                     : "no-hand-no-path-candidate");
+                }
                 // D 必须在后续直接无手帧中连续自匹配。未达到门槛就消失，
                 // 不保留为悬空 IN，更不能让它在后续随机帧重新凑次数。
                 if (track.is_suspect_new &&
@@ -3212,6 +3674,15 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             }
             const Detection& d = detections[found];
             claimed.insert(found);
+            if (!track.is_suspect_new) {
+                track.no_hand_candidate_ambiguous = false;
+                trace_("MATCH",
+                       "item=%d detection=%d source=%s box=(%.1f,%.1f,%.1f,%.1f)",
+                       track.item_id, found,
+                       found_at_original_position ? "ORIGINAL" :
+                           (found_as_reappear_candidate ? "REAPPEAR" : "TRACK"),
+                       d.box.x1, d.box.y1, d.box.x2, d.box.y2);
+            }
 
             if (track.is_suspect_new) {
                 track.last_seen_box = d.box;
@@ -3246,14 +3717,24 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     std::map<int, InventoryItem>::iterator item =
                         working_inventory_.find(track.item_id);
                     if (item != working_inventory_.end()) update_seen(item->second, d, 0);
-                    release_not_held_(track, false);
+                    release_not_held_(track, false,
+                                      ReleaseReason::ORIGINAL_DETECTION,
+                                      found,
+                                      &d.box,
+                                      "no-hand-original");
                 } else {
                     const bool should_observe_candidate =
                         found_as_reappear_candidate || track.reappearance_pending ||
                         track.has_reappear_candidate_box;
                     bool candidate_ready = true;
                     if (should_observe_candidate) {
+                        const bool had_candidate = track.has_reappear_candidate_box;
                         candidate_ready = update_reappear_candidate(&track, d, false);
+                        trace_("MATCH",
+                               "item=%d detection=%d source=no-hand-reappear action=%s count=%d ready=%d",
+                               track.item_id, found, had_candidate ? "update" : "start",
+                               track.reappear_candidate_match_count,
+                               candidate_ready ? 1 : 0);
                     }
                     if (!candidate_ready) continue;
                     track.last_seen_box = d.box;
@@ -3281,6 +3762,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
         if (track == track_buffer_.end()) continue;
         printf("[3.0] suspect#%d 的手离开后完整框未连续确认，丢弃候选\n",
                track->second.suspect_id);
+        trace_track_("STATE", track->second,
+                     "discard-suspect-missing-continuous-no-hand-confirmation");
         if (track->second.promoted_to_working_inventory && track->second.item_id > 0) {
             const int item_id = track->second.item_id;
             working_inventory_.erase(item_id);
@@ -3313,6 +3796,13 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
 
 void SessionManager::mark_pending_out_(int item_id) {
     pending_out_ids_.insert(item_id);
+    OperationTrack* track = find_runtime_for_item_(item_id);
+    if (track && !track->is_suspect_new) {
+        track->resolution = ExistingItemResolution::OUT_CONFIRMED;
+        track->release_reason = ReleaseReason::NONE;
+        track->needs_no_hand_settlement = false;
+        trace_track_("NO-HAND", *track, "confirm-out-after-direct-missing-frames");
+    }
 }
 
 void SessionManager::refresh_confirmed_blockers_(const std::set<int>& /*observed_working_ids*/) {
@@ -3327,22 +3817,37 @@ bool SessionManager::has_unresolved_no_hand_state_(
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
-        if (!is_active_runtime_track(track)) continue;
 
         if (track.is_suspect_new) {
+            if (!is_active_runtime_track(track)) continue;
             // D 只有在至少两张直接无手帧中连续匹配到自己后才可提交 IN。
             // 这是单对象时序证据，不是多检测框投票。
             if (!track.promoted_to_working_inventory || track.item_id <= 0 ||
                 !observed_item_ids.count(track.item_id) ||
                 track.no_hand_self_match_count < FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
                 unresolved = true;
+                trace_track_("NO-HAND", track, "suspect-not-yet-directly-confirmed");
             }
             continue;
         }
 
-        if (track.item_id <= 0 || is_claim_protected(track) ||
-            track.b_claim_ambiguous || track.contact_path_ambiguous) {
+        if (!existing_item_needs_settlement(track)) continue;
+
+        // 状态被意外变成 NORMAL 绝不是“旧 C 已结案”。此时没有可靠活动
+        // 轨迹可安全累计 OUT，必须保持未决并阻止本轮提交。
+        if (!is_active_runtime_track(track)) {
             unresolved = true;
+            trace_track_("NO-HAND", track, "normal-track-still-needs-settlement");
+            continue;
+        }
+
+        if (is_claim_protected(track) || track.b_claim_ambiguous ||
+            track.contact_path_ambiguous || track.no_hand_candidate_ambiguous) {
+            unresolved = true;
+            trace_track_("NO-HAND", track,
+                         track.no_hand_candidate_ambiguous
+                             ? "ambiguous-no-hand-path-candidate"
+                             : "claim-or-contact-ambiguity");
             continue;
         }
         if (observed_item_ids.count(track.item_id)) {
@@ -3351,13 +3856,19 @@ bool SessionManager::has_unresolved_no_hand_state_(
             if (track.has_reappear_candidate_box &&
                 !reappear_candidate_is_confirmed(track)) {
                 unresolved = true;
+                trace_track_("NO-HAND", track, "reappear-candidate-needs-second-frame");
                 continue;
             }
             track.no_hand_missing_count = 0;
+            trace_track_("NO-HAND", track, "directly-observed");
             continue;
         }
         if (fully_occluded_item_ids.count(track.item_id)) {
             track.no_hand_missing_count = 0;
+            track.resolution = ExistingItemResolution::OCCLUDED_CONFIRMED;
+            track.release_reason = ReleaseReason::FULLY_OCCLUDED;
+            track.needs_no_hand_settlement = false;
+            trace_track_("NO-HAND", track, "fully-occluded-by-confirmed-front-item");
             continue;
         }
         if (pending_out_ids_.count(track.item_id)) continue;
@@ -3373,14 +3884,47 @@ bool SessionManager::has_unresolved_no_hand_state_(
             (track.hold_and_move || has_meaningful_hand_move(track));
         if (!contact_out_evidence && !hand_out_evidence) {
             unresolved = true;
+            trace_track_("NO-HAND", track, "missing-without-sufficient-out-evidence");
             continue;
         }
 
+        const int old_missing_count = track.no_hand_missing_count;
         ++track.no_hand_missing_count;
+        trace_("NO-HAND", "item=%d direct-missing-count=%d->%d threshold=%d",
+               track.item_id, old_missing_count, track.no_hand_missing_count,
+               FLOW3_NO_HAND_OUT_MISSING_FRAMES);
+        trace_track_("NO-HAND", track, "direct-missing-frame");
         if (track.no_hand_missing_count >= FLOW3_NO_HAND_OUT_MISSING_FRAMES) {
             mark_pending_out_(track.item_id);
         } else {
             unresolved = true;
+        }
+    }
+
+    // 最终保险：即使此前某个旧 C 的运行时记录已经意外失活，只要同类 D
+    // 要正式 IN，而该旧 C 在本帧没有独立观测/遮挡/已确认结束，仍拒绝提交。
+    for (std::set<int>::const_iterator pending = pending_in_ids_.begin();
+         pending != pending_in_ids_.end(); ++pending) {
+        std::map<int, InventoryItem>::const_iterator d = working_inventory_.find(*pending);
+        if (d == working_inventory_.end()) continue;
+        for (std::map<int, InventoryItem>::const_iterator old =
+                 operation_start_inventory_.begin();
+             old != operation_start_inventory_.end(); ++old) {
+            if (old->second.cls_id != d->second.cls_id ||
+                pending_out_ids_.count(old->first) ||
+                observed_item_ids.count(old->first) ||
+                fully_occluded_item_ids.count(old->first)) {
+                continue;
+            }
+            const OperationTrack* runtime = find_runtime_for_item_(old->first);
+            if (existing_item_resolved_without_current_detection(runtime)) continue;
+            unresolved = true;
+            trace_("SETTLE",
+                   "block-commit pending-d=%d cls=%d unresolved-old=%d runtime=%s resolution=%s",
+                   *pending, d->second.cls_id, old->first,
+                   runtime ? operation_track_state_name(runtime->state) : "NONE",
+                   runtime ? existing_resolution_name(runtime->resolution) : "NONE");
+            break;
         }
     }
     return unresolved;
@@ -3592,6 +4136,10 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     }
 
     if (has_unresolved_state) {
+        trace_("SETTLE",
+               "defer-commit inventory=%zu tracks=%zu pending-in=%zu pending-out=%zu",
+               final_items.size(), track_buffer_.size(), pending_in_ids_.size(),
+               pending_out_ids_.size());
         return result;
     }
 
@@ -3653,7 +4201,30 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         if (observation_owner[si] < 0) {
             printf("[3.0] 无手直接帧出现未绑定检测 cls=%d；没有 D 证据链，不自动 IN\n",
                    observed[si].cls_id);
+            trace_("SETTLE", "unbound-detection=%zu cls=%d result=no-auto-in",
+                   si, observed[si].cls_id);
         }
+    }
+
+    trace_("SETTLE",
+           "commit inventory-before=%zu inventory-after=%zu events=%zu pending-in=%zu pending-out=%zu",
+           inventory_.size(), final_items.size(), events.size(), pending_in_ids_.size(),
+           pending_out_ids_.size());
+    for (std::map<int, OperationTrack>::const_iterator track = track_buffer_.begin();
+         track != track_buffer_.end(); ++track) {
+        trace_track_("SETTLE", track->second, "commit-final-track");
+    }
+    for (size_t event_index = 0; event_index < events.size(); ++event_index) {
+        const InventoryEvent& event = events[event_index];
+        trace_("SETTLE",
+               "event=%s item=%d cls=%d box=(%.1f,%.1f,%.1f,%.1f) "
+               "before=(%.1f,%.1f,%.1f,%.1f) after=(%.1f,%.1f,%.1f,%.1f)",
+               event_kind_name(event.kind), event.item_id, event.cls_id,
+               event.box.x1, event.box.y1, event.box.x2, event.box.y2,
+               event.before_box.x1, event.before_box.y1,
+               event.before_box.x2, event.before_box.y2,
+               event.after_box.x1, event.after_box.y1,
+               event.after_box.x2, event.after_box.y2);
     }
 
     inventory_.replace_all(final_items, working_next_item_id_);
@@ -3666,6 +4237,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
 }
 
 void SessionManager::clear_runtime_after_commit_() {
+    trace_("STATE", "clear-operation-runtime-after-commit");
     reset_operation_runtime_();
 }
 
@@ -3694,9 +4266,18 @@ FrameProcessResult SessionManager::process_frame(
         const std::vector<Detection>& food_detections,
         const std::vector<BBox>& hand_boxes, int frame_id, long long time_ms) {
     FrameProcessResult output;
+    trace_frame_id_ = frame_id;
+    trace_hand_phase_ = !hand_boxes.empty();
     current_time_ms_ = time_ms;
     hand_present_ = !hand_boxes.empty();
-    if (!session_active_) return output;
+    if (!session_active_) {
+        trace_("FRAME", "ignore-inactive-session foods=%zu hands=%zu",
+               food_detections.size(), hand_boxes.size());
+        return output;
+    }
+    trace_("FRAME", "foods=%zu hands=%zu operation_active=%d tracks=%zu no_hand_streak=%d",
+           food_detections.size(), hand_boxes.size(),
+           working_inventory_active_ ? 1 : 0, track_buffer_.size(), no_hand_streak_);
 
     if (hand_present_) {
         finalize_initial_check_before_hand_();
@@ -3720,6 +4301,7 @@ FrameProcessResult SessionManager::process_frame(
         }
         if (!has_active_runtime && has_old_hand_box_ &&
             hand_boxes_effectively_same(old_hand_box_, hand)) {
+            trace_("FRAME", "skip-stationary-hand-no-active-track");
             return output;
         }
         process_effective_hand_frame_(hand, food_detections, false);

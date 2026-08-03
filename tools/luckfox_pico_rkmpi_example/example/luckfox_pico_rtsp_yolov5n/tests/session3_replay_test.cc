@@ -1129,6 +1129,136 @@ void test_c_reappear_commits_after_second_direct_frame() {
     assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
 }
 
+// 细节8-7.1：A 被移动到同类 B 旁边时，B 的独立原位框必须仍属于 B，
+// A 则沿自己的 HAND 路径在无手帧完成 MOVED；不能增加同类 D，也不能 OUT A。
+void test_active_a_moves_next_to_static_same_class_b() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // A
+    initial.push_back(item(2, 0, 420, 100, 520, 200));  // B
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 420, 100, 520, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    std::vector<fridge::Detection> moved_once;
+    moved_once.push_back(det(0, 200, 100, 300, 200));
+    moved_once.push_back(det(0, 420, 100, 520, 200));
+    send_frame(&session, moved_once,
+               std::vector<fridge::BBox>(1, fridge::BBox(180, 80, 320, 220)), &frame);
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(det(0, 300, 100, 400, 200));
+    final_boxes.push_back(det(0, 420, 100, 520, 200));
+    send_frame(&session, final_boxes,
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 80, 420, 220)), &frame);
+
+    fridge::SettlementResult result = settle_after_hand(&session, final_boxes, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 3));
+}
+
+// 细节8-7.2 的自然时序：A 先连续两帧被直接看到仍在原位，触发暂时的
+// STATIC_CONFIRMED；手尚未离开就再次移动，A 在旧位置消失。此时必须重新
+// 激活 A 的轨迹，最终认回移动后的 A，而不是把它登记成新的同类 D。
+void test_provisional_static_a_reopens_when_moved_later_in_same_operation() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // A
+    initial.push_back(item(2, 0, 700, 100, 800, 200));  // B，远离 A 的移动路径
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 700, 100, 800, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    // t0/t1/t2：手移动，但 A 的独立完整框一直在原位。t2 后 A 应仅是
+    // 有手阶段的暂时静态确认，仍须等待无手结算或后续重新激活。
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(100, 80, 240, 220)), &frame);
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(120, 80, 260, 220)), &frame);
+    const fridge::OperationTrack& temporarily_static =
+        session.operation_tracks().find(1)->second;
+    assert(temporarily_static.state == fridge::OperationTrackState::NORMAL);
+    assert(temporarily_static.resolution == fridge::ExistingItemResolution::STATIC_CONFIRMED);
+    assert(temporarily_static.needs_no_hand_settlement);
+
+    // t3：同一次手操作再次移动，A 暂时完全被挡住；B 仍有自己的原位框。
+    std::vector<fridge::Detection> only_b;
+    only_b.push_back(det(0, 700, 100, 800, 200));
+    send_frame(&session, only_b,
+               std::vector<fridge::BBox>(1, fridge::BBox(240, 80, 380, 220)), &frame);
+    const fridge::OperationTrack& reopened = session.operation_tracks().find(1)->second;
+    assert(reopened.state != fridge::OperationTrackState::NORMAL);
+    assert(reopened.resolution == fridge::ExistingItemResolution::NONE);
+    assert(reopened.needs_no_hand_settlement);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(det(0, 220, 100, 320, 200));
+    final_boxes.push_back(det(0, 700, 100, 800, 200));
+    fridge::SettlementResult result = settle_after_hand(&session, final_boxes, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 3));
+}
+
+// 细节8-7.4：A 向同类 B 靠近后，YOLO 只剩一个既严格属于 B、又落在 A
+// 路径附近的合并框。它不能被强认给 A，也不能作为 A 缺失的 OUT 证据。
+void test_same_class_merged_box_keeps_active_a_unresolved() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // A
+    initial.push_back(item(2, 0, 340, 100, 440, 200));  // B
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 340, 100, 440, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 340, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 80, 420, 220)), &frame);
+
+    const std::vector<fridge::Detection> merged_or_b_only(
+        1, det(0, 340, 100, 440, 200));
+    fridge::SettlementResult result = settle_after_hand(
+        &session, merged_or_b_only, &frame);
+    assert(!result.committed);
+    assert(session.operation_pending());
+    assert(session.inventory().size() == 2);
+    assert(!has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 3));
+}
+
 // OUT 同样使用连续的无手直接缺失证据：首张缺失保留工作库存，第二张才
 // 可以结束这次操作并提交 OUT。
 void test_out_requires_two_direct_missing_frames() {
@@ -1273,6 +1403,9 @@ int main() {
     test_stationary_hand_frame_does_not_change_hand_evidence();
     test_post_hand_reveal_commits_on_second_direct_frame();
     test_c_reappear_commits_after_second_direct_frame();
+    test_active_a_moves_next_to_static_same_class_b();
+    test_provisional_static_a_reopens_when_moved_later_in_same_operation();
+    test_same_class_merged_box_keeps_active_a_unresolved();
     test_out_requires_two_direct_missing_frames();
     test_no_hand_occlusion_uses_cover_union();
     return 0;
