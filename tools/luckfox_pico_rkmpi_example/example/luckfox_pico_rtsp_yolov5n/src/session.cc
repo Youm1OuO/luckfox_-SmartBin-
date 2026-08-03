@@ -1,6 +1,6 @@
 // ============================================================================
 //  session.cc
-//  3.0：工作库存 + HAND_* 候选 + 疑似新物品 D + 无手稳定快照提交
+//  3.0：工作库存 + HAND_* 候选 + 疑似新物品 D + 无手逐帧条件提交
 // ============================================================================
 #include "session.h"
 #include "fridge_config.h"
@@ -44,10 +44,6 @@ bool strict_match(const InventoryItem& item, const Detection& observed) {
     return strict_match_box(item.cls_id, item.box, observed.cls_id, observed.box);
 }
 
-bool strict_match(const InventoryItem& item, const VotingItem& observed) {
-    return strict_match_box(item.cls_id, item.box, observed.cls_id, observed.box);
-}
-
 bool partial_match_box(int cls_id, const BBox& reference,
                        int observed_cls_id, const BBox& observed,
                        float iom_threshold = INVENTORY_PARTIAL_IOM) {
@@ -59,14 +55,10 @@ bool partial_match(const InventoryItem& item, const Detection& observed) {
     return partial_match_box(item.cls_id, item.box, observed.cls_id, observed.box);
 }
 
-bool partial_match(const InventoryItem& item, const VotingItem& observed) {
-    return partial_match_box(item.cls_id, item.box, observed.cls_id, observed.box);
-}
-
 // 仅用于“手正在遮挡”的逐帧认领。被手挡住时，YOLO 经常只给出原物品的一部分，
 // 用普通 partial_match 的高 IoM 阈值会把已有 C 错当成新的 D。这里仍要求：
 // 同类、局部框有足够部分落在旧框内、局部框不会比旧框异常大、中心也不能太远。
-// 它不是无手稳定快照的身份匹配，绝不能在别处滥用。
+// 它不是无手收尾阶段的身份匹配，绝不能在别处滥用。
 bool hand_partial_match_box(int cls_id, const BBox& reference,
                             int observed_cls_id, const BBox& observed) {
     if (cls_id != observed_cls_id || reference.area() <= 0.0f ||
@@ -246,7 +238,7 @@ bool reappear_candidate_is_confirmed(const OperationTrack& track) {
 
 // 这不是普通身份匹配，也不直接更新库存：它只回答“同类 B 是否仍在 C 的
 // 完整候选路径附近，值得先暂存为 C 的重新出现候选”。相比正常轨迹匹配略宽，
-// 是为了抵抗有效帧间的手框/YOLO 跳动；随后仍有二次自匹配和稳定快照两层约束。
+// 是为了抵抗有效帧间的手框/YOLO 跳动；随后仍有二次自匹配和无手收尾约束。
 bool reappear_candidate_path_matches(const OperationTrack& track,
                                      const Detection& observed) {
     if (track.cls_id != observed.cls_id || observed.box.area() <= 0.0f) {
@@ -327,6 +319,13 @@ float move_length(const MoveValue& delta) {
     return std::sqrt(delta.dx * delta.dx + delta.dy * delta.dy);
 }
 
+bool has_meaningful_hand_move(const OperationTrack& track) {
+    for (size_t i = 0; i < track.move_values.size(); ++i) {
+        if (move_length(track.move_values[i]) >= TRACK_HAND_MOVE_EPS) return true;
+    }
+    return false;
+}
+
 InventoryItem make_inventory_item(int item_id, const Detection& detection,
                                   int frame_id, long long time_ms) {
     InventoryItem item;
@@ -342,30 +341,9 @@ InventoryItem make_inventory_item(int item_id, const Detection& detection,
     return item;
 }
 
-InventoryItem make_inventory_item(int item_id, const VotingItem& detection,
-                                  int frame_id, long long time_ms) {
-    InventoryItem item;
-    item.item_id = item_id;
-    item.cls_id = detection.cls_id;
-    item.box = detection.box;
-    item.base_box = detection.box;
-    item.score = detection.best_score;
-    item.status = ItemStatus::VISIBLE;
-    item.created_frame = frame_id;
-    item.updated_frame = frame_id;
-    item.created_time_ms = time_ms;
-    return item;
-}
-
 void update_seen(InventoryItem& item, const Detection& detection, int frame_id) {
     item.box = detection.box;
     item.score = detection.score;
-    item.updated_frame = frame_id;
-}
-
-void update_seen(InventoryItem& item, const VotingItem& detection, int frame_id) {
-    item.box = detection.box;
-    item.score = detection.best_score;
     item.updated_frame = frame_id;
 }
 
@@ -845,7 +823,7 @@ float suspect_d_reappearance_path_cost(const OperationTrack& track,
 
 // 无手首帧可能才第一次看见 B，因此没有“贴手”这一强证据。这里只允许
 // 唯一 C 在完整候选路径附近认领它，并排除严格属于另一件旧库存的框；后续仍
-// 必须通过 candidate 自匹配和稳定快照，不能在这一帧直接提交移动。
+// 必须通过 candidate 自匹配和后续无手直接帧，不能在这一帧直接提交移动。
 int unique_no_hand_reappear_detection_for_track(
         const std::vector<Detection>& detections, const std::set<int>& claimed,
         int runtime_key, const OperationTrack& track,
@@ -1133,6 +1111,29 @@ bool detection_matches_old_working_inventory(
     return false;
 }
 
+// 当前直接检测框即使同时落入新 D 的宽松范围，只要它在本次操作开始前的
+// 旧库存中只有一个严格/局部来源，就优先还给该旧 C。多个旧 C 都合理时
+// 返回 false，保留同类歧义而不按遍历顺序强行认领。
+bool has_unique_operation_start_owner(
+        const Detection& detection, int item_id,
+        const std::map<int, InventoryItem>& operation_start) {
+    int owner = -1;
+    for (std::map<int, InventoryItem>::const_iterator it = operation_start.begin();
+         it != operation_start.end(); ++it) {
+        const BBox reference = it->second.base_box.area() > 0.0f
+            ? it->second.base_box : it->second.box;
+        if (!strict_match_box(it->second.cls_id, reference,
+                              detection.cls_id, detection.box) &&
+            !partial_match_box(it->second.cls_id, reference,
+                               detection.cls_id, detection.box)) {
+            continue;
+        }
+        if (owner >= 0) return false;
+        owner = it->first;
+    }
+    return owner == item_id;
+}
+
 bool detection_conflicts_with_active_track(
         const Detection& detection,
         const std::map<int, OperationTrack>& tracks) {
@@ -1189,6 +1190,21 @@ void reserve_unique_no_hand_static_inventory_detections(
             if (current == working.end()) continue;
             const BBox reference = current->second.base_box.area() > 0.0f
                 ? current->second.base_box : current->second.box;
+            bool already_claimed_for_item = false;
+            for (std::set<int>::const_iterator claimed_index = claimed->begin();
+                 claimed_index != claimed->end(); ++claimed_index) {
+                if (*claimed_index < 0 ||
+                    static_cast<size_t>(*claimed_index) >= detections.size()) {
+                    continue;
+                }
+                if (strict_match_box(current->second.cls_id, reference,
+                                     detections[*claimed_index].cls_id,
+                                     detections[*claimed_index].box)) {
+                    already_claimed_for_item = true;
+                    break;
+                }
+            }
+            if (already_claimed_for_item) continue;
             int only_detection = -1;
             for (size_t di = 0; di < detections.size(); ++di) {
                 const int index = static_cast<int>(di);
@@ -1259,28 +1275,28 @@ bool hand_boxes_effectively_same(const BBox& a, const BBox& b) {
            std::fabs(a.y2 - b.y2) <= HAND_MICRO_MOVE_SKIP_EPS;
 }
 
-// 给稳定快照建立严格的一对一绑定：只有 item 和 snapshot 两侧都唯一才绑定。
+// 给当前无手帧建立严格的一对一绑定：只有 item 和 detection 两侧都唯一才绑定。
 void bind_mutually_unique(const std::map<int, InventoryItem>& items,
                           const std::set<int>& candidate_item_ids,
-                          const std::vector<VotingItem>& observed,
+                          const std::vector<Detection>& observed,
                           std::map<int, BBox>* references,
-                          std::map<int, int>* item_to_snapshot,
-                          std::vector<int>* snapshot_owner,
+                          std::map<int, int>* item_to_observation,
+                          std::vector<int>* observation_owner,
                           bool track_mode, bool partial_mode) {
     bool made_progress = true;
     while (made_progress) {
         made_progress = false;
         std::map<int, std::vector<int> > item_candidates;
-        std::vector<std::vector<int> > snapshot_candidates(observed.size());
+        std::vector<std::vector<int> > observation_candidates(observed.size());
         for (std::set<int>::const_iterator id = candidate_item_ids.begin();
              id != candidate_item_ids.end(); ++id) {
-            if (item_to_snapshot->count(*id)) continue;
+            if (item_to_observation->count(*id)) continue;
             std::map<int, InventoryItem>::const_iterator item_it = items.find(*id);
             if (item_it == items.end()) continue;
             const BBox reference = references->count(*id) ? (*references)[*id] :
                 item_it->second.box;
             for (size_t si = 0; si < observed.size(); ++si) {
-                if ((*snapshot_owner)[si] >= 0 || observed[si].cls_id != item_it->second.cls_id) {
+                if ((*observation_owner)[si] >= 0 || observed[si].cls_id != item_it->second.cls_id) {
                     continue;
                 }
                 bool matched = false;
@@ -1296,16 +1312,16 @@ void bind_mutually_unique(const std::map<int, InventoryItem>& items,
                 }
                 if (!matched) continue;
                 item_candidates[*id].push_back(static_cast<int>(si));
-                snapshot_candidates[si].push_back(*id);
+                observation_candidates[si].push_back(*id);
             }
         }
         for (std::map<int, std::vector<int> >::const_iterator it = item_candidates.begin();
              it != item_candidates.end(); ++it) {
             if (it->second.size() != 1) continue;
             const int si = it->second.front();
-            if (snapshot_candidates[si].size() != 1 || (*snapshot_owner)[si] >= 0) continue;
-            (*item_to_snapshot)[it->first] = si;
-            (*snapshot_owner)[si] = it->first;
+            if (observation_candidates[si].size() != 1 || (*observation_owner)[si] >= 0) continue;
+            (*item_to_observation)[it->first] = si;
+            (*observation_owner)[si] = it->first;
             made_progress = true;
         }
     }
@@ -1320,20 +1336,16 @@ const OperationTrack* find_track_for_item(
     return nullptr;
 }
 
-// 返回快照框到该物品“完整候选轨迹”的最小匹配代价。它只在终点严格匹配
+// 返回当前无手检测到该物品“完整候选轨迹”的最小匹配代价。它只在终点严格匹配
 // 和原位置回查都没有解决时使用，避免把手持物体在路径中途放下的情况误判 OUT。
 float track_path_match_cost(const InventoryItem& item, const OperationTrack& track,
-                            const VotingItem& observed) {
+                            const Detection& observed) {
     if (item.cls_id != observed.cls_id || track.cls_id != observed.cls_id) {
         return std::numeric_limits<float>::infinity();
     }
     float best_cost = std::numeric_limits<float>::infinity();
     if (!track.observed_track.empty()) {
-        Detection detection;
-        detection.cls_id = observed.cls_id;
-        detection.box = observed.box;
-        detection.score = observed.best_score;
-        best_cost = contact_path_match_cost(track, detection);
+        best_cost = contact_path_match_cost(track, observed);
     }
     for (size_t pi = 0; pi < track.track.size(); ++pi) {
         const BBox& reference = track.track[pi];
@@ -1350,7 +1362,7 @@ float track_path_match_cost(const InventoryItem& item, const OperationTrack& tra
         best_cost = std::min(best_cost, cost);
     }
     // 重新出现 B 已经连续自匹配后，它是实际观测位置，优先级高于纯手位移
-    // 推算出来的完整路径点；仍只作为稳定快照的候选绑定，不单帧提交。
+    // 推算出来的完整路径点；仍只作为当前无手帧的候选绑定，不单帧提交。
     if (reappear_candidate_is_confirmed(track)) {
         const BBox& reference = track.reappear_candidate_box;
         float cost = std::numeric_limits<float>::infinity();
@@ -1374,53 +1386,53 @@ float track_path_match_cost(const InventoryItem& item, const OperationTrack& tra
 void bind_mutually_unique_track_paths(
         const std::map<int, InventoryItem>& items,
         const std::set<int>& candidate_item_ids,
-        const std::vector<VotingItem>& observed,
+        const std::vector<Detection>& observed,
         const std::map<int, OperationTrack>& tracks,
-        std::map<int, int>* item_to_snapshot,
-        std::vector<int>* snapshot_owner) {
+        std::map<int, int>* item_to_observation,
+        std::vector<int>* observation_owner) {
     bool made_progress = true;
     while (made_progress) {
         made_progress = false;
-        std::map<int, int> best_snapshot_for_item;
+        std::map<int, int> best_observation_for_item;
         std::set<int> tied_items;
-        std::map<int, std::vector<std::pair<int, float> > > candidates_for_snapshot;
+        std::map<int, std::vector<std::pair<int, float> > > candidates_for_observation;
 
         for (std::set<int>::const_iterator id = candidate_item_ids.begin();
              id != candidate_item_ids.end(); ++id) {
-            if (item_to_snapshot->count(*id)) continue;
+            if (item_to_observation->count(*id)) continue;
             std::map<int, InventoryItem>::const_iterator item = items.find(*id);
             const OperationTrack* track = find_track_for_item(tracks, *id);
             if (item == items.end() || !track || track->track.empty()) continue;
 
             float best_cost = std::numeric_limits<float>::infinity();
-            int best_snapshot = -1;
+            int best_observation = -1;
             bool tied = false;
             for (size_t si = 0; si < observed.size(); ++si) {
-                if ((*snapshot_owner)[si] >= 0) continue;
+                if ((*observation_owner)[si] >= 0) continue;
                 const float cost = track_path_match_cost(item->second, *track, observed[si]);
                 if (!(cost < std::numeric_limits<float>::infinity())) continue;
-                candidates_for_snapshot[static_cast<int>(si)].push_back(
+                candidates_for_observation[static_cast<int>(si)].push_back(
                     std::make_pair(*id, cost));
                 if (cost + 0.0001f < best_cost) {
                     best_cost = cost;
-                    best_snapshot = static_cast<int>(si);
+                    best_observation = static_cast<int>(si);
                     tied = false;
                 } else if (std::fabs(cost - best_cost) <= 0.0001f) {
                     tied = true;
                 }
             }
-            if (best_snapshot >= 0 && !tied) {
-                best_snapshot_for_item[*id] = best_snapshot;
-            } else if (best_snapshot >= 0) {
+            if (best_observation >= 0 && !tied) {
+                best_observation_for_item[*id] = best_observation;
+            } else if (best_observation >= 0) {
                 tied_items.insert(*id);
             }
         }
 
-        std::map<int, int> best_item_for_snapshot;
-        std::set<int> tied_snapshots;
+        std::map<int, int> best_item_for_observation;
+        std::set<int> tied_observations;
         for (std::map<int, std::vector<std::pair<int, float> > >::const_iterator si =
-                 candidates_for_snapshot.begin();
-             si != candidates_for_snapshot.end(); ++si) {
+                 candidates_for_observation.begin();
+             si != candidates_for_observation.end(); ++si) {
             float best_cost = std::numeric_limits<float>::infinity();
             int best_item = -1;
             bool tied = false;
@@ -1436,23 +1448,23 @@ void bind_mutually_unique_track_paths(
                 }
             }
             if (best_item >= 0 && !tied) {
-                best_item_for_snapshot[si->first] = best_item;
+                best_item_for_observation[si->first] = best_item;
             } else if (best_item >= 0) {
-                tied_snapshots.insert(si->first);
+                tied_observations.insert(si->first);
             }
         }
 
-        for (std::map<int, int>::const_iterator item = best_snapshot_for_item.begin();
-             item != best_snapshot_for_item.end(); ++item) {
-            const int snapshot_index = item->second;
-            if (tied_items.count(item->first) || tied_snapshots.count(snapshot_index) ||
-                (*snapshot_owner)[snapshot_index] >= 0 ||
-                !best_item_for_snapshot.count(snapshot_index) ||
-                best_item_for_snapshot[snapshot_index] != item->first) {
+        for (std::map<int, int>::const_iterator item = best_observation_for_item.begin();
+             item != best_observation_for_item.end(); ++item) {
+            const int observation_index = item->second;
+            if (tied_items.count(item->first) || tied_observations.count(observation_index) ||
+                (*observation_owner)[observation_index] >= 0 ||
+                !best_item_for_observation.count(observation_index) ||
+                best_item_for_observation[observation_index] != item->first) {
                 continue;
             }
-            (*item_to_snapshot)[item->first] = snapshot_index;
-            (*snapshot_owner)[snapshot_index] = item->first;
+            (*item_to_observation)[item->first] = observation_index;
+            (*observation_owner)[observation_index] = item->first;
             made_progress = true;
         }
     }
@@ -1460,7 +1472,7 @@ void bind_mutually_unique_track_paths(
 
 }  // namespace
 
-SessionManager::SessionManager() : no_hand_buffer_(SNAPSHOT_N, SNAPSHOT_S) {}
+SessionManager::SessionManager() {}
 
 void SessionManager::rebuild_persistent_item_index_() {
     item_by_id_.clear();
@@ -1483,7 +1495,6 @@ void SessionManager::reset_operation_runtime_() {
     hand_track_.clear();
     has_old_hand_box_ = false;
     next_suspect_id_ = -1;
-    no_hand_buffer_.reset();
     no_hand_streak_ = 0;
 }
 
@@ -1532,8 +1543,8 @@ void SessionManager::init_from_backend(const std::vector<InventoryItem>& items,
 void SessionManager::mark_backend_unavailable() {
     if (!session_active_ || has_local_inventory_) return;
     backend_status_ = BackendStatus::NO_TRUSTED_BACKEND;
-    initial_check_state_ = ALLOW_SNAPSHOT_BOOTSTRAP_WHEN_BACKEND_UNAVAILABLE
-        ? InitialCheckState::BOOTSTRAP_FROM_SNAPSHOT : InitialCheckState::NONE;
+    initial_check_state_ = ALLOW_INITIAL_FRAME_BOOTSTRAP_WHEN_BACKEND_UNAVAILABLE
+        ? InitialCheckState::BOOTSTRAP_FROM_FRAME : InitialCheckState::NONE;
 }
 
 void SessionManager::finish_session(long long time_ms) {
@@ -1546,7 +1557,6 @@ void SessionManager::finish_session(long long time_ms) {
 }
 
 void SessionManager::begin_closing_guard() {
-    no_hand_buffer_.reset();
     has_old_hand_box_ = false;
 }
 
@@ -1555,57 +1565,48 @@ void SessionManager::resume_after_false_closing() {
     if (working_inventory_active_) reset_operation_runtime_();
 }
 
-void SessionManager::validate_initial_snapshot_(const Snapshot& snapshot) const {
+void SessionManager::validate_initial_no_hand_frame_(
+        const std::vector<Detection>& detections) const {
     int matched = 0;
-    for (size_t si = 0; si < snapshot.items.size(); ++si) {
+    for (size_t si = 0; si < detections.size(); ++si) {
         int count = 0;
         for (std::map<int, InventoryItem>::const_iterator it = inventory_.items().begin();
              it != inventory_.items().end(); ++it) {
-            if (strict_match(it->second, snapshot.items[si]) ||
-                partial_match(it->second, snapshot.items[si])) {
+            if (strict_match(it->second, detections[si]) ||
+                partial_match(it->second, detections[si])) {
                 ++count;
             }
         }
         if (count == 1) ++matched;
     }
-    printf("[INIT-CHECK] 首张无手快照校验：%d/%zu 个框可唯一对应；库存未修改\n",
-           matched, snapshot.items.size());
+    printf("[INIT-CHECK] 首张无手帧校验：%d/%zu 个框可唯一对应；库存未修改\n",
+           matched, detections.size());
 }
 
-void SessionManager::initialize_from_bootstrap_snapshot_(const Snapshot& snapshot) {
+void SessionManager::initialize_from_bootstrap_no_hand_frame_(
+        const std::vector<Detection>& detections, int frame_id) {
     std::map<int, InventoryItem> loaded;
     int next_id = inventory_.next_item_id();
-    for (size_t i = 0; i < snapshot.items.size(); ++i) {
-        loaded[next_id] = make_inventory_item(next_id, snapshot.items[i],
-                                               snapshot.frame_id, current_time_ms_);
+    for (size_t i = 0; i < detections.size(); ++i) {
+        loaded[next_id] = make_inventory_item(next_id, detections[i], frame_id,
+                                               current_time_ms_);
         ++next_id;
     }
     inventory_.replace_all(loaded, next_id);
     rebuild_persistent_item_index_();
     has_local_inventory_ = true;
     initial_check_state_ = InitialCheckState::DONE;
-    printf("[INIT] 本地稳定快照建库：%zu 个物品\n", loaded.size());
+    printf("[INIT] 本地首张无手帧建库：%zu 个物品\n", loaded.size());
 }
 
 void SessionManager::finalize_initial_check_before_hand_() {
     if (initial_check_state_ != InitialCheckState::WAITING &&
-        initial_check_state_ != InitialCheckState::BOOTSTRAP_FROM_SNAPSHOT) return;
-    if (no_hand_buffer_.empty()) {
-        if (initial_check_state_ == InitialCheckState::BOOTSTRAP_FROM_SNAPSHOT) {
-            Snapshot empty;
-            empty.valid = true;
-            initialize_from_bootstrap_snapshot_(empty);
-        } else {
-            initial_check_state_ = InitialCheckState::SKIPPED;
-        }
-        return;
-    }
-    Snapshot snapshot = no_hand_buffer_.take_snapshot();
-    if (initial_check_state_ == InitialCheckState::BOOTSTRAP_FROM_SNAPSHOT) {
-        initialize_from_bootstrap_snapshot_(snapshot);
+        initial_check_state_ != InitialCheckState::BOOTSTRAP_FROM_FRAME) return;
+    // 手在任何无手帧前就进入画面时，没有可用于首次校验/建库的直接检测。
+    if (initial_check_state_ == InitialCheckState::BOOTSTRAP_FROM_FRAME) {
+        initialize_from_bootstrap_no_hand_frame_(std::vector<Detection>(), 0);
     } else {
-        validate_initial_snapshot_(snapshot);
-        initial_check_state_ = InitialCheckState::DONE;
+        initial_check_state_ = InitialCheckState::SKIPPED;
     }
 }
 
@@ -1644,7 +1645,6 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     hand_track_.push_back(hand_box);
     old_hand_box_ = hand_box;
     has_old_hand_box_ = true;
-    no_hand_buffer_.reset();
     no_hand_streak_ = 0;
     process_effective_hand_frame_(hand_box, detections, true);
 }
@@ -1910,7 +1910,7 @@ void SessionManager::promote_suspect_(int runtime_key, const Detection& detectio
     const int item_id = working_next_item_id_++;
     working_inventory_[item_id] = make_inventory_item(item_id, detection,
                                                        frame_id, current_time_ms_);
-    // 初次检测可能只是局部框；它只作为临时位置，最终 stable snapshot 会刷新。
+    // 初次检测可能只是局部框；它只作为临时位置，后续无手直接帧会刷新。
     track.item_id = item_id;
     track.promoted_to_working_inventory = true;
     pending_in_ids_.insert(item_id);
@@ -2036,6 +2036,7 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     track.contact_state = ContactState::NONE;
     track.b_claim_ambiguous = false;
     track.claim_grace_remaining = 0;
+    track.no_hand_missing_count = 0;
     track.has_tentative_b_box = false;
     track.tentative_b_match_count = 0;
     track.tentative_b_started_touching_hand = false;
@@ -2075,6 +2076,7 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded) {
     track.hand_move_values.clear();
     track.contact_started_touching_hand = false;
     track.hand_track_start_index = -1;
+    track.no_hand_missing_count = 0;
 }
 
 void SessionManager::advance_claim_grace_(
@@ -2107,6 +2109,9 @@ void SessionManager::update_existing_hand_tracks_(
         const MoveValue& delta, std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner) {
     std::vector<int> promote_keys;
+    // 对 HAND_* + hold_and_move=false，静止手帧只能更新局部观测，不能把
+    // “还在原位”或“跟手移动”当作新的有效证据。
+    const bool hand_moved = move_length(delta) >= TRACK_HAND_MOVE_EPS;
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
@@ -2178,7 +2183,7 @@ void SessionManager::update_existing_hand_tracks_(
         // CONTACT_* 转入 HAND_* 后，B 仍可能与最初 A.box 有较大 IoM。
         // 普通 HAND_* 的“局部重叠即旧位置”规则在这里会把已经推开的 B
         // 误当成 A 原地未动。因此该分支只接受真正仍贴近 original_box 的
-        // 真实框；其他框交给 observed_track / 稳定快照收尾。
+        // 真实框；其他框交给 observed_track / 无手逐帧收尾。
         if (track.has_hand_estimate_anchor_box && old_position_index >= 0 &&
             !contact_detection_is_at_original(
                 track, detections[old_position_index])) {
@@ -2260,11 +2265,13 @@ void SessionManager::update_existing_hand_tracks_(
                 track.has_reappear_candidate_box = false;
                 track.reappear_candidate_match_count = 0;
                 track.reappear_candidate_started_touching_hand = false;
-                ++track.not_hold_evidence_count;
-                track.hold_evidence_count = 0;
+                if (hand_moved) {
+                    ++track.not_hold_evidence_count;
+                    track.hold_evidence_count = 0;
+                }
                 track.last_hand_block_box = old_d.box;
                 track.has_last_hand_block_box = true;
-                if (track.not_hold_evidence_count >=
+                if (hand_moved && track.not_hold_evidence_count >=
                     FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
                     std::map<int, InventoryItem>::iterator item =
                         working_inventory_.find(track.item_id);
@@ -2278,7 +2285,8 @@ void SessionManager::update_existing_hand_tracks_(
                     hand_box, detections[observed_index].box);
                 record_tentative_b(&track, detections[observed_index],
                                    touching);
-                if (old_clean && (touching || track.tentative_b_started_touching_hand)) {
+                if (hand_moved && old_clean &&
+                    (touching || track.tentative_b_started_touching_hand)) {
                     ++track.hold_evidence_count;
                     track.not_hold_evidence_count = 0;
                 }
@@ -2357,11 +2365,14 @@ void SessionManager::update_existing_hand_tracks_(
                 (*known_item_owner)[track.item_id] = old_position_index;
             }
             track.b_claim_ambiguous = false;
-            ++track.not_hold_evidence_count;
-            track.hold_evidence_count = 0;
+            if (hand_moved) {
+                ++track.not_hold_evidence_count;
+                track.hold_evidence_count = 0;
+            }
             track.last_hand_block_box = old_d.box;
             track.has_last_hand_block_box = true;
-            if (track.not_hold_evidence_count >= FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
+            if (hand_moved &&
+                track.not_hold_evidence_count >= FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
                 std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
                 if (item != working_inventory_.end()) update_seen(item->second, old_d, 0);
                 release_not_held_(track, false);
@@ -2386,8 +2397,9 @@ void SessionManager::update_existing_hand_tracks_(
                 }
             }
             // 有手首帧 B 必须贴手才可用这条“候选 B 连续自匹配”链路建立
-            // hold；否则保留到无手稳定快照按更严格的路径规则收尾。
-            if (candidate_ready && track.reappear_candidate_started_touching_hand &&
+            // hold；否则保留到无手逐帧收尾按更严格的路径规则处理。
+            if (hand_moved && candidate_ready &&
+                track.reappear_candidate_started_touching_hand &&
                 old_clean && !detection_strictly_matches_other_item(
                     d, track.item_id, working_inventory_)) {
                 track.hold_evidence_count = std::max(
@@ -2395,7 +2407,8 @@ void SessionManager::update_existing_hand_tracks_(
                     track.reappear_candidate_match_count);
                 track.not_hold_evidence_count = 0;
             }
-            if (track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
+            if (hand_moved &&
+                track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
                 track.hold_and_move = true;
                 track.hold_evidence_count = 0;
                 track.not_hold_evidence_count = 0;
@@ -2411,15 +2424,18 @@ void SessionManager::update_existing_hand_tracks_(
             if (track.item_id > 0) {
                 (*known_item_owner)[track.item_id] = observed_index;
             }
-            ++track.hold_evidence_count;
-            track.not_hold_evidence_count = 0;
+            if (hand_moved) {
+                ++track.hold_evidence_count;
+                track.not_hold_evidence_count = 0;
+            }
             track.last_seen_box = d.box;
             track.has_last_seen_box = true;
             if (hand_touches_detection(hand_box, d.box)) {
                 track.last_hand_block_box = d.box;
                 track.has_last_hand_block_box = true;
             }
-            if (track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
+            if (hand_moved &&
+                track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
                 track.hold_and_move = true;
                 track.hold_evidence_count = 0;
                 track.not_hold_evidence_count = 0;
@@ -2436,18 +2452,23 @@ void SessionManager::update_existing_hand_tracks_(
             if (track.state == OperationTrackState::HAND_FULL_BLOCKED) {
                 if (confirmed_blocker_covers_old_c(
                         track, detections, *known_item_owner, track_buffer_)) {
-                    ++track.not_hold_evidence_count;
-                    track.hold_evidence_count = 0;
-                    if (track.not_hold_evidence_count >=
+                    if (hand_moved) {
+                        ++track.not_hold_evidence_count;
+                        track.hold_evidence_count = 0;
+                    }
+                    if (hand_moved && track.not_hold_evidence_count >=
                         FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
                         release_not_held_(track, false);
                     }
                 } else if (hand_affects(hand_box, track.original_box)) {
                     // 手仍盖在 C 原位置：既不能说明拿起，也不能说明没拿起。
                 } else if (!any_detection_at_old_position(detections, track)) {
-                    ++track.hold_evidence_count;
-                    track.not_hold_evidence_count = 0;
-                    if (track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
+                    if (hand_moved) {
+                        ++track.hold_evidence_count;
+                        track.not_hold_evidence_count = 0;
+                    }
+                    if (hand_moved &&
+                        track.hold_evidence_count >= FLOW3_HOLD_EVIDENCE_REQUIRED) {
                         track.hold_and_move = true;
                         track.hold_evidence_count = 0;
                         track.not_hold_evidence_count = 0;
@@ -2777,7 +2798,8 @@ void SessionManager::mark_newly_hand_blocked_items_(
 }
 
 void SessionManager::apply_suspect_cover_evidence_(
-        const BBox& hand_box, const std::vector<Detection>& /*detections*/) {
+        const BBox& hand_box, const std::vector<Detection>& /*detections*/,
+        bool hand_moved) {
     for (std::map<int, OperationTrack>::const_iterator dit = track_buffer_.begin();
          dit != track_buffer_.end(); ++dit) {
         const OperationTrack& d = dit->second;
@@ -2803,6 +2825,9 @@ void SessionManager::apply_suspect_cover_evidence_(
             const bool d_covers_c = fully_covered_by(c.original_box,
                                                       std::vector<BBox>(1, d_box));
             if (!union_covers_c) continue;
+            // D + 手的并集只能在手实际移动的有效帧中构成 C 的反向证据。
+            // 静止手帧仍属于 HAND_* 的模糊帧，不能改变 hold/not_hold 或释放 C。
+            if (!hand_moved) continue;
             // 尚未连续确认并放下的 D 只是“可能挡住 C”的解释，不能改变 C
             // 的 hold/not-hold 计数；否则一次误检又会把 C 提前释放。
             if (!d.promoted_to_working_inventory || !d.drop_confirmed) continue;
@@ -2830,6 +2855,8 @@ void SessionManager::process_effective_hand_frame_(
         hand_track_.push_back(hand_box);
         append_move_to_existing_hand_tracks_(delta);
     }
+    const bool hand_moved = !first_hand_frame &&
+        move_length(delta) >= TRACK_HAND_MOVE_EPS;
 
     // 先更新已有 HAND_*；随后先为仍稳定可见的旧库存保留本帧自己的
     // 严格框，再处理新进入 HAND_* 的物品。这个先后顺序很关键：若旧
@@ -2854,7 +2881,7 @@ void SessionManager::process_effective_hand_frame_(
                                    &known_item_owner, &new_existing_track_ids);
     scan_or_update_suspects_(hand_box, detections, &claimed, known_item_owner,
                              first_hand_frame);
-    apply_suspect_cover_evidence_(hand_box, detections);
+    apply_suspect_cover_evidence_(hand_box, detections, hand_moved);
     advance_claim_grace_(new_existing_track_ids);
 }
 
@@ -2942,6 +2969,7 @@ void SessionManager::register_post_hand_reveal_suspects_(
         track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
         track.shelter_or_hold = true;
         track.self_match_count = 1;
+        track.no_hand_self_match_count = 1;
         track.hand_track_start_index = 0;
         track.post_hand_reveal_no_hand_streak = no_hand_streak_;
         track.track.push_back(d.box);
@@ -3055,6 +3083,16 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 found = unique_detection_for_box(detections, claimed, track.cls_id,
                                                   track.original_box, true, false);
                 found_at_original_position = found >= 0;
+                if (found < 0) {
+                    const int nearest = best_detection_for_box(
+                        detections, claimed, track.cls_id, track.original_box, true, false);
+                    if (nearest >= 0 && has_unique_operation_start_owner(
+                            detections[nearest], track.item_id,
+                            operation_start_inventory_)) {
+                        found = nearest;
+                        found_at_original_position = true;
+                    }
+                }
                 // 同上：由 CONTACT_* 转来的物品已拥有真实 B 路径。B 与
                 // 原框局部重叠并不等于它仍在原位，必须再检查中心位移。
                 if (track.has_hand_estimate_anchor_box && found >= 0 &&
@@ -3164,12 +3202,10 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 track.b_claim_ambiguous = false;
             }
             if (found < 0) {
-                // POST_HAND_REVEAL_D 的第一张完整 B 就是它唯一的初始证据。
-                // 下一张有效无手帧无法自匹配，说明该 B 不稳定，直接丢弃，
-                // 而不是让它在后续随机帧中重新凑够次数。
-                if (track.is_suspect_new && !track.promoted_to_working_inventory &&
-                    track.suspect_source == SuspectSource::POST_HAND_REVEAL_D &&
-                    no_hand_streak_ > track.post_hand_reveal_no_hand_streak) {
+                // D 必须在后续直接无手帧中连续自匹配。未达到门槛就消失，
+                // 不保留为悬空 IN，更不能让它在后续随机帧重新凑次数。
+                if (track.is_suspect_new &&
+                    track.no_hand_self_match_count < FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
                     discard_keys.insert(it->first);
                 }
                 continue;
@@ -3180,6 +3216,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             if (track.is_suspect_new) {
                 track.last_seen_box = d.box;
                 track.has_last_seen_box = true;
+                ++track.no_hand_self_match_count;
             }
             if (track.is_suspect_new && !track.promoted_to_working_inventory) {
                 ++track.self_match_count;
@@ -3221,7 +3258,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     if (!candidate_ready) continue;
                     track.last_seen_box = d.box;
                     track.has_last_seen_box = true;
-                    if ((track.hold_and_move || !track.move_values.empty()) &&
+                    if ((track.hold_and_move || has_meaningful_hand_move(track)) &&
                         boxes_differ_as_move(track.original_box, d.box)) {
                         confirm_rearrange_(track, d.box, d.score, 0);
                     }
@@ -3244,6 +3281,13 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
         if (track == track_buffer_.end()) continue;
         printf("[3.0] suspect#%d 的手离开后完整框未连续确认，丢弃候选\n",
                track->second.suspect_id);
+        if (track->second.promoted_to_working_inventory && track->second.item_id > 0) {
+            const int item_id = track->second.item_id;
+            working_inventory_.erase(item_id);
+            pending_in_ids_.erase(item_id);
+            confirmed_moved_ids_.erase(item_id);
+            pending_out_ids_.erase(item_id);
+        }
         track_buffer_.erase(track);
     }
 
@@ -3272,18 +3316,85 @@ void SessionManager::mark_pending_out_(int item_id) {
 }
 
 void SessionManager::refresh_confirmed_blockers_(const std::set<int>& /*observed_working_ids*/) {
-    // 最终 stable snapshot 中统一重算。手还在时不按任意框交集写 block_ids，
+    // 最终无手直接帧中统一重算。手还在时不按任意框交集写 block_ids，
     // 避免旧 2.0 版本那种 blocker 不断膨胀的问题。
 }
 
-SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapshot) {
+bool SessionManager::has_unresolved_no_hand_state_(
+        const std::set<int>& observed_item_ids,
+        const std::set<int>& fully_occluded_item_ids) {
+    bool unresolved = false;
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (!is_active_runtime_track(track)) continue;
+
+        if (track.is_suspect_new) {
+            // D 只有在至少两张直接无手帧中连续匹配到自己后才可提交 IN。
+            // 这是单对象时序证据，不是多检测框投票。
+            if (!track.promoted_to_working_inventory || track.item_id <= 0 ||
+                !observed_item_ids.count(track.item_id) ||
+                track.no_hand_self_match_count < FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
+                unresolved = true;
+            }
+            continue;
+        }
+
+        if (track.item_id <= 0 || is_claim_protected(track) ||
+            track.b_claim_ambiguous || track.contact_path_ambiguous) {
+            unresolved = true;
+            continue;
+        }
+        if (observed_item_ids.count(track.item_id)) {
+            // 手离开后首次重新出现的同类 B 仍要在下一张直接无手帧中和
+            // 自己连续匹配。不能让本帧的一对一绑定绕过这条身份确认链路。
+            if (track.has_reappear_candidate_box &&
+                !reappear_candidate_is_confirmed(track)) {
+                unresolved = true;
+                continue;
+            }
+            track.no_hand_missing_count = 0;
+            continue;
+        }
+        if (fully_occluded_item_ids.count(track.item_id)) {
+            track.no_hand_missing_count = 0;
+            continue;
+        }
+        if (pending_out_ids_.count(track.item_id)) continue;
+
+        // CONTACT_CANDIDATE 没有足够的真实移动证据，继续保持未决；只有
+        // CONTACT_MOVING 才可沿实际观察路径累计无手缺失并最终 OUT。
+        const bool contact_out_evidence =
+            track.contact_state == ContactState::CONTACT_MOVING &&
+            track.hold_and_move && !track.observed_move_values.empty();
+        const bool hand_out_evidence =
+            track.contact_state == ContactState::NONE &&
+            track.state != OperationTrackState::NORMAL &&
+            (track.hold_and_move || has_meaningful_hand_move(track));
+        if (!contact_out_evidence && !hand_out_evidence) {
+            unresolved = true;
+            continue;
+        }
+
+        ++track.no_hand_missing_count;
+        if (track.no_hand_missing_count >= FLOW3_NO_HAND_OUT_MISSING_FRAMES) {
+            mark_pending_out_(track.item_id);
+        } else {
+            unresolved = true;
+        }
+    }
+    return unresolved;
+}
+
+SettlementResult SessionManager::settle_no_hand_frame_(
+        const std::vector<Detection>& detections, int frame_id) {
     SettlementResult result;
-    if (!working_inventory_active_ || !snapshot.valid) return result;
+    if (!working_inventory_active_) return result;
 
     std::map<int, InventoryItem> final_items = working_inventory_;
-    std::vector<VotingItem> observed = snapshot.items;
-    std::vector<int> snapshot_owner(observed.size(), -1);
-    std::map<int, int> item_to_snapshot;
+    const std::vector<Detection>& observed = detections;
+    std::vector<int> observation_owner(observed.size(), -1);
+    std::map<int, int> item_to_observation;
     std::map<int, BBox> references;
     std::set<int> track_priority_ids;
     std::set<int> ambiguous_ids;
@@ -3321,7 +3432,7 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
             (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first) ||
             (!runtime_in_claim_grace && runtime && (runtime->hold_and_move ||
                          runtime->contact_state != ContactState::NONE ||
-                         (!runtime->move_values.empty() &&
+                         (has_meaningful_hand_move(*runtime) &&
                           runtime->state != OperationTrackState::NORMAL))))) {
             track_priority_ids.insert(it->first);
         }
@@ -3353,29 +3464,29 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
 
     // 绑定顺序：已确认移动/新 D 的终点 -> 普通严格匹配 -> 局部匹配。
     bind_mutually_unique(final_items, track_priority_ids, observed,
-                         &references, &item_to_snapshot, &snapshot_owner, true, false);
+                         &references, &item_to_observation, &observation_owner, true, false);
     bind_mutually_unique(final_items, all_ids, observed,
-                         &references, &item_to_snapshot, &snapshot_owner, false, false);
+                         &references, &item_to_observation, &observation_owner, false, false);
     // 若物品在手尚未离开时已经掉队并停在候选路径中段，终点框不会命中；
     // 在原位置回查前再做一次整条 path 的唯一最近绑定，避免这类物品被 OUT。
     bind_mutually_unique_track_paths(final_items, track_priority_ids, observed,
-                                     track_buffer_, &item_to_snapshot, &snapshot_owner);
+                                     track_buffer_, &item_to_observation, &observation_owner);
     // 再回查旧位置。这样 hold_and_move 尚未凑满、或只被手短暂擦过的
     // 物品，只要在原位重新出现，就不会因为轨迹参考框漂移而被误判出库。
     bind_mutually_unique(final_items, original_position_ids, observed,
-                         &original_references, &item_to_snapshot, &snapshot_owner,
+                         &original_references, &item_to_observation, &observation_owner,
                          false, false);
     bind_mutually_unique(final_items, original_position_ids, observed,
-                         &original_references, &item_to_snapshot, &snapshot_owner,
+                         &original_references, &item_to_observation, &observation_owner,
                          false, true);
     bind_mutually_unique(final_items, all_ids, observed,
-                         &references, &item_to_snapshot, &snapshot_owner, false, true);
+                         &references, &item_to_observation, &observation_owner, false, true);
 
-    // 文档允许 HAND_* 下尚未来得及凑满两次证据的物品，在手离开后的稳定
-    // 快照中由自己的候选轨迹补确认整理。这里仍要求它命中了自己的轨迹参考框，
+    // 文档允许 HAND_* 下尚未来得及凑满两次证据的物品，在手离开后的直接
+    // 无手帧中由自己的候选轨迹补确认整理。这里仍要求它命中了自己的轨迹参考框，
     // 不把普通未匹配框当作移动终点。
-    for (std::map<int, int>::const_iterator it = item_to_snapshot.begin();
-         it != item_to_snapshot.end(); ++it) {
+    for (std::map<int, int>::const_iterator it = item_to_observation.begin();
+         it != item_to_observation.end(); ++it) {
         const OperationTrack* runtime = find_runtime_for_item_(it->first);
         std::map<int, InventoryItem>::const_iterator original =
             operation_start_inventory_.find(it->first);
@@ -3390,7 +3501,7 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
             runtime->contact_state == ContactState::CONTACT_MOVING &&
             runtime->hold_and_move;
         const bool has_hand_confirmation = runtime->contact_state == ContactState::NONE &&
-            (runtime->hold_and_move || !runtime->move_values.empty());
+            (runtime->hold_and_move || has_meaningful_hand_move(*runtime));
         if (!has_contact_confirmation && !has_hand_confirmation &&
             runtime->observed_move_values.empty()) {
             continue;
@@ -3412,11 +3523,11 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
     }
 
     std::set<int> observed_ids;
-    for (std::map<int, int>::const_iterator it = item_to_snapshot.begin();
-         it != item_to_snapshot.end(); ++it) {
+    for (std::map<int, int>::const_iterator it = item_to_observation.begin();
+         it != item_to_observation.end(); ++it) {
         observed_ids.insert(it->first);
         InventoryItem& item = final_items[it->first];
-        update_seen(item, observed[it->second], snapshot.frame_id);
+        update_seen(item, observed[it->second], frame_id);
         if (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first)) {
             item.base_box = observed[it->second].box;
         }
@@ -3424,17 +3535,7 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         item.block_ids.clear();
     }
 
-    // 未稳定出现的疑似 D 不允许入库；它只属于本次临时操作。
-    for (std::set<int>::const_iterator it = pending_in_ids_.begin();
-         it != pending_in_ids_.end(); ++it) {
-        if (!observed_ids.count(*it)) {
-            printf("[3.0] 已提升的 D item#%d 未能唯一绑定到稳定快照；取消本轮 IN\n",
-                   *it);
-            final_items.erase(*it);
-        }
-    }
-
-    // 仅“本轮确认移动/确认入库，且在稳定快照中出现”的物品可成为前景遮挡物。
+    // 仅“本轮确认移动/确认入库，且在当前无手帧直接出现”的物品可成为前景遮挡物。
     std::set<int> confirmed_front_ids;
     for (std::set<int>::const_iterator it = observed_ids.begin(); it != observed_ids.end(); ++it) {
         if (pending_in_ids_.count(*it) || confirmed_moved_ids_.count(*it)) {
@@ -3442,6 +3543,7 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         }
     }
 
+    std::set<int> fully_occluded_ids;
     for (std::map<int, InventoryItem>::iterator it = final_items.begin();
          it != final_items.end(); ++it) {
         if (observed_ids.count(it->first)) continue;
@@ -3450,59 +3552,47 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         if (original == operation_start_inventory_.end()) continue;
 
         std::vector<int> blockers;
+        std::vector<BBox> cover_boxes;
         for (std::set<int>::const_iterator front_id = confirmed_front_ids.begin();
              front_id != confirmed_front_ids.end(); ++front_id) {
             if (*front_id == it->first) continue;
             std::map<int, InventoryItem>::const_iterator front = final_items.find(*front_id);
             if (front == final_items.end()) continue;
-            const bool full = fully_covered_by(original->second.base_box,
-                                                std::vector<BBox>(1, front->second.base_box));
-            const bool partial_new = pending_in_ids_.count(*front_id) &&
-                cover_ratio(original->second.base_box, front->second.base_box) >=
-                    FLOW3_D_PARTIAL_COVER_RATIO;
-            if (full || partial_new) blockers.push_back(*front_id);
+            const BBox front_box = front->second.base_box.area() > 0.0f
+                ? front->second.base_box : front->second.box;
+            if (intersection_area(original->second.base_box, front_box) <=
+                BLOCK_OVERLAP_AREA_EPS) {
+                continue;
+            }
+            // 先收集所有已确认前景框，再由矩形差集计算它们的覆盖并集。
+            // 单个新 D 的部分覆盖不能把缺失 C 直接定为 OCCLUDED。
+            blockers.push_back(*front_id);
+            cover_boxes.push_back(front_box);
         }
-        if (!blockers.empty()) {
+        if (fully_covered_by(original->second.base_box, cover_boxes)) {
             it->second = original->second;
             it->second.status = ItemStatus::OCCLUDED;
             it->second.block_ids.clear();
             it->second.block_ids.insert(blockers.begin(), blockers.end());
+            fully_occluded_ids.insert(it->first);
             continue;
         }
 
-        const OperationTrack* runtime = find_runtime_for_item_(it->first);
-        const bool runtime_has_ambiguous_b = runtime &&
-            (runtime->b_claim_ambiguous || runtime->contact_path_ambiguous);
-        // 到这里说明：D 的最终遮挡解释已经处理过，且旧位置与动态参考
-        // 位置都没有把 C 认领回来。move_values 非空表示手确实在该候选
-        // 上完成过有效移动；即使两次正向证据尚未凑满，也要按文档在收尾
-        // 阶段把“整条候选路径都找不到 C”作为出库证据。没有任何有效移动
-        // 的普通漏检仍然保留，不会凭空 OUT。
-        const bool contact_out_evidence = runtime && !runtime_has_ambiguous_b &&
-            !is_claim_protected(*runtime) &&
-            runtime->contact_state == ContactState::CONTACT_MOVING &&
-            !runtime->contact_path_ambiguous &&
-            (runtime->hold_and_move || !runtime->observed_move_values.empty());
-        const bool hand_out_evidence = runtime && !runtime_has_ambiguous_b &&
-            !is_claim_protected(*runtime) &&
-            !is_active_contact_track(*runtime) &&
-            runtime->state != OperationTrackState::NORMAL &&
-            (runtime->hold_and_move || !runtime->move_values.empty());
-        const bool strong_out_evidence = !runtime_has_ambiguous_b &&
-            (pending_out_ids_.count(it->first) ||
-             contact_out_evidence || hand_out_evidence);
-        if (strong_out_evidence) {
-            mark_pending_out_(it->first);
-        } else {
-            // 无法证明 OUT：严格保留本次操作开始前的正式物品，绝不把缺失
-            // 误变成 OUT，也不让一个未绑定框取代它。
-            it->second = original->second;
-        }
+        // 不完整遮挡和本帧缺失都不是最终状态。旧 C 是否可 OUT 由下面的
+        // 连续直接无手缺失证据统一处理；在此之前保留原库存身份。
+        it->second = original->second;
     }
+
+    const bool has_unresolved_state = has_unresolved_no_hand_state_(
+        observed_ids, fully_occluded_ids);
 
     for (std::set<int>::const_iterator out = pending_out_ids_.begin();
          out != pending_out_ids_.end(); ++out) {
         final_items.erase(*out);
+    }
+
+    if (has_unresolved_state) {
+        return result;
     }
 
     // blocker 只保留存在且真正覆盖的已确认前景物品。
@@ -3526,7 +3616,7 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         }
     }
 
-    // 最后才生成正式事件；整个过程中没有任何“未绑定快照框自动 IN”。
+    // 最后才生成正式事件；整个过程中没有任何“未绑定无手框自动 IN”。
     std::vector<InventoryEvent> events;
     for (std::map<int, InventoryItem>::const_iterator old = operation_start_inventory_.begin();
          old != operation_start_inventory_.end(); ++old) {
@@ -3559,9 +3649,9 @@ SettlementResult SessionManager::settle_stable_snapshot_(const Snapshot& snapsho
         }
     }
 
-    for (size_t si = 0; si < snapshot_owner.size(); ++si) {
-        if (snapshot_owner[si] < 0) {
-            printf("[3.0] 稳定快照出现未绑定检测 cls=%d；没有 D 证据链，不自动 IN\n",
+    for (size_t si = 0; si < observation_owner.size(); ++si) {
+        if (observation_owner[si] < 0) {
+            printf("[3.0] 无手直接帧出现未绑定检测 cls=%d；没有 D 证据链，不自动 IN\n",
                    observed[si].cls_id);
         }
     }
@@ -3610,7 +3700,6 @@ FrameProcessResult SessionManager::process_frame(
 
     if (hand_present_) {
         finalize_initial_check_before_hand_();
-        no_hand_buffer_.reset();
         no_hand_streak_ = 0;
         if (!has_local_inventory_) return output;
         const BBox hand = choose_primary_hand(hand_boxes);
@@ -3640,29 +3729,23 @@ FrameProcessResult SessionManager::process_frame(
     }
 
     ++no_hand_streak_;
+    output.no_hand_frame_processed = true;
     if (working_inventory_active_) {
-        // 手刚离开的每一帧都先供 D/候选轨迹做最终确认；随后再进入稳定快照投票。
+        // 手刚离开的每一帧都直接供 D/C 候选完成认领、连续自匹配和缺失证据。
+        // 不缓存、不平均框，也不做多数投票。
         observe_no_hand_frame_(food_detections);
         has_old_hand_box_ = false;
-        no_hand_buffer_.push(food_detections, frame_id);
-        if (!no_hand_buffer_.full()) return output;
-        Snapshot snapshot = no_hand_buffer_.take_snapshot();
-        output.stable_snapshot_generated = true;
-        output.settlement = settle_stable_snapshot_(snapshot);
+        output.settlement = settle_no_hand_frame_(food_detections, frame_id);
         return output;
     }
 
     if (initial_check_state_ == InitialCheckState::WAITING ||
-        initial_check_state_ == InitialCheckState::BOOTSTRAP_FROM_SNAPSHOT) {
-        no_hand_buffer_.push(food_detections, frame_id);
-        if (!no_hand_buffer_.full()) return output;
-        Snapshot snapshot = no_hand_buffer_.take_snapshot();
-        output.stable_snapshot_generated = true;
+        initial_check_state_ == InitialCheckState::BOOTSTRAP_FROM_FRAME) {
         if (initial_check_state_ == InitialCheckState::WAITING) {
-            validate_initial_snapshot_(snapshot);
+            validate_initial_no_hand_frame_(food_detections);
             initial_check_state_ = InitialCheckState::DONE;
         } else {
-            initialize_from_bootstrap_snapshot_(snapshot);
+            initialize_from_bootstrap_no_hand_frame_(food_detections, frame_id);
         }
     }
     return output;

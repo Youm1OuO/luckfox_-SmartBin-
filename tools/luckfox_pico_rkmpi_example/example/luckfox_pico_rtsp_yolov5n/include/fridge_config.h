@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r9";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r10";
 
 // =========================================================================
 //  类别 ID 配置
@@ -39,7 +39,7 @@ inline bool is_food(int cls_id) {
 //  分三层：
 //    1. YOLO_CANDIDATE_SCORE_THRESH：RKNN 原始输出的粗筛，低一点，避免过早丢候选。
 //    2. YOLO_OBJECT_SCORE_THRESH / YOLO_HAND_SCORE_THRESH：postprocess 最终输出阈值。
-//    3. 业务层手阈值：HAND_CONTEXT_SCORE_THRESH；检测到就停止稳定快照。
+//    3. 业务层手阈值：HAND_CONTEXT_SCORE_THRESH；检测到就停止无手收尾。
 // =========================================================================
 constexpr float YOLO_CANDIDATE_SCORE_THRESH = 0.01f;
 constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.25f;    // 物品的阈值
@@ -191,22 +191,22 @@ constexpr int TRACK_BUFFER_FRAMES = 60;
 constexpr float NEW_TRACK_SCORE_THRESH = 0.6f;
 
 // =========================================================================
-//  3.0 库存 / 快照流程超参数
+//  3.0 库存逐帧流程超参数
 // -------------------------------------------------------------------------
 //  这里的常量只给出可运行的初始值；部署前必须按该摄像头、该模型和实际
 //  冰箱格局标定。详细的“地址 + 含义 + 调整方向”见：
 //  另另一种业务流程(3.0var).md/超参数位置与调节说明.txt
 // =========================================================================
 
-// 连续无手稳定快照。
-// 票数采用严格大于 frames * SNAPSHOT_S：N=3、S=0.5 时至少需要 2 票。
+// 历史多帧投票模块参数。3.0 的 SessionManager 不使用 SnapshotBuffer，
+// 这些常量只保留给独立的 snapshot.cc 兼容编译，不参与业务判断。
 constexpr int   SNAPSHOT_N            = 3;
 constexpr float SNAPSHOT_S            = 0.5f;
 constexpr float SNAPSHOT_MIN_SCORE    = 0.5f;
 constexpr float SNAPSHOT_MIN_BOX_WIDTH  = 12.0f;
 constexpr float SNAPSHOT_MIN_BOX_HEIGHT = 12.0f;
 
-// 同一份快照内跨帧投票候选的严格关联。只用于快照投票，不用于库存结算。
+// 同一份历史快照内跨帧投票候选的严格关联，不用于 3.0 库存结算。
 constexpr float SNAPSHOT_VOTE_CENTER_NORM = 0.30f;
 constexpr float SNAPSHOT_VOTE_WIDTH_RATIO = 0.25f;
 constexpr float SNAPSHOT_VOTE_HEIGHT_RATIO = 0.25f;
@@ -246,24 +246,25 @@ constexpr float COVER_REMAINING_AREA_EPS = 4.0f;
 // C 但 C 已处于 HAND_* 时，达到该比例可以作为“先保留 C，不判 OUT”的证据。
 constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
-// 当前尚未对接后台，允许首次无手稳定快照建立本地测试库存。
-// 接入可信后台后建议改为 false：此时冷启动快照只做只读校验，不负责建库。
-constexpr bool ALLOW_SNAPSHOT_BOOTSTRAP_WHEN_BACKEND_UNAVAILABLE = true;
+// 当前尚未对接后台，允许首张无手直接检测建立本地测试库存。
+// 接入可信后台后建议改为 false：此时冷启动画面只做只读校验，不负责建库。
+constexpr bool ALLOW_INITIAL_FRAME_BOOTSTRAP_WHEN_BACKEND_UNAVAILABLE = true;
 
 // =========================================================================
 //  手框
 // =========================================================================
-// 手证据阈值：业务层只要检测到这种手框，就停止生成稳定快照。
+// 手证据阈值：业务层只要检测到这种手框，就停止无手收尾。
 constexpr float HAND_CONTEXT_SCORE_THRESH = YOLO_HAND_SCORE_THRESH;
 // 强手框仅用于 OSD 显示，避免 UI 被普通小手框干扰。
 constexpr float OSD_STRONG_HAND_SCORE_THRESH = 0.45f;
 constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
+constexpr float OSD_OBJECT_SCORE_THRESH = 0.50f;
 
 // =========================================================================
 //  3.0 HAND_* / Track 参数
 // -------------------------------------------------------------------------
 // 每个被手影响物品各自保存 move_values 和完整估计轨迹；正式事件仍在无手
-// 稳定快照提交时生成。对已有完整库存物品 A，先计算：
+// 逐帧收尾的条件提交时生成。对已有完整库存物品 A，先计算：
 //   r = intersection(hand.box, A.box) / area(A.box)
 // r < e2 不进入 HAND_*；e2 <= r < e1 为 HAND_PARTIAL；r >= e1 才为
 // HAND_FULL。e2/e1 只使用 A 的完整可靠框，不能使用被遮挡后缩小的检测框。
@@ -276,6 +277,9 @@ constexpr float HAND_MICRO_MOVE_SKIP_EPS     = 6.0f;
 constexpr int   NEW_ITEM_CONFIRM_FRAMES      = 2;
 constexpr int   FLOW3_HOLD_EVIDENCE_REQUIRED = 2;
 constexpr int   FLOW3_NOT_HOLD_EVIDENCE_REQUIRED = 2;
+// 无手阶段只累计同一对象的连续直接观测，绝不对多个检测框做投票或平均。
+constexpr int   FLOW3_NO_HAND_D_CONFIRM_FRAMES = 2;
+constexpr int   FLOW3_NO_HAND_OUT_MISSING_FRAMES = 2;
 // 新建的旧库存 CONTACT_* / HAND_* 轨迹在后续两张有效帧内只能做本地
 // 匹配和累计证据，不能把同类 B 作为排他归属；两张后续帧结束后才成熟。
 constexpr int   FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES = 2;
@@ -302,11 +306,10 @@ constexpr float FLOW3_D_REAPPEAR_MAX_CENTER_SHIFT_NORM = 0.45f;
 // 即使 D 已不贴手，也以 C_POSITION_REPLACEMENT_D 预登记它。
 constexpr float FLOW3_C_REPLACEMENT_MIN_COVER_RATIO = 0.30f;
 // 无手阶段：手离开后的前几张无手帧可从公共手轨迹创建
-// POST_HAND_REVEAL_D。当前 N=3、D 需要两次观察，所以设为 2，确保仍有
-// 后续帧可完成自匹配并进入本轮稳定快照。
+// POST_HAND_REVEAL_D。窗口内仍需一张后续直接帧完成自匹配。
 constexpr int   FLOW3_POST_HAND_REVEAL_WINDOW_FRAMES = 2;
 // 同类 B 首次重新出现后，需要多少次连续自匹配，才允许作为旧 C 的
-// 已确认候选。无手稳定快照仍是最终提交条件。
+// 已确认候选；最终仍由无手逐帧收尾的条件提交决定。
 constexpr int   FLOW3_REAPPEAR_CANDIDATE_CONFIRM_FRAMES = 2;
 constexpr float FLOW3_DROP_FALL_BEHIND_RATIO = 0.45f;
 // 放下需要连续证据，不能只凭 B 与手脱离的一帧就确认。

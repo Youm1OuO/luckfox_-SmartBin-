@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "inventory.h"
-#include "snapshot.h"
+#include "tracker.h"
 
 namespace fridge {
 
@@ -36,14 +36,15 @@ struct SettlementResult {
 };
 
 struct FrameProcessResult {
-    bool stable_snapshot_generated = false;
+    // 3.0 对每张无手帧直接执行收尾状态机；这里不代表多帧快照或投票。
+    bool no_hand_frame_processed = false;
     SettlementResult settlement;
 };
 
 enum class InitialCheckState {
     NONE,
     WAITING,
-    BOOTSTRAP_FROM_SNAPSHOT,
+    BOOTSTRAP_FROM_FRAME,
     DONE,
     SKIPPED,
     NOT_NEEDED,
@@ -72,7 +73,7 @@ enum class ContactState {
 };
 
 // 疑似新物品 D 的首次发现来源。来源只决定后续需要哪一条确认链路；
-// 无论哪一种，正式 IN 都仍要等无手稳定快照提交。
+// 无论哪一种，正式 IN 都仍要等后续无手帧完成直接确认并提交。
 enum class SuspectSource {
     NONE,
     HAND_VISIBLE_D,
@@ -104,7 +105,7 @@ struct OperationTrack {
     BBox last_hand_block_box;
     bool has_last_hand_block_box = false;
     // C 曾暂时不可见后重新出现的同类 B。它先只是候选，必须连续自匹配
-    // 或由无手稳定快照支持，不能在第一帧直接把它当成 C 或新 D。
+    // 或由后续无手帧支持，不能在第一帧直接把它当成 C 或新 D。
     BBox reappear_candidate_box;
     bool has_reappear_candidate_box = false;
     BBox placed_box;
@@ -140,6 +141,10 @@ struct OperationTrack {
     // 仅 POST_HAND_REVEAL_D 使用：它在第几张无手帧首次出现。
     // 后续一张有效无手帧若不能自匹配，就丢弃该候选而不产生事件。
     int post_hand_reveal_no_hand_streak = -1;
+    // 无手阶段的同一对象直接观测次数。它是时序自匹配证据，不做框平均或投票。
+    int no_hand_self_match_count = 0;
+    // 旧 C 在无手阶段未被直接认领、也没有完整遮挡解释的连续次数。
+    int no_hand_missing_count = 0;
 
     // HAND_* 的手位移估计路径。CONTACT_* 不使用它来推算物品位置。
     std::vector<MoveValue> move_values;
@@ -202,8 +207,9 @@ private:
     void begin_working_operation_(const BBox& hand_box,
                                   const std::vector<Detection>& detections);
     void finalize_initial_check_before_hand_();
-    void validate_initial_snapshot_(const Snapshot& snapshot) const;
-    void initialize_from_bootstrap_snapshot_(const Snapshot& snapshot);
+    void validate_initial_no_hand_frame_(const std::vector<Detection>& detections) const;
+    void initialize_from_bootstrap_no_hand_frame_(const std::vector<Detection>& detections,
+                                                  int frame_id);
 
     // 有手逐帧处理
     void process_effective_hand_frame_(const BBox& hand_box,
@@ -243,7 +249,8 @@ private:
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner);
     void apply_suspect_cover_evidence_(const BBox& hand_box,
-                                       const std::vector<Detection>& detections);
+                                       const std::vector<Detection>& detections,
+                                       bool hand_moved);
     void advance_claim_grace_(const std::set<int>& new_existing_track_ids);
 
     // 手离开后的收尾与提交
@@ -251,7 +258,10 @@ private:
     void register_post_hand_reveal_suspects_(
         const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices);
-    SettlementResult settle_stable_snapshot_(const Snapshot& snapshot);
+    SettlementResult settle_no_hand_frame_(const std::vector<Detection>& detections,
+                                           int frame_id);
+    bool has_unresolved_no_hand_state_(const std::set<int>& observed_item_ids,
+                                       const std::set<int>& fully_occluded_item_ids);
     void clear_runtime_after_commit_();
 
     // 运行时对象与工作库存操作
@@ -287,7 +297,6 @@ private:
     bool has_old_hand_box_ = false;
     int next_suspect_id_ = -1;
 
-    SnapshotBuffer no_hand_buffer_;
     bool hand_present_ = false;
     bool session_active_ = false;
     bool has_local_inventory_ = false;

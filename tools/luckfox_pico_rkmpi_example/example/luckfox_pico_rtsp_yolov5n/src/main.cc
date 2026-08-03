@@ -6,7 +6,7 @@
 //    1. 摄像头采集 + YOLO推理 + 坐标映射
 //    2. ByteTrack-Lite 每帧更新（只用于 OSD 显示）
 //    3. SessionManager 在手操作期间维护 3.0 工作库存、HAND_* 和疑似 D
-//    4. 连续 N 帧无手稳定 → 以工作库存和稳定快照完成一次原子提交
+//    4. 每张无手帧直接推进收尾；所有未决项收敛后以工作库存原子提交
 //    5. 事件上报 + 画面绘制 + RTSP推流
 // ============================================================================
 #include <assert.h>
@@ -39,7 +39,6 @@
 #include "fridge_config.h"
 #include "geometry.h"
 #include "tracker.h"
-#include "snapshot.h"
 #include "session.h"
 #include "inventory.h"
 #include "cloud_uploader.h"
@@ -109,9 +108,9 @@ static bool request_backend_inventory(const char* device_id,
 
 	// 后台库存 GET/POST 协议还没有在端侧落地。这里保留明确接入点：
 	// 后续拿到后端返回 JSON 后，只需要在本函数里填充 items 并返回 true。
-	// 后台未接入期间，SessionManager 会依据配置决定是否用首次稳定快照建立
+	// 后台未接入期间，SessionManager 会依据配置决定是否用首张无手帧建立
 	// 本地测试库存；接入可信后台后可关闭该测试兜底。
-	printf("[BACKEND] 开门库存获取接口未接入；将按测试配置处理首次快照\n");
+	printf("[BACKEND] 开门库存获取接口未接入；将按测试配置处理首张无手帧\n");
 	return false;
 }
 
@@ -552,22 +551,24 @@ int main(int argc, char *argv[]) {
 			g_frame_id++;
 
 			// 只保留物品检测给业务层（手框单独传入）。
+			// 检测结果已通过 YOLO_OBJECT_SCORE_THRESH；3.0 逐帧状态机不能再用
+			// 历史快照投票阈值二次丢弃手操作中的 C/D 证据。
 			std::vector<fridge::Detection> food_dets;
 			for (const auto& d : detections) {
-				if (fridge::is_food(d.cls_id) && d.score >= fridge::SNAPSHOT_MIN_SCORE) {
+				if (fridge::is_food(d.cls_id)) {
 					food_dets.push_back(d);
 				}
 			}
 
-			// 3.0 业务层自己维护连续无手稳定快照；有手时只改工作库存和
-			// HAND_*/D 运行时状态，正式库存只在稳定收尾时提交。
+			// 3.0 对每张无手帧直接推进收尾状态机；有手时只改工作库存和
+			// HAND_*/D 运行时状态，正式库存只在所有未决项收敛后提交。
 			fridge::FrameProcessResult frame_result =
 				session.process_frame(food_dets, hand_boxes, g_frame_id, now_ms);
 
-			if (frame_result.stable_snapshot_generated) {
+			if (frame_result.no_hand_frame_processed) {
 				const fridge::SettlementResult& res = frame_result.settlement;
 
-				// 处理快照对比产生的事件：先打印终端日志；只有真正出入库/整理
+				// 处理无手收尾产生的事件：先打印终端日志；只有真正出入库/整理
 				// 才上报云端，遮挡和露出仅更新本地库存状态。
 				for (const auto& ev : res.events) {
 					print_inventory_event(ev);
@@ -715,11 +716,11 @@ int main(int argc, char *argv[]) {
 					}
 				}
 
-				// 正式快照只要成功提交，就打印当前库存；即使本轮只是确认“无变化”，
-				// 终端也能看到它确实已经结算完成。
-				if (res.committed) {
-					printf("\n\033[1;36m[INVENTORY]\033[0m 快照结算已提交:\n");
-					session.print_inventory();
+					// 无手收尾只要成功提交，就打印当前库存；即使本轮只是确认“无变化”，
+					// 终端也能看到它确实已经结算完成。
+					if (res.committed) {
+						printf("\n\033[1;36m[INVENTORY]\033[0m 无手收尾已提交:\n");
+						session.print_inventory();
 				}
 			}
 
@@ -729,7 +730,7 @@ int main(int argc, char *argv[]) {
 			for (const auto& d : detections) {
 				// if (fridge::is_hand(d.cls_id)) continue;
 				bool should_display_raw =
-					d.score >= fridge::SNAPSHOT_MIN_SCORE;
+					d.score >= fridge::OSD_OBJECT_SCORE_THRESH;
 				if (!should_display_raw) continue;
 
 				int x1 = (int)d.box.x1;
