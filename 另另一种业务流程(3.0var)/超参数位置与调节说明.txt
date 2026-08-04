@@ -4,9 +4,17 @@
 一、参数代码位置
 ----------------
 
-业务参数统一位于：
+3.0 业务状态机和显示层的大多数配置位于：
 
 tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/include/fridge_config.h
+
+YOLO 后处理的 NMS IoU 阈值位于：
+
+tools/luckfox_pico_rkmpi_example/include/rknn/postprocess.h
+
+实际将这些参数送入 RKNN 后处理的位置位于：
+
+tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/yolov5n.cc
 
 3.0 的会话状态机实现位于：
 
@@ -59,6 +67,66 @@ item_id、不得作为“其他旧库存”排除 C。普通、无冲突 D 仍�
 才解除 D 的隔离并按原有流程提交 C 的 MOVED 和 D 的 IN。隔离 D 始终保留逐帧位置、
 贴手和路径更新，所以这不是“等手离开后才识别”。
 
+检测输出、NMS、业务输入与 OSD 显示
+--------------------------------------
+
+以下数值都属于检测/显示配置，但它们的含义不同，不能混为“同一个 YOLO 阈值”：
+
+YOLO_CANDIDATE_SCORE_THRESH（当前 0.01）
+    代码位置：fridge_config.h；实际传入 post_process 的位置：yolov5n.cc。
+    它是 RKNN/YOLO 原始候选的粗筛阈值。低于它的 anchor 不会进入后续候选集合。
+    调大：后处理计算更少、原始噪声更少，但可能在 NMS 前就漏掉部分遮挡或低分物品。
+    调小：召回候选更多，但会增加后处理负担；它不是业务层物品确认阈值。
+
+NMS_THRESH（当前 0.60）
+    代码位置：tools/luckfox_pico_rkmpi_example/include/rknn/postprocess.h。
+    这是同类候选框的 NMS IoU 重叠阈值，绝不是置信度分数阈值。两个同类候选框高度
+    重叠时，NMS 会保留较强候选、抑制较弱候选。
+    调大：只有重叠更高时才压掉重复框，因此更容易保留多个相近框；相邻/遮挡物品的
+    召回可能更高，但同一物品的重复框也更容易进入后续。
+    调小：更积极地压掉重叠框，重复框更少；但相邻、部分遮挡的两个真实物品更可能被
+    错误合并。不得为了单次假 D 现象盲目调低。
+
+YOLO_OBJECT_SCORE_THRESH（当前 0.25）
+    代码位置：fridge_config.h；在 postprocess.cc 的 NMS 后最终输出阶段按类别使用。
+    它是食品框的最终置信度下限：达到该值的 NMS 后食品框才会进入 od_results，随后被
+    main.cc 放进 food_dets 并传给 SessionManager::process_frame()。
+    因此它不是 NMS，也不是“库存已确认”的门槛。达到 0.25 只表示该框是本帧业务状态机
+    必须看见并谨慎处理的 YOLO 输入；是否成为正式库存仍由后续轨迹、C-D alias、无手
+    证据和 settlement 决定。
+    调大：假框、重复框更难进入业务层，但手遮挡下真实物品的低分框也会被直接丢掉，
+    可能退化现有整理、遮挡与入库能力。
+    调小：低分证据更容易保留，召回更高，但状态机需要处理更多短暂候选。任何调整都
+    必须同时回放正常 IN/OUT/MOVED、CONTACT_*、遮挡和相邻同类场景。
+
+YOLO_HAND_SCORE_THRESH / HAND_CONTEXT_SCORE_THRESH（当前均 0.30）
+    代码位置：fridge_config.h。手框达到该值后进入 hand_boxes，业务状态机将该帧视为
+    HAND，而不是继续无手收尾。
+    调大：手的误触发减少，但低分真手可能被漏掉，造成过早无手提交。
+    调小：更早/更稳定地暂停无手提交，但低分误手框也会让操作保持 HAND。
+
+OSD_OBJECT_SCORE_THRESH（当前 0.50；当前 r14 的显示专用旧配置）
+    代码位置：fridge_config.h；当前 main.cc 绘制 detections 时使用它做第二次显示过滤。
+    它不参与 NMS、不参与 food_dets、不参与 hand_boxes，也不参与库存匹配或提交。
+    因此当前会出现“业务日志 foods=4，但画面只显示 3 个框”：第 4 个食品框可能已满足
+    0.25、进入业务层，却因分数低于 0.50 而没有画出来。
+
+    细节12实施时的固定规则：食品和手的 OSD 必须直接从当帧实际传入 process_frame()
+    的 food_dets / hand_boxes（或完全相同的判定谓词）绘制。低于原 OSD 0.50、但已进入
+    业务的框必须以黄色/橙色并携带 input-index、类别、分数显示。不能仅因为 OSD 看不见
+    就让业务层忽略它。
+
+    因而后续代码不得再把 OSD_OBJECT_SCORE_THRESH 作为食品/手业务输入的第二道过滤。
+    实施时可以删除/废弃该配置项，或只保留给不参与本业务的装饰性显示；无论采取哪种
+    方式，都必须同步更新此文件和代码注释。不要通过把 YOLO_OBJECT_SCORE_THRESH 从
+    0.25 提升到 0.50 来实现“看到即所得”，那会改变业务证据而非修复显示不一致。
+
+看到即所得的准确范围
+    应显示：经 NMS 和最终类别阈值后、已进入 food_dets / hand_boxes 的业务有效框。
+    不要求显示：原始 anchor、低于最终类别阈值的候选、或已被 NMS 抑制的候选；它们没有
+    进入业务状态机，显示它们会把“模型原始猜测”和“实际业务输入”混为一谈。
+    画面中的低分业务框也不是正式库存或 IN 事件，只是提醒“状态机正在观察这个输入”。
+
 诊断追踪开关（不是匹配超参数）
 ----------------------------------
 
@@ -97,6 +165,14 @@ FLOW3_DEBUG_TRACE_LOG（当前 true）
     若 MATCH 出现 `reject=strict-owner`，后面的 `owner-kind` 可明确区分
     `start-old-c`、`pending-d`、`quarantined-pending-d`、`confirmed-d`；只有
     `start-old-c` 或已确认库存才具有“其他旧物品”的正式排除权限。
+
+    细节12实施后的新增诊断要求：每个实际传入 process_frame() 的食品框都要输出
+    `[FOOD-DETECTION] input-index=<n> class=<...> score=<...> box=<...>
+    business-input=1 osd-business-visible=1`。若 `foods=4` 而物理上只有 3 个物品，
+    应先用这一条日志确认第 4 个框的分数、位置和重叠关系；不能仅凭 OSD 只看见 3 个框
+    就认定业务层也只有 3 个输入。C-D stale alias 清理日志还必须包含
+    `all-conflicting-old-settled` 与 `missing-count=<n>/<threshold>`，以区分“等待真实 D”
+    和“所有旧 C 已结算后回收消失的假 D”。
 
     同类数量不足跨帧累计时，`VISIBLE-COUNT` 会复用既有 `FLOW3_TRACK_*`
     匹配范围确认保留框仍连续；若保留框明显跳变，会清除未提交的数量不足
