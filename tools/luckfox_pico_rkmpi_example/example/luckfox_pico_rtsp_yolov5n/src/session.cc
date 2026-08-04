@@ -186,6 +186,34 @@ const char* release_reason_name(ReleaseReason reason) {
     return "UNKNOWN";
 }
 
+const char* live_observation_state_name(LiveObservationState state) {
+    switch (state) {
+        case LiveObservationState::NONE:
+            return "NONE";
+        case LiveObservationState::HAND_CONTACT:
+            return "HAND_CONTACT";
+        case LiveObservationState::POSSIBLE_MOVED:
+            return "POSSIBLE_MOVED";
+        case LiveObservationState::POSSIBLE_OCCLUDED:
+            return "POSSIBLE_OCCLUDED";
+        case LiveObservationState::PROVISIONAL_D:
+            return "PROVISIONAL_D";
+        case LiveObservationState::C_D_ALIAS:
+            return "C_D_ALIAS";
+        case LiveObservationState::POST_HAND_REVEAL_D:
+            return "POST_HAND_REVEAL_D";
+        case LiveObservationState::PLACED:
+            return "PLACED";
+    }
+    return "UNKNOWN";
+}
+
+const char* runtime_owner_kind_name(const OperationTrack& track) {
+    if (!track.is_suspect_new) return "start-old-c";
+    return track.pending_d_quarantined_by_old_c
+        ? "quarantined-pending-d" : "pending-d";
+}
+
 const char* event_kind_name(EventKind kind) {
     switch (kind) {
         case EventKind::IN:
@@ -215,6 +243,13 @@ bool existing_item_resolved_without_current_detection(const OperationTrack* trac
     return track->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
            track->resolution == ExistingItemResolution::OUT_CONFIRMED ||
            track->resolution == ExistingItemResolution::OCCLUDED_CONFIRMED;
+}
+
+bool existing_track_is_terminal(const OperationTrack& track) {
+    return !track.is_suspect_new &&
+           (track.resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+            track.resolution == ExistingItemResolution::OUT_CONFIRMED ||
+            track.resolution == ExistingItemResolution::OCCLUDED_CONFIRMED);
 }
 
 // D 全程被手挡住时，手离开后的完整 B 可能位于手轨迹中段，而不是最后
@@ -261,6 +296,14 @@ bool is_active_contact_track(const OperationTrack& track) {
 bool is_active_runtime_track(const OperationTrack& track) {
     return track.state != OperationTrackState::NORMAL ||
            track.contact_state != ContactState::NONE;
+}
+
+bool is_unresolved_operation_start_old_track(const OperationTrack& track) {
+    return !track.is_suspect_new && track.item_id > 0 &&
+           !existing_track_is_terminal(track) &&
+           (is_active_runtime_track(track) ||
+            existing_item_needs_settlement(track) ||
+            track.reappearance_pending || track.needs_no_hand_settlement);
 }
 
 // 保护期只针对已有库存 C；疑似新物品 D 不参加“同类旧 C 的 B 仲裁”。
@@ -697,6 +740,134 @@ bool detection_strictly_matches_other_item(const Detection& detection,
     return false;
 }
 
+// working_inventory_ 中既可能有操作开始前的旧库存，也可能有尚未提交的
+// staged D。无手收尾不能再把后者打印或处理成 "other old item"。
+enum class StrictOwnerKind {
+    NONE,
+    START_OLD_C,
+    PENDING_D,
+    QUARANTINED_PENDING_D,
+    CONFIRMED_D,
+};
+
+struct StrictDetectionOwner {
+    StrictOwnerKind kind = StrictOwnerKind::NONE;
+    int item_id = -1;
+    int runtime_key = 0;
+};
+
+const char* strict_owner_kind_name(StrictOwnerKind kind) {
+    switch (kind) {
+        case StrictOwnerKind::NONE:
+            return "none";
+        case StrictOwnerKind::START_OLD_C:
+            return "start-old-c";
+        case StrictOwnerKind::PENDING_D:
+            return "pending-d";
+        case StrictOwnerKind::QUARANTINED_PENDING_D:
+            return "quarantined-pending-d";
+        case StrictOwnerKind::CONFIRMED_D:
+            return "confirmed-d";
+    }
+    return "unknown";
+}
+
+const OperationTrack* runtime_for_working_item(
+        int item_id, const std::map<int, OperationTrack>& tracks,
+        int* runtime_key) {
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        if (it->second.item_id == item_id) {
+            if (runtime_key) *runtime_key = it->first;
+            return &it->second;
+        }
+    }
+    return nullptr;
+}
+
+StrictDetectionOwner strict_owner_for_detection(
+        const Detection& detection, int excluded_item_id,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks) {
+    // 操作开始库存优先：细节10的独立静止旧 B 规则依赖其严格所有权。
+    for (std::map<int, InventoryItem>::const_iterator it = working.begin();
+         it != working.end(); ++it) {
+        if (it->first == excluded_item_id || !strict_match(it->second, detection)) {
+            continue;
+        }
+        if (operation_start.count(it->first)) {
+            StrictDetectionOwner owner;
+            owner.kind = StrictOwnerKind::START_OLD_C;
+            owner.item_id = it->first;
+            owner.runtime_key = it->first;
+            return owner;
+        }
+    }
+
+    for (std::map<int, InventoryItem>::const_iterator it = working.begin();
+         it != working.end(); ++it) {
+        if (it->first == excluded_item_id || !strict_match(it->second, detection)) {
+            continue;
+        }
+        StrictDetectionOwner owner;
+        owner.item_id = it->first;
+        int runtime_key = 0;
+        const OperationTrack* runtime = runtime_for_working_item(
+            it->first, tracks, &runtime_key);
+        owner.runtime_key = runtime_key;
+        if ((runtime && runtime->is_suspect_new &&
+             runtime->pending_d_quarantined_by_old_c) ||
+            (pending_in_ids.count(it->first) && runtime &&
+             runtime->pending_d_quarantined_by_old_c)) {
+            owner.kind = StrictOwnerKind::QUARANTINED_PENDING_D;
+        } else if ((runtime && runtime->is_suspect_new) ||
+                   pending_in_ids.count(it->first)) {
+            owner.kind = StrictOwnerKind::PENDING_D;
+        } else {
+            owner.kind = StrictOwnerKind::CONFIRMED_D;
+        }
+        return owner;
+    }
+
+    // 隔离 D 在有手阶段不会进入 working_inventory_，仍须能作为实时
+    // owner 被日志识别，但它没有排除旧 C 的正式权限。
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        const OperationTrack& track = it->second;
+        if (!track.is_suspect_new || !track.pending_d_quarantined_by_old_c ||
+            track.cls_id != detection.cls_id) {
+            continue;
+        }
+        const BBox reference = track.has_last_seen_box ? track.last_seen_box : estimated_box(track);
+        if (!strict_match_box(track.cls_id, reference,
+                              detection.cls_id, detection.box)) {
+            continue;
+        }
+        StrictDetectionOwner owner;
+        owner.kind = StrictOwnerKind::QUARANTINED_PENDING_D;
+        owner.item_id = track.item_id;
+        owner.runtime_key = it->first;
+        return owner;
+    }
+    return StrictDetectionOwner();
+}
+
+bool strict_owner_blocks_old_c(StrictOwnerKind kind) {
+    return kind == StrictOwnerKind::START_OLD_C ||
+           kind == StrictOwnerKind::CONFIRMED_D;
+}
+
+bool strict_owner_is_quarantined_alias_of_old_c(
+        const StrictDetectionOwner& owner, int old_item_id,
+        const std::map<int, OperationTrack>& tracks) {
+    if (owner.kind != StrictOwnerKind::QUARANTINED_PENDING_D) return false;
+    std::map<int, OperationTrack>::const_iterator suspect = tracks.find(owner.runtime_key);
+    return suspect != tracks.end() &&
+           suspect->second.conflicting_old_item_ids.count(old_item_id) > 0;
+}
+
 // CONTACT_* 只使用物品自己的真实观测路径。手框位移不能替代这里的 BBox
 // 位移，因为手腕不动时手指仍可能推动物品。
 float contact_reference_cost(const OperationTrack& track,
@@ -916,15 +1087,20 @@ int unique_no_hand_reappear_detection_for_track(
         const std::vector<Detection>& detections, const std::set<int>& claimed,
         int runtime_key, const OperationTrack& track,
         const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
         const std::map<int, OperationTrack>& tracks) {
     int result = -1;
     const std::map<int, int> no_known_owner;
     for (size_t i = 0; i < detections.size(); ++i) {
         if (claimed.count(static_cast<int>(i)) ||
-            detection_strictly_matches_other_item(detections[i], track.item_id, working) ||
             !reappear_candidate_path_matches(track, detections[i])) {
             continue;
         }
+        const StrictDetectionOwner strict_owner = strict_owner_for_detection(
+            detections[i], track.item_id, working, operation_start,
+            pending_in_ids, tracks);
+        if (strict_owner_blocks_old_c(strict_owner.kind)) continue;
         bool belongs_to_existing_d = false;
         for (std::map<int, OperationTrack>::const_iterator other = tracks.begin();
              other != tracks.end(); ++other) {
@@ -934,6 +1110,12 @@ int unique_no_hand_reappear_detection_for_track(
                 continue;
             }
             const OperationTrack& d = other->second;
+            // C-D alias 是同一个真实物品的暂定双轨迹。它不能反过来让 C
+            // 失去唯一的无手候选；C 仍要先拿到直接框，随后再等第二帧仲裁。
+            if (d.pending_d_quarantined_by_old_c &&
+                d.conflicting_old_item_ids.count(track.item_id)) {
+                continue;
+            }
             const BBox reference = d.has_placed_box ? d.placed_box : estimated_box(d);
             if (track_match_box(d.cls_id, reference, detections[i].cls_id,
                                 detections[i].box) ||
@@ -966,6 +1148,8 @@ bool has_ambiguous_no_hand_reappear_candidate(
         const std::vector<Detection>& detections, const std::set<int>& claimed,
         int runtime_key, const OperationTrack& track,
         const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
         const std::map<int, OperationTrack>& tracks,
         const std::map<int, int>& independent_static_owner_by_detection) {
     if (!is_claim_mature(track)) return false;
@@ -984,8 +1168,16 @@ bool has_ambiguous_no_hand_reappear_candidate(
             static_owner->second != track.item_id) {
             continue;
         }
-        if (detection_strictly_matches_other_item(detections[i], track.item_id,
-                                                  working)) {
+        const StrictDetectionOwner strict_owner = strict_owner_for_detection(
+            detections[i], track.item_id, working, operation_start,
+            pending_in_ids, tracks);
+        if (strict_owner_blocks_old_c(strict_owner.kind)) {
+            return true;
+        }
+        // Pending D 不是 "other old item"，但在没有可把它归给 C 的直接
+        // 路径时仍是需要继续观察的实时候选，不能据此累计 C 的 OUT。
+        if (strict_owner.kind == StrictOwnerKind::PENDING_D ||
+            strict_owner.kind == StrictOwnerKind::QUARANTINED_PENDING_D) {
             return true;
         }
         const int owner = unique_c_reappear_owner_for_detection(
@@ -1110,6 +1302,103 @@ float suspect_d_reappearance_path_cost(const OperationTrack& track,
         best_cost = std::min(best_cost, cost);
     }
     return best_cost;
+}
+
+bool quarantined_suspect_matches_detection(const OperationTrack& suspect,
+                                           const Detection& detection) {
+    if (!suspect.is_suspect_new || !suspect.pending_d_quarantined_by_old_c ||
+        suspect.cls_id != detection.cls_id) {
+        return false;
+    }
+    const BBox reference = suspect.has_placed_box ? suspect.placed_box : estimated_box(suspect);
+    return strict_match_box(suspect.cls_id, reference,
+                            detection.cls_id, detection.box) ||
+           (suspect.has_last_seen_box && strict_match_box(
+               suspect.cls_id, suspect.last_seen_box,
+               detection.cls_id, detection.box)) ||
+           (suspect.has_last_hand_block_box && strict_match_box(
+               suspect.cls_id, suspect.last_hand_block_box,
+               detection.cls_id, detection.box)) ||
+           suspect_d_reappearance_path_cost(suspect, detection) <
+               std::numeric_limits<float>::infinity();
+}
+
+bool old_c_has_independently_settled_identity(const OperationTrack& old) {
+    return !old.is_suspect_new &&
+           (existing_track_is_terminal(old) ||
+            (old.resolution == ExistingItemResolution::STATIC_CONFIRMED &&
+             !old.needs_no_hand_settlement &&
+             old.state == OperationTrackState::NORMAL &&
+             old.contact_state == ContactState::NONE));
+}
+
+bool detection_is_duplicate_of_settled_old_c(const OperationTrack& old,
+                                              int detection_index,
+                                              const Detection& detection) {
+    if (!old_c_has_independently_settled_identity(old) ||
+        old.cls_id != detection.cls_id) {
+        return false;
+    }
+
+    // 同一张无手帧已经由旧 C 直接认领的 detection index 是最强的一框一物品
+    // 证据。不能再用普通 strict_match 把相邻的同类真实 D 误判成这一个 C。
+    if (old.no_hand_detection_index >= 0) {
+        return old.no_hand_detection_index == detection_index;
+    }
+
+    // 旧 C 是前一帧已经结算、因而本帧没有重新参与认领时，只把近乎同一框的
+    // 观察当作 duplicate 的后备证据。partial 的高 IoM 语义比 strict 更窄，
+    // 不会吞掉“相邻但略有重叠”的真实同类 D。
+    const BBox reference = old.has_placed_box ? old.placed_box :
+        (old.has_last_seen_box ? old.last_seen_box : old.original_box);
+    return partial_match_box(old.cls_id, reference, detection.cls_id, detection.box);
+}
+
+bool quarantined_suspect_detection_is_duplicate_of_settled_old_c(
+        const OperationTrack& suspect,
+        const std::map<int, OperationTrack>& tracks,
+        int suspect_detection_index,
+        const Detection& detection) {
+    for (std::set<int>::const_iterator old_id = suspect.conflicting_old_item_ids.begin();
+         old_id != suspect.conflicting_old_item_ids.end(); ++old_id) {
+        std::map<int, OperationTrack>::const_iterator old = tracks.find(*old_id);
+        if (old != tracks.end() &&
+            detection_is_duplicate_of_settled_old_c(
+                old->second, suspect_detection_index, detection)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool quarantined_suspect_has_distinct_old_c_detections(
+        const OperationTrack& suspect,
+        const std::map<int, OperationTrack>& tracks,
+        int suspect_detection_index,
+        const Detection& suspect_detection) {
+    if (!suspect.pending_d_quarantined_by_old_c ||
+        suspect.conflicting_old_item_ids.empty()) {
+        return false;
+    }
+    for (std::set<int>::const_iterator old_id = suspect.conflicting_old_item_ids.begin();
+         old_id != suspect.conflicting_old_item_ids.end(); ++old_id) {
+        std::map<int, OperationTrack>::const_iterator old = tracks.find(*old_id);
+        if (old == tracks.end()) return false;
+        if (old_c_has_independently_settled_identity(old->second)) {
+            // 已独立结算的 C 只在当前 D 框与 C 的结算框不同的前提下，
+            // 才能作为“C、D 各有一个框”的证据。否则仍是一框两身份。
+            if (detection_is_duplicate_of_settled_old_c(
+                    old->second, suspect_detection_index, suspect_detection)) {
+                return false;
+            }
+            continue;
+        }
+        if (old->second.no_hand_detection_index < 0 ||
+            old->second.no_hand_detection_index == suspect_detection_index) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // 只在 D 原有的单点匹配全部失败后调用。B 必须不严格属于已有库存，且在
@@ -1739,12 +2028,112 @@ void SessionManager::trace_(const char* tag, const char* format, ...) const {
     printf("\n");
 }
 
+void SessionManager::set_live_state_(OperationTrack* track,
+                                     LiveObservationState state,
+                                     bool provisional,
+                                     const char* reason) {
+    if (!track) return;
+    const std::string next_reason = reason ? reason : "NONE";
+    if (track->live_state == state &&
+        track->live_state_provisional == provisional &&
+        track->live_state_reason == next_reason) {
+        return;
+    }
+    track->live_state = state;
+    track->live_state_provisional = provisional;
+    track->live_state_last_changed_frame = trace_frame_id_;
+    track->live_state_reason = next_reason;
+    const BBox box = track->has_last_seen_box ? track->last_seen_box : estimated_box(*track);
+    trace_("LIVE-STATE",
+           "owner-kind=%s runtime=%d item=%d cls=%d state=%s provisional=%d "
+           "reason=%s box=(%.1f,%.1f,%.1f,%.1f)",
+           runtime_owner_kind_name(*track),
+           track->is_suspect_new ? track->suspect_id : track->item_id,
+           track->item_id, track->cls_id,
+           live_observation_state_name(state), provisional ? 1 : 0,
+           track->live_state_reason.c_str(),
+           box.x1, box.y1, box.x2, box.y2);
+}
+
+void SessionManager::update_hand_live_states_() {
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (track.is_suspect_new) {
+            set_live_state_(&track,
+                            track.pending_d_quarantined_by_old_c
+                                ? LiveObservationState::C_D_ALIAS
+                                : LiveObservationState::PROVISIONAL_D,
+                            true,
+                            track.pending_d_quarantined_by_old_c
+                                ? "same-class-unsettled-old-alias"
+                                : "hand-visible-provisional-d");
+            continue;
+        }
+        if (!is_unresolved_operation_start_old_track(track)) continue;
+        if (!track.conflicting_suspect_keys.empty()) {
+            set_live_state_(&track, LiveObservationState::C_D_ALIAS, true,
+                            "same-class-provisional-d-alias");
+        } else if (track.contact_state != ContactState::NONE) {
+            set_live_state_(&track, LiveObservationState::HAND_CONTACT, true,
+                            "contact-track-active");
+        } else if (track.hold_and_move || has_meaningful_hand_move(track) ||
+                   track.reappearance_pending) {
+            set_live_state_(&track, LiveObservationState::POSSIBLE_MOVED, true,
+                            "hand-path-or-reappearance-pending");
+        } else if (track.state == OperationTrackState::HAND_FULL_BLOCKED) {
+            set_live_state_(&track, LiveObservationState::POSSIBLE_OCCLUDED, true,
+                            "hand-fully-covers-old-c");
+        } else {
+            set_live_state_(&track, LiveObservationState::HAND_CONTACT, true,
+                            "hand-affects-old-c");
+        }
+    }
+}
+
+bool SessionManager::old_track_has_unresolved_alias_(const OperationTrack& track) const {
+    if (track.is_suspect_new) return false;
+    for (std::set<int>::const_iterator key = track.conflicting_suspect_keys.begin();
+         key != track.conflicting_suspect_keys.end(); ++key) {
+        std::map<int, OperationTrack>::const_iterator suspect = track_buffer_.find(*key);
+        if (suspect != track_buffer_.end() && suspect->second.is_suspect_new &&
+            suspect->second.pending_d_quarantined_by_old_c) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SessionManager::unlink_quarantined_suspect_(int runtime_key,
+                                                  const char* action) {
+    std::map<int, OperationTrack>::iterator suspect = track_buffer_.find(runtime_key);
+    if (suspect == track_buffer_.end() || !suspect->second.is_suspect_new) return;
+    OperationTrack& d = suspect->second;
+    for (std::set<int>::const_iterator old_id = d.conflicting_old_item_ids.begin();
+         old_id != d.conflicting_old_item_ids.end(); ++old_id) {
+        std::map<int, OperationTrack>::iterator old = track_buffer_.find(*old_id);
+        if (old != track_buffer_.end()) {
+            old->second.conflicting_suspect_keys.erase(runtime_key);
+            trace_("C-D-ALIAS",
+                   "old-item=%d suspect=%d phase=%s action=%s relation=closed",
+                   *old_id, d.suspect_id,
+                   trace_hand_phase_ ? "HAND" : "NO_HAND",
+                   action ? action : "unlink");
+        }
+    }
+    d.conflicting_old_item_ids.clear();
+    d.pending_d_quarantined_by_old_c = false;
+    d.alias_no_hand_match_count = 0;
+}
+
 void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
                                   const char* reason) const {
     const BBox expected = estimated_box(track);
     trace_(tag,
            "item=%d suspect=%d cls=%d state=%s contact=%s resolution=%s "
            "needs_settle=%d grace=%d hold=%d not_hold=%d missing=%d ambiguous=%d "
+           "owner-kind=%s quarantine=%d alias-old=%zu alias-d=%zu alias-no-hand=%d "
+           "live=%s provisional=%d "
            "original=(%.1f,%.1f,%.1f,%.1f) expected=(%.1f,%.1f,%.1f,%.1f) "
            "last=%d:(%.1f,%.1f,%.1f,%.1f) reappear=%d/%d:(%.1f,%.1f,%.1f,%.1f) "
            "reason=%s",
@@ -1757,6 +2146,13 @@ void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
            track.not_hold_evidence_count, track.no_hand_missing_count,
            (track.b_claim_ambiguous || track.contact_path_ambiguous ||
             track.no_hand_candidate_ambiguous) ? 1 : 0,
+           runtime_owner_kind_name(track),
+           track.pending_d_quarantined_by_old_c ? 1 : 0,
+           track.conflicting_old_item_ids.size(),
+           track.conflicting_suspect_keys.size(),
+           track.alias_no_hand_match_count,
+           live_observation_state_name(track.live_state),
+           track.live_state_provisional ? 1 : 0,
            track.original_box.x1, track.original_box.y1,
            track.original_box.x2, track.original_box.y2,
            expected.x1, expected.y1, expected.x2, expected.y2,
@@ -2229,6 +2625,13 @@ void SessionManager::promote_suspect_(int runtime_key, const Detection& detectio
         track.self_match_count < NEW_ITEM_CONFIRM_FRAMES) {
         return;
     }
+    if (track.pending_d_quarantined_by_old_c) {
+        trace_("D-GUARD",
+               "suspect=%d cls=%d action=keep-quarantined-runtime-only "
+               "reason=unresolved-c-d-alias self-match=%d formal-owner-authority=0",
+               track.suspect_id, track.cls_id, track.self_match_count);
+        return;
+    }
     const int item_id = working_next_item_id_++;
     working_inventory_[item_id] = make_inventory_item(item_id, detection,
                                                        frame_id, current_time_ms_);
@@ -2368,6 +2771,8 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     track.tentative_b_match_count = 0;
     track.tentative_b_started_touching_hand = false;
     confirmed_moved_ids_.insert(track.item_id);
+    set_live_state_(&track, LiveObservationState::PLACED, false,
+                    "moved-confirmed-after-direct-evidence");
     trace_track_("STATE", track, "confirm-rearrange");
 }
 
@@ -3138,6 +3543,87 @@ void SessionManager::scan_or_update_suspects_(
         }
         if (belongs_to_contact_track) continue;
 
+        // 细节11：旧 C 即使本帧已经临时认领了另一个同类框，也不等于
+        // 它已经结算。此时第二个未认领框必须实时建成 D 轨迹，但只要 C
+        // 仍是活动的操作开始旧库存，就将 D 隔离为 C-D alias，禁止它在
+        // 有手阶段取得 working_inventory_ 的排他身份。
+        std::set<int> alias_old_item_ids;
+        for (std::map<int, InventoryItem>::const_iterator old =
+                 operation_start_inventory_.begin();
+             old != operation_start_inventory_.end(); ++old) {
+            if (old->second.cls_id != d.cls_id ||
+                !working_inventory_.count(old->first) ||
+                pending_in_ids_.count(old->first)) {
+                continue;
+            }
+            std::map<int, OperationTrack>::const_iterator runtime =
+                track_buffer_.find(old->first);
+            if (runtime == track_buffer_.end() ||
+                !is_unresolved_operation_start_old_track(runtime->second) ||
+                !is_active_runtime_track(runtime->second)) {
+                continue;
+            }
+            std::map<int, int>::const_iterator owner =
+                effective_known_item_owner.find(old->first);
+            // 仅覆盖本次实机漏洞的窄分支：C 已经临时拥有另一个检测框，
+            // 当前 d 仍未认领。没有任何 owner 的 C 继续沿既有保护/未决
+            // 逻辑处理，避免改变已验证的同类相邻和 CONTACT_* 路径。
+            if (owner == effective_known_item_owner.end() ||
+                owner->second == static_cast<int>(di)) {
+                continue;
+            }
+            alias_old_item_ids.insert(old->first);
+        }
+        if (!alias_old_item_ids.empty()) {
+            OperationTrack track;
+            const int key = new_suspect_id_();
+            track.suspect_id = key;
+            track.is_suspect_new = true;
+            track.pending_d_quarantined_by_old_c = true;
+            track.conflicting_old_item_ids = alias_old_item_ids;
+            track.suspect_source = replacement_owner >= 0
+                ? SuspectSource::C_POSITION_REPLACEMENT_D
+                : SuspectSource::HAND_VISIBLE_D;
+            track.cls_id = d.cls_id;
+            track.original_box = d.box;
+            track.last_seen_box = d.box;
+            track.has_last_seen_box = true;
+            if (hand_visible_d) {
+                track.first_hand_block_box = d.box;
+                track.last_hand_block_box = d.box;
+                track.has_first_hand_block_box = true;
+                track.has_last_hand_block_box = true;
+            }
+            track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
+            track.shelter_or_hold = true;
+            track.self_match_count = 1;
+            track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
+            track.track.push_back(d.box);
+            track_buffer_[key] = track;
+            for (std::set<int>::const_iterator old_id = alias_old_item_ids.begin();
+                 old_id != alias_old_item_ids.end(); ++old_id) {
+                std::map<int, OperationTrack>::iterator old = track_buffer_.find(*old_id);
+                if (old != track_buffer_.end()) {
+                    old->second.conflicting_suspect_keys.insert(key);
+                    trace_("C-D-ALIAS",
+                           "old-item=%d suspect=%d detection=%zu phase=HAND "
+                           "relation=shared-or-unresolved action=create "
+                           "reason=same-class-unsettled-old-even-if-current-owner-exists",
+                           *old_id, key, di);
+                }
+            }
+            claimed_detection_indices->insert(static_cast<int>(di));
+            trace_("D-GUARD",
+                   "candidate=%zu cls=%d action=quarantine-pending-d suspect=%d "
+                   "conflicting-old-count=%zu reason=unresolved-same-class-old-even-if-current-owner-exists "
+                   "hand-touching=%d formal-owner-authority=0",
+                   di, d.cls_id, key, alias_old_item_ids.size(),
+                   hand_visible_d ? 1 : 0);
+            trace_track_("STATE", track_buffer_[key],
+                         "create-quarantined-hand-visible-suspect");
+            continue;
+        }
+
         // 即使当前成熟 C 的宽松路径暂时没有命中，其他同类旧 C 仍可能
         // 正在等待自己的原位置/轨迹证据。此时 B 只能进未决池，不能利用
         // “没有候选”这一瞬间伪造 D；只有同类旧 C 都有独立归属或已明确
@@ -3396,6 +3882,9 @@ void SessionManager::process_effective_hand_frame_(
                              first_hand_frame);
     apply_suspect_cover_evidence_(hand_box, detections, hand_moved);
     advance_claim_grace_(new_existing_track_ids);
+    // 有手阶段每张有效帧都必须维护实时观察层。这里不改变库存或事件，
+    // 只把 C/D/alias 当前的可撤销结论写入运行时记录和调试日志。
+    update_hand_live_states_();
 }
 
 void SessionManager::register_post_hand_reveal_suspects_(
@@ -3539,6 +4028,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
     std::set<int> claimed;
     std::vector<int> promote_keys;
     std::set<int> discard_keys;
+    std::set<int> discard_settled_old_c_duplicate_keys;
     const std::map<int, int> independent_static_owner_by_detection =
         build_independent_no_hand_static_owner_by_detection(
             detections, working_inventory_, operation_start_inventory_, track_buffer_);
@@ -3547,8 +4037,11 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
     // 计算，不能让上一帧歧义永久阻塞，也不能把本帧歧义拿去累计 OUT。
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
+        it->second.no_hand_detection_index = -1;
         if (!it->second.is_suspect_new) {
             it->second.no_hand_candidate_ambiguous = false;
+        } else if (it->second.pending_d_quarantined_by_old_c) {
+            it->second.alias_no_hand_matched_this_frame = false;
         }
     }
 
@@ -3749,7 +4242,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 if (found < 0 && !track.is_suspect_new) {
                     found = unique_no_hand_reappear_detection_for_track(
                         detections, candidate_claimed, it->first, track,
-                        working_inventory_, track_buffer_);
+                        working_inventory_, operation_start_inventory_,
+                        pending_in_ids_, track_buffer_);
                     found_as_reappear_candidate = found >= 0;
                     if (found >= 0) {
                         found_source = "UNIQUE_REAPPEAR";
@@ -3758,11 +4252,15 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     }
                 }
 
+                const StrictDetectionOwner fallback_strict_owner = found >= 0
+                    ? strict_owner_for_detection(
+                        detections[found], track.item_id, working_inventory_,
+                        operation_start_inventory_, pending_in_ids_, track_buffer_)
+                    : StrictDetectionOwner();
                 if (found < 0 || track.is_suspect_new || is_claim_protected(track) ||
                     found_at_original_position ||
                     contact_detection_is_at_original(track, detections[found]) ||
-                    !detection_strictly_matches_other_item(
-                        detections[found], track.item_id, working_inventory_)) {
+                    !strict_owner_blocks_old_c(fallback_strict_owner.kind)) {
                     break;
                 }
 
@@ -3860,25 +4358,52 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             }
             if (!track.is_suspect_new && found >= 0 &&
                 !found_at_original_position &&
-                !contact_detection_is_at_original(track, detections[found]) &&
-                detection_strictly_matches_other_item(
-                    detections[found], track.item_id, working_inventory_)) {
-                // A 的预计轨迹可以碰巧经过 B 的原位，但一个完整框若已经
-                // 严格属于另一件旧库存 B，就不能被 A 先抢走。它既不是 A
-                // 的 MOVED 证据，也不是 A 缺失的 OUT 证据，应保持未决。
-                track.reappearance_pending = true;
-                track.no_hand_candidate_ambiguous = true;
-                trace_("MATCH",
-                       "item=%d detection=%d reject=strictly-belongs-to-other-old-item "
-                       "excluded-static-neighbors=%zu stale-candidate-reset=%d "
-                       "tentative-reset=%d fallback-source=%s result=real-ambiguity",
-                       track.item_id, found,
-                       excluded_static_neighbor_detections.size(),
-                       stale_reappear_candidate_cleared ? 1 : 0,
-                       stale_tentative_b_cleared ? 1 : 0, found_source);
-                trace_track_("MATCH", track,
-                             "no-hand-candidate-strictly-belongs-to-other-old-item");
-                continue;
+                !contact_detection_is_at_original(track, detections[found])) {
+                const StrictDetectionOwner strict_owner = strict_owner_for_detection(
+                    detections[found], track.item_id, working_inventory_,
+                    operation_start_inventory_, pending_in_ids_, track_buffer_);
+                const bool is_current_c_alias =
+                    strict_owner_is_quarantined_alias_of_old_c(
+                        strict_owner, track.item_id, track_buffer_);
+                if ((strict_owner.kind == StrictOwnerKind::PENDING_D ||
+                     strict_owner.kind == StrictOwnerKind::QUARANTINED_PENDING_D) &&
+                    !is_current_c_alias) {
+                    // Pending D 没有 old C 的排他权限，也不能反过来被 C 单帧
+                    // 抢走。保留双方独立证据链，日志明确它是 runtime D 而非
+                    // "other old item"。
+                    track.reappearance_pending = true;
+                    track.no_hand_candidate_ambiguous = true;
+                    trace_("MATCH",
+                           "item=%d detection=%d defer=pending-runtime-owner "
+                           "owner-kind=%s owner-id=%d owner-runtime=%d "
+                           "owner-authority=provisional-runtime-only",
+                           track.item_id, found,
+                           strict_owner_kind_name(strict_owner.kind),
+                           strict_owner.item_id, strict_owner.runtime_key);
+                    trace_track_("MATCH", track,
+                                 "no-hand-candidate-belongs-to-pending-runtime-d");
+                    continue;
+                }
+                if (strict_owner_blocks_old_c(strict_owner.kind)) {
+                    // A 的预计轨迹可以碰巧经过 B 的原位，但一个完整框若已经
+                    // 严格属于另一件旧库存 B，就不能被 A 先抢走。它既不是 A
+                    // 的 MOVED 证据，也不是 A 缺失的 OUT 证据，应保持未决。
+                    track.reappearance_pending = true;
+                    track.no_hand_candidate_ambiguous = true;
+                    trace_("MATCH",
+                           "item=%d detection=%d reject=strict-owner "
+                           "owner-kind=%s owner-id=%d owner-runtime=%d "
+                           "excluded-static-neighbors=%zu stale-candidate-reset=%d "
+                           "tentative-reset=%d fallback-source=%s result=real-ambiguity",
+                           track.item_id, found, strict_owner_kind_name(strict_owner.kind),
+                           strict_owner.item_id, strict_owner.runtime_key,
+                           excluded_static_neighbor_detections.size(),
+                           stale_reappear_candidate_cleared ? 1 : 0,
+                           stale_tentative_b_cleared ? 1 : 0, found_source);
+                    trace_track_("MATCH", track,
+                                 "no-hand-candidate-strictly-owned-by-old-or-confirmed-item");
+                    continue;
+                }
             }
             if (!track.is_suspect_new && found >= 0 &&
                 !found_at_original_position &&
@@ -3923,7 +4448,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     track.no_hand_candidate_ambiguous =
                         has_ambiguous_no_hand_reappear_candidate(
                             detections, candidate_claimed, it->first, track,
-                            working_inventory_, track_buffer_,
+                            working_inventory_, operation_start_inventory_,
+                            pending_in_ids_, track_buffer_,
                             independent_static_owner_by_detection);
                     trace_track_("MATCH", track,
                                  track.no_hand_candidate_ambiguous
@@ -3945,8 +4471,37 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                                    : "excluded-static-neighbor-then-no-a-candidate");
                     }
                 }
-                // D 必须在后续直接无手帧中连续自匹配。未达到门槛就消失，
-                // 不保留为悬空 IN，更不能让它在后续随机帧重新凑次数。
+                // 对 C-D alias：当前框若已被 C 直接认领，D 只是同一框的
+                // 重复运行时解释，必须等待第二张直接无手帧再合并；不能按
+                // 普通 D 的“本帧未自匹配”规则立刻丢掉，否则 C 无法获得
+                // 连续的 alias 仲裁证据。
+                if (track.is_suspect_new &&
+                    track.pending_d_quarantined_by_old_c) {
+                    if (track.alias_no_hand_matched_this_frame) {
+                        trace_("C-D-ALIAS",
+                               "old-count=%zu suspect=%d phase=NO_HAND relation=shared-detection "
+                               "direct-count=%d action=%s",
+                               track.conflicting_old_item_ids.size(), track.suspect_id,
+                               track.alias_no_hand_match_count,
+                               track.alias_no_hand_match_count >=
+                                       FLOW3_NO_HAND_D_CONFIRM_FRAMES
+                                   ? "discard-duplicate"
+                                   : "wait-second-no-hand");
+                        if (track.alias_no_hand_match_count >=
+                            FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
+                            discard_keys.insert(it->first);
+                        }
+                    } else {
+                        track.alias_no_hand_match_count = 0;
+                        trace_("C-D-ALIAS",
+                               "old-count=%zu suspect=%d phase=NO_HAND relation=no-direct-pair "
+                               "action=keep-unresolved",
+                               track.conflicting_old_item_ids.size(), track.suspect_id);
+                    }
+                    continue;
+                }
+                // 普通 D 必须在后续直接无手帧中连续自匹配。未达到门槛就
+                // 消失，不保留为悬空 IN，更不能让它在后续随机帧重新凑次数。
                 if (track.is_suspect_new &&
                     track.no_hand_self_match_count < FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
                     discard_keys.insert(it->first);
@@ -3954,6 +4509,43 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 continue;
             }
             const Detection& d = detections[found];
+            bool shared_quarantined_alias = false;
+            if (!track.is_suspect_new) {
+                track.no_hand_detection_index = found;
+                for (std::set<int>::const_iterator key =
+                         track.conflicting_suspect_keys.begin();
+                     key != track.conflicting_suspect_keys.end(); ++key) {
+                    std::map<int, OperationTrack>::iterator suspect =
+                        track_buffer_.find(*key);
+                    if (suspect == track_buffer_.end() ||
+                        !suspect->second.pending_d_quarantined_by_old_c ||
+                        !suspect->second.conflicting_old_item_ids.count(track.item_id) ||
+                        !quarantined_suspect_matches_detection(suspect->second, d)) {
+                        continue;
+                    }
+                    OperationTrack& alias_d = suspect->second;
+                    alias_d.alias_no_hand_matched_this_frame = true;
+                    ++alias_d.alias_no_hand_match_count;
+                    track.alias_no_hand_match_count =
+                        alias_d.alias_no_hand_match_count;
+                    track.reappearance_pending = true;
+                    shared_quarantined_alias = true;
+                    trace_("C-D-ALIAS",
+                           "old-item=%d suspect=%d detection=%d phase=NO_HAND "
+                           "relation=shared-detection direct-count=%d "
+                           "action=%s",
+                           track.item_id, alias_d.suspect_id, found,
+                           alias_d.alias_no_hand_match_count,
+                           alias_d.alias_no_hand_match_count >=
+                                   FLOW3_NO_HAND_D_CONFIRM_FRAMES
+                               ? "assign-to-old-c-discard-duplicate"
+                               : "wait-second-no-hand");
+                    if (alias_d.alias_no_hand_match_count >=
+                        FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
+                        discard_keys.insert(*key);
+                    }
+                }
+            }
             claimed.insert(found);
             if (!track.is_suspect_new) {
                 track.no_hand_candidate_ambiguous = false;
@@ -3971,9 +4563,56 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             }
 
             if (track.is_suspect_new) {
+                if (track.pending_d_quarantined_by_old_c &&
+                    quarantined_suspect_detection_is_duplicate_of_settled_old_c(
+                        track, track_buffer_, found, d)) {
+                    // C 已先独立结算；D 当前又只命中同一个 C 框时，D 不再
+                    // 具有独立新增物品的任何证据。立即回收该重复 runtime
+                    // identity，避免下一帧把它累积为 IN。
+                    discard_keys.insert(it->first);
+                    discard_settled_old_c_duplicate_keys.insert(it->first);
+                    trace_("C-D-ALIAS",
+                           "suspect=%d detection=%d phase=NO_HAND "
+                           "relation=duplicate-settled-old-c "
+                           "action=discard-duplicate-settled-old-c",
+                           track.suspect_id, found);
+                    continue;
+                }
                 track.last_seen_box = d.box;
                 track.has_last_seen_box = true;
                 ++track.no_hand_self_match_count;
+                track.no_hand_detection_index = found;
+                if (track.pending_d_quarantined_by_old_c) {
+                    if (!quarantined_suspect_has_distinct_old_c_detections(
+                            track, track_buffer_, found, d)) {
+                        track.alias_no_hand_match_count = 0;
+                        trace_("C-D-ALIAS",
+                               "suspect=%d detection=%d phase=NO_HAND relation=not-independent "
+                               "action=keep-unresolved",
+                               track.suspect_id, found);
+                        continue;
+                    }
+                    track.alias_no_hand_matched_this_frame = true;
+                    ++track.alias_no_hand_match_count;
+                    trace_("C-D-ALIAS",
+                           "suspect=%d detection=%d phase=NO_HAND relation=distinct-detections "
+                           "old-count=%zu direct-count=%d action=%s",
+                           track.suspect_id, found, track.conflicting_old_item_ids.size(),
+                           track.alias_no_hand_match_count,
+                           track.alias_no_hand_match_count >=
+                                   FLOW3_NO_HAND_D_CONFIRM_FRAMES
+                               ? "confirm-independent-d"
+                               : "wait-second-no-hand");
+                    if (track.alias_no_hand_match_count <
+                        FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
+                        continue;
+                    }
+                    const int released_key = it->first;
+                    unlink_quarantined_suspect_(released_key,
+                                                "confirm-independent-d");
+                    set_live_state_(&track, LiveObservationState::PROVISIONAL_D,
+                                    true, "independent-no-hand-d-confirmed");
+                }
             }
             if (track.is_suspect_new && !track.promoted_to_working_inventory) {
                 ++track.self_match_count;
@@ -4026,7 +4665,10 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     track.last_seen_box = d.box;
                     track.has_last_seen_box = true;
                     if ((track.hold_and_move || has_meaningful_hand_move(track)) &&
-                        boxes_differ_as_move(track.original_box, d.box)) {
+                        boxes_differ_as_move(track.original_box, d.box) &&
+                        (!shared_quarantined_alias ||
+                         track.alias_no_hand_match_count >=
+                             FLOW3_NO_HAND_D_CONFIRM_FRAMES)) {
                         confirm_rearrange_(track, d.box, d.score, 0);
                     }
                 }
@@ -4046,10 +4688,33 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
          discard != discard_keys.end(); ++discard) {
         std::map<int, OperationTrack>::iterator track = track_buffer_.find(*discard);
         if (track == track_buffer_.end()) continue;
-        printf("[3.0] suspect#%d 的手离开后完整框未连续确认，丢弃候选\n",
-               track->second.suspect_id);
-        trace_track_("STATE", track->second,
-                     "discard-suspect-missing-continuous-no-hand-confirmation");
+        const bool discard_alias_duplicate =
+            track->second.pending_d_quarantined_by_old_c;
+        const bool duplicate_of_settled_old_c =
+            discard_settled_old_c_duplicate_keys.count(*discard) > 0;
+        if (discard_alias_duplicate) {
+            unlink_quarantined_suspect_(
+                *discard,
+                duplicate_of_settled_old_c
+                    ? "discard-duplicate-settled-old-c"
+                    : "discard-duplicate");
+        }
+        if (duplicate_of_settled_old_c) {
+            printf("[3.0] suspect#%d 只命中已独立结算旧 C 的框，"
+                   "按重复身份丢弃\n", track->second.suspect_id);
+            trace_track_("C-D-ALIAS", track->second,
+                         "discard-quarantined-duplicate-of-settled-old-c");
+        } else if (discard_alias_duplicate) {
+            printf("[3.0] suspect#%d 与旧 C 的共享无手框已连续确认，"
+                   "按重复身份丢弃\n", track->second.suspect_id);
+            trace_track_("C-D-ALIAS", track->second,
+                         "discard-quarantined-duplicate-after-shared-no-hand-confirmation");
+        } else {
+            printf("[3.0] suspect#%d 的手离开后完整框未连续确认，丢弃候选\n",
+                   track->second.suspect_id);
+            trace_track_("STATE", track->second,
+                         "discard-suspect-missing-continuous-no-hand-confirmation");
+        }
         if (track->second.promoted_to_working_inventory && track->second.item_id > 0) {
             const int item_id = track->second.item_id;
             working_inventory_.erase(item_id);
@@ -4631,6 +5296,12 @@ bool SessionManager::has_unresolved_no_hand_state_(
                          track.no_hand_candidate_ambiguous
                              ? "ambiguous-no-hand-path-candidate"
                              : "claim-or-contact-ambiguity");
+            continue;
+        }
+        if (old_track_has_unresolved_alias_(track)) {
+            unresolved = true;
+            trace_track_("C-D-ALIAS", track,
+                         "old-c-awaits-quarantined-pending-d-no-hand-arbitration");
             continue;
         }
         if (observed_item_ids.count(track.item_id)) {

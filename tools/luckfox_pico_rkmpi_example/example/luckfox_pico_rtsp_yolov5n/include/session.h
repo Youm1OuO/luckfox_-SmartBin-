@@ -10,6 +10,7 @@
 
 #include <map>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "inventory.h"
@@ -91,6 +92,19 @@ enum class ExistingItemResolution {
     OCCLUDED_CONFIRMED,
 };
 
+// 手操作中的实时观察状态。它与最终库存事件分离：provisional=true 的状态
+// 可以在后续帧被修正，不能单独产生 IN / OUT / MOVED。
+enum class LiveObservationState {
+    NONE,
+    HAND_CONTACT,
+    POSSIBLE_MOVED,
+    POSSIBLE_OCCLUDED,
+    PROVISIONAL_D,
+    C_D_ALIAS,
+    POST_HAND_REVEAL_D,
+    PLACED,
+};
+
 // 最近一次将旧 C 退出活动 HAND/CONTACT 轨迹的直接原因。用于约束释放
 // 语义并生成可追溯日志，不能用模糊的“没匹配到”伪造 STATIC_CONFIRMED。
 enum class ReleaseReason {
@@ -169,6 +183,21 @@ struct OperationTrack {
     int no_hand_self_match_count = 0;
     // 旧 C 在无手阶段未被直接认领、也没有完整遮挡解释的连续次数。
     int no_hand_missing_count = 0;
+
+    // C-D alias 只存在于当前手操作的运行时层。被隔离的 D 仍逐帧更新，
+    // 但在有手阶段不得写入 working_inventory_ 成为正式/排他所有者。
+    bool pending_d_quarantined_by_old_c = false;
+    std::set<int> conflicting_old_item_ids;     // D -> operation-start old C
+    std::set<int> conflicting_suspect_keys;     // old C -> runtime D key
+    int alias_no_hand_match_count = 0;
+    bool alias_no_hand_matched_this_frame = false;
+    int no_hand_detection_index = -1;
+
+    // 对外/调试可追溯的实时观察层；它不替代 state、resolution 或最终事件。
+    LiveObservationState live_state = LiveObservationState::NONE;
+    bool live_state_provisional = true;
+    int live_state_last_changed_frame = -1;
+    std::string live_state_reason;
 
     // HAND_* 的手位移估计路径。CONTACT_* 不使用它来推算物品位置。
     std::vector<MoveValue> move_values;
@@ -314,6 +343,11 @@ private:
                            const char* caller = nullptr);
     void mark_pending_out_(int item_id);
     void refresh_confirmed_blockers_(const std::set<int>& observed_working_ids);
+    void set_live_state_(OperationTrack* track, LiveObservationState state,
+                         bool provisional, const char* reason);
+    void update_hand_live_states_();
+    void unlink_quarantined_suspect_(int runtime_key, const char* action);
+    bool old_track_has_unresolved_alias_(const OperationTrack& track) const;
     void trace_(const char* tag, const char* format, ...) const;
     void trace_track_(const char* tag, const OperationTrack& track,
                       const char* reason) const;

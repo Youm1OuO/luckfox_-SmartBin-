@@ -15,7 +15,7 @@ tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/session.c
 修改参数后必须重新交叉编译。建议一次只改一项，并保存“参数版本 + 视频 +
 事件日志”；多个阈值一起放宽，出现误匹配时会无法判断是哪一项造成的。
 
-当前版本（3.0-r13）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
+当前版本（3.0-r14）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
 自己的唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用
 的框才有机会进入疑似 D 链路。若某个 HAND_* 旧 C 没有自己的检测框，而同类贴手
 B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_candidate` 暂存，不能
@@ -45,10 +45,24 @@ B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_ca
 不会单帧强认 MOVED。若 B 没有上述独立原位证据，或一个框仍可同时属于多个旧 C，
 则保持未决，不会强认 MOVED、OUT 或新 D。
 
+r14 在上述规则之上增加了一个仅限当前手操作的 C-D alias 隔离层，且没有修改
+任何数值超参数、几何匹配范围或 IN/OUT/MOVED 的确认帧数。若一个操作开始前的
+同类旧 C 仍处于活动且未结算状态，即使该 C 本帧已经暂时认领了另一个检测框，
+第二个未认领同类框也会立刻建立为可追踪的 `PROVISIONAL_D` runtime track；它和 C
+记录 `C_D_ALIAS` 关系，但在有手阶段不得写入 `working_inventory_`、不得获得 staged
+item_id、不得作为“其他旧库存”排除 C。普通、无冲突 D 仍使用原有的提前 staged
+入库链路，不受此规则影响。
+
+手离开后仍先执行旧 C 的独立静态框/细节10 fallback，再对 alias 做连续直接无手
+仲裁：同类最终只有一个共享框时，第 1 张无手帧只等待，第 2 张连续直接帧将框归回
+旧 C 并丢弃重复 D，不产生 IN；旧 C 与真实 D 在两张无手帧各自拥有不同检测框时，
+才解除 D 的隔离并按原有流程提交 C 的 MOVED 和 D 的 IN。隔离 D 始终保留逐帧位置、
+贴手和路径更新，所以这不是“等手离开后才识别”。
+
 诊断追踪开关（不是匹配超参数）
 ----------------------------------
 
-FLOW3_DEBUG_TRACE_LOG（当前 false）
+FLOW3_DEBUG_TRACE_LOG（当前 true）
     代码位置：fridge_config.h。它只控制诊断输出，不参与匹配、计数或结算判断。
     实机复现异常时改为 true 后重新编译；常规部署保持 false，避免逐帧日志过多。
 
@@ -57,7 +71,8 @@ FLOW3_DEBUG_TRACE_LOG（当前 false）
     预计框、最近观测框、reappear candidate、保护期、hold/not_hold/缺失计数；
     `RELEASE` 还会带 release_reason、调用分支 caller、原位检测索引和 BBox（若存在）。
 
-    常用标签：STATE（状态转换）、MATCH（C->B 接受或拒绝原因；若出现
+    常用标签：STATE（状态转换）、LIVE-STATE（逐帧运行时状态；会给出
+    owner-kind、runtime key、正式 item_id、`provisional=0/1` 和原因）、MATCH（C->B 接受或拒绝原因；若出现
     `exclude-independent-static-neighbor-and-fallback`，表示过期候选已被独立静止
     邻居排除，程序正继续搜索当前 C 的真实框；其中
     `other-owner-evidence=direct-original-mutually-unique` 表示邻居在当前帧和该框
@@ -69,6 +84,19 @@ FLOW3_DEBUG_TRACE_LOG（当前 false）
     （同类可见框数、框到旧 C 的一对一保留、数量差额 OUT、框跳变清除及撤销）、SETTLE（拒绝或
     提交结算、库存变化和最终事件）。排查一次异常时，应按 operation_id 再按 item_id
     过滤，查看第一个不符合预期的 STATE/MATCH/VISIBLE-COUNT 转换。
+
+    r14 还会输出 D-GUARD 和 C-D-ALIAS。`D-GUARD action=quarantine-pending-d` 表示
+    同类未结算旧 C 与新框发生了身份冲突：D 已建立 runtime track，但
+    `formal-owner-authority=0`，不会在有手阶段 promote。C-D-ALIAS 会说明关系是
+    `shared-detection`、`distinct-detections` 还是尚未获得直接配对，并记录
+    `wait-second-no-hand`、`discard-duplicate`、`confirm-independent-d` 等仲裁动作；
+    `discard-duplicate-settled-old-c` 表示 D 只命中已经独立结算的 C 的同一直接
+    检测框，或在 C 本帧未再参与认领时与其结算框高度重合，因此 D 被按重复身份
+    回收而不会产生 IN。相邻但各自拥有不同 detection index 的同类 C、D 不会走
+    这条回收分支。
+    若 MATCH 出现 `reject=strict-owner`，后面的 `owner-kind` 可明确区分
+    `start-old-c`、`pending-d`、`quarantined-pending-d`、`confirmed-d`；只有
+    `start-old-c` 或已确认库存才具有“其他旧物品”的正式排除权限。
 
     同类数量不足跨帧累计时，`VISIBLE-COUNT` 会复用既有 `FLOW3_TRACK_*`
     匹配范围确认保留框仍连续；若保留框明显跳变，会清除未提交的数量不足
@@ -314,6 +342,12 @@ NEW_ITEM_CONFIRM_FRAMES（当前 2）
     的 C_POSITION_REPLACEMENT_D、以及手离开后首次完整出现的 POST_HAND_REVEAL_D。
     前两者从有手帧开始计数；第三者以首张无手完整 B 记为第 1 次，下一张有效无手帧
     必须自匹配才可提升。三者都不能绕过稳定快照直接正式 IN。
+
+    r14 不改变这个数值或普通 D 的提升时机。唯一例外是 `C_D_ALIAS` 中的
+    QUARANTINED_PENDING_D：它仍从首次有手帧建立并实时更新，但要等旧 C 与 D 在
+    连续直接无手帧中获得不同检测框，或旧 C 已独立结算，才允许进入原有的
+    `NEW_ITEM_CONFIRM_FRAMES -> working_inventory_ -> IN` 链路。该例外是身份
+    所有权隔离，不是放宽或降低 D 的确认要求。
 
 FLOW3_C_REPLACEMENT_MIN_COVER_RATIO（当前 0.30）
     有手阶段，若已有库存 C 已进入 HAND_*、本帧又没有自己的检测框，而一个未被

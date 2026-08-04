@@ -1682,6 +1682,170 @@ void test_no_hand_occlusion_uses_cover_union() {
     }
 }
 
+// 细节11-8.2：同一个被移动的旧 C 在有手帧中可能同时被 YOLO 给出一个
+// 局部/过期候选和一个完整新位置框。后者不能被直接 promote 成工作库存
+// D；它应保留为 C-D alias runtime track，并在两张直接无手帧后归回旧 C。
+void test_quarantined_same_class_duplicate_merges_back_to_old_c() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 100, 100, 200, 200));  // old orange C
+    initial.push_back(item(2, 2, 700, 100, 800, 200));  // static same-class B
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(2, 100, 100, 200, 200));
+    stable.push_back(det(2, 700, 100, 800, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    // t0: C is fully covered. t1/t2: the hand displacement predicts the
+    // narrow decoy box; the complete box is the same physical C at its new
+    // location. The old claim grace intentionally keeps existing behavior.
+    const fridge::BBox old_hand(80, 80, 220, 220);
+    const fridge::BBox moved_hand(370, 80, 610, 220);
+    const fridge::Detection decoy = det(2, 440, 100, 540, 200);
+    const fridge::Detection complete_c = det(2, 430, 95, 550, 205);
+    std::vector<fridge::Detection> only_b;
+    only_b.push_back(det(2, 700, 100, 800, 200));
+    send_frame(&session, only_b, std::vector<fridge::BBox>(1, old_hand), &frame);
+
+    std::vector<fridge::Detection> conflicting_hand_frame;
+    conflicting_hand_frame.push_back(decoy);
+    conflicting_hand_frame.push_back(complete_c);
+    conflicting_hand_frame.push_back(det(2, 700, 100, 800, 200));
+    send_frame(&session, conflicting_hand_frame,
+               std::vector<fridge::BBox>(1, moved_hand), &frame);
+    send_frame(&session, conflicting_hand_frame,
+               std::vector<fridge::BBox>(1, moved_hand), &frame);
+    send_frame(&session, conflicting_hand_frame,
+               std::vector<fridge::BBox>(1, moved_hand), &frame);
+
+    const std::map<int, fridge::OperationTrack>& hand_tracks =
+        session.operation_tracks();
+    assert(hand_tracks.find(1) != hand_tracks.end());
+    assert(hand_tracks.find(1)->second.live_state ==
+           fridge::LiveObservationState::C_D_ALIAS);
+    bool found_quarantined_duplicate = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             hand_tracks.begin(); it != hand_tracks.end(); ++it) {
+        const fridge::OperationTrack& track = it->second;
+        if (!track.is_suspect_new || !track.pending_d_quarantined_by_old_c ||
+            !track.conflicting_old_item_ids.count(1)) {
+            continue;
+        }
+        found_quarantined_duplicate = true;
+        assert(track.item_id <= 0);
+        assert(!track.promoted_to_working_inventory);
+        assert(track.live_state == fridge::LiveObservationState::C_D_ALIAS);
+        assert(track.live_state_provisional);
+        assert(track.has_last_seen_box);
+    }
+    assert(found_quarantined_duplicate);
+    assert(session.inventory().size() == 2);
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(complete_c);
+    final_boxes.push_back(det(2, 700, 100, 800, 200));
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        final_boxes, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+    assert(!has_event(first.settlement, fridge::EventKind::MOVED, 1));
+    assert(!has_event(first.settlement, fridge::EventKind::IN, 3));
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        final_boxes, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::IN, 3));
+}
+
+// 细节11-8.3：防止假 D 不能退化为吞掉真实 D。C 的完整新框和一个真实
+// 同类 D 都在有手阶段形成 provisional alias；无手两帧分别得到不同框后，
+// C 保留 old item_id 并 MOVED，D 才正式 IN。
+void test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // old apple C
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    const fridge::BBox old_hand(80, 80, 220, 220);
+    const fridge::BBox c_hand(370, 80, 610, 220);
+    const fridge::BBox c_and_d_hand(180, 80, 800, 220);
+    const fridge::Detection decoy = det(0, 440, 100, 540, 200);
+    const fridge::Detection complete_c = det(0, 430, 95, 550, 205);
+    const fridge::Detection real_d = det(0, 650, 100, 750, 200);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, old_hand), &frame);
+
+    std::vector<fridge::Detection> c_conflict;
+    c_conflict.push_back(decoy);
+    c_conflict.push_back(complete_c);
+    send_frame(&session, c_conflict, std::vector<fridge::BBox>(1, c_hand), &frame);
+    send_frame(&session, c_conflict, std::vector<fridge::BBox>(1, c_hand), &frame);
+
+    std::vector<fridge::Detection> c_and_d_conflict;
+    c_and_d_conflict.push_back(decoy);
+    c_and_d_conflict.push_back(complete_c);
+    c_and_d_conflict.push_back(real_d);
+    send_frame(&session, c_and_d_conflict,
+               std::vector<fridge::BBox>(1, c_and_d_hand), &frame);
+
+    bool found_c_alias = false;
+    bool found_real_d_alias = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        const fridge::OperationTrack& track = it->second;
+        if (!track.is_suspect_new || !track.pending_d_quarantined_by_old_c ||
+            !track.conflicting_old_item_ids.count(1)) {
+            continue;
+        }
+        assert(!track.promoted_to_working_inventory);
+        if (track.last_seen_box.x1 < 600.0f) {
+            found_c_alias = true;
+        } else {
+            found_real_d_alias = true;
+        }
+    }
+    assert(found_c_alias);
+    assert(found_real_d_alias);
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(complete_c);
+    final_boxes.push_back(real_d);
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        final_boxes, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        final_boxes, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(has_event(second.settlement, fridge::EventKind::IN, 2));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
+}
+
 }  // namespace
 
 int main() {
@@ -1727,5 +1891,7 @@ int main() {
     test_adjacent_same_class_deficit_requires_continuous_survivor_box();
     test_out_requires_two_direct_missing_frames();
     test_no_hand_occlusion_uses_cover_union();
+    test_quarantined_same_class_duplicate_merges_back_to_old_c();
+    test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes();
     return 0;
 }
