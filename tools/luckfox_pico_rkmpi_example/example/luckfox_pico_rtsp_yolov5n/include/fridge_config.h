@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r11";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r12";
 
 // =========================================================================
 //  类别 ID 配置

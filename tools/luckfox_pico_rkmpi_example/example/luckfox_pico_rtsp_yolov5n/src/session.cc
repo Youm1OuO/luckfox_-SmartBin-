@@ -1376,6 +1376,82 @@ float strict_match_cost(int cls_id, const BBox& reference,
     return center + 0.35f * width + 0.35f * height;
 }
 
+// 细节9的最终无手同类数量结算只在“一个框代表一个可见实例”时使用。
+// 即使几何证据完全重叠，也要给同类旧 C 一个稳定、可复现的保留顺序；
+// 这里的回退距离不会单独产生 MOVED，只决定不可区分时保留哪个 item_id。
+float visible_count_owner_cost(const InventoryItem& original,
+                               const OperationTrack* runtime,
+                               const Detection& observed) {
+    if (original.cls_id != observed.cls_id || observed.box.area() <= 0.0f) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const BBox base = original.base_box.area() > 0.0f
+        ? original.base_box : original.box;
+    const float shape_cost =
+        0.35f * ratio_difference(base.w(), observed.box.w()) +
+        0.35f * ratio_difference(base.h(), observed.box.h());
+    float result = 20.0f + normalized_nearby_distance(base, observed.box) + shape_cost;
+    if (strict_match_box(original.cls_id, base, observed.cls_id, observed.box)) {
+        result = strict_match_cost(original.cls_id, base, observed);
+    } else if (partial_match_box(original.cls_id, base,
+                                 observed.cls_id, observed.box)) {
+        result = 1.0f + (1.0f - iom(base, observed.box));
+    }
+
+    if (!runtime || runtime->is_suspect_new) return result;
+    const BBox runtime_reference = runtime->has_placed_box ? runtime->placed_box :
+        estimated_box(*runtime);
+    if (strict_match_box(runtime->cls_id, runtime_reference,
+                         observed.cls_id, observed.box)) {
+        result = std::min(result,
+                          2.0f + strict_match_cost(runtime->cls_id,
+                                                   runtime_reference, observed));
+    } else if (track_match_box(runtime->cls_id, runtime_reference,
+                               observed.cls_id, observed.box)) {
+        result = std::min(result,
+                          3.0f + normalized_nearby_distance(runtime_reference,
+                                                             observed.box) + shape_cost);
+    }
+    if (runtime->has_last_seen_box &&
+        track_match_box(runtime->cls_id, runtime->last_seen_box,
+                        observed.cls_id, observed.box)) {
+        result = std::min(result,
+                          4.0f + normalized_nearby_distance(runtime->last_seen_box,
+                                                             observed.box) + shape_cost);
+    }
+    return result;
+}
+
+// 数量不足只能跨连续、可解释的无手框累计。这里复用既有 track 匹配范围，
+// 不新增一套数值阈值；它只用于判断“上一张保留的可见实例是否仍是同一框”。
+bool visible_count_survivor_box_is_continuous(int cls_id, const BBox& previous,
+                                               const BBox& current) {
+    return track_match_box(cls_id, previous, cls_id, current);
+}
+
+// 已经完成自身连续确认的 D 不能为了填补旧 C 的可见数量而被抢回。未完成
+// 证据链的 suspect D 仍不能单独阻断旧 C 的保守处理。
+bool detection_matches_confirmed_suspect_d(
+        const Detection& detection,
+        const std::map<int, OperationTrack>& tracks) {
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        const OperationTrack& track = it->second;
+        if (!track.is_suspect_new || !track.promoted_to_working_inventory ||
+            !track.drop_confirmed || track.cls_id != detection.cls_id) {
+            continue;
+        }
+        const BBox reference = track.has_placed_box ? track.placed_box :
+            (track.has_last_seen_box ? track.last_seen_box : estimated_box(track));
+        if (strict_match_box(track.cls_id, reference, detection.cls_id, detection.box) ||
+            partial_match_box(track.cls_id, reference, detection.cls_id, detection.box) ||
+            track_match_box(track.cls_id, reference, detection.cls_id, detection.box)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 BBox choose_primary_hand(const std::vector<BBox>& hand_boxes) {
     BBox best;
     float best_area = -1.0f;
@@ -1655,6 +1731,13 @@ void SessionManager::reset_operation_runtime_() {
     pending_out_ids_.clear();
     confirmed_moved_ids_.clear();
     released_hand_candidate_ids_.clear();
+    visible_count_detection_owner_.clear();
+    visible_count_survivor_ids_.clear();
+    visible_count_out_candidate_ids_.clear();
+    visible_count_missing_counts_.clear();
+    visible_count_confirmed_out_ids_.clear();
+    visible_count_prior_survivors_by_cls_.clear();
+    visible_count_prior_survivor_boxes_by_cls_.clear();
     hand_track_.clear();
     has_old_hand_box_ = false;
     next_suspect_id_ = -1;
@@ -1805,6 +1888,13 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     pending_out_ids_.clear();
     confirmed_moved_ids_.clear();
     released_hand_candidate_ids_.clear();
+    visible_count_detection_owner_.clear();
+    visible_count_survivor_ids_.clear();
+    visible_count_out_candidate_ids_.clear();
+    visible_count_missing_counts_.clear();
+    visible_count_confirmed_out_ids_.clear();
+    visible_count_prior_survivors_by_cls_.clear();
+    visible_count_prior_survivor_boxes_by_cls_.clear();
     hand_track_.clear();
     hand_track_.push_back(hand_box);
     old_hand_box_ = hand_box;
@@ -3805,6 +3895,455 @@ void SessionManager::mark_pending_out_(int item_id) {
     }
 }
 
+void SessionManager::clear_visible_count_settlement_(bool restore_uncommitted_outs) {
+    for (std::map<int, int>::const_iterator it = visible_count_missing_counts_.begin();
+         it != visible_count_missing_counts_.end(); ++it) {
+        OperationTrack* track = find_runtime_for_item_(it->first);
+        if (track && !track->is_suspect_new) {
+            track->no_hand_missing_count = 0;
+        }
+    }
+    if (restore_uncommitted_outs) {
+        for (std::set<int>::const_iterator it = visible_count_confirmed_out_ids_.begin();
+             it != visible_count_confirmed_out_ids_.end(); ++it) {
+            pending_out_ids_.erase(*it);
+            OperationTrack* track = find_runtime_for_item_(*it);
+            if (track && !track->is_suspect_new &&
+                track->resolution == ExistingItemResolution::OUT_CONFIRMED) {
+                track->resolution = ExistingItemResolution::NONE;
+                track->needs_no_hand_settlement = true;
+                track->release_reason = ReleaseReason::NONE;
+                trace_track_("VISIBLE-COUNT", *track,
+                             "retract-uncommitted-visible-count-out");
+            }
+        }
+    }
+    visible_count_detection_owner_.clear();
+    visible_count_survivor_ids_.clear();
+    visible_count_out_candidate_ids_.clear();
+    visible_count_missing_counts_.clear();
+    visible_count_confirmed_out_ids_.clear();
+    visible_count_prior_survivors_by_cls_.clear();
+    visible_count_prior_survivor_boxes_by_cls_.clear();
+}
+
+void SessionManager::prepare_visible_count_settlement_(
+        const std::vector<Detection>& detections) {
+    std::map<int, std::vector<int> > detection_indices_by_cls;
+    for (size_t di = 0; di < detections.size(); ++di) {
+        if (detections[di].cls_id >= 0 && detections[di].box.area() > 0.0f) {
+            detection_indices_by_cls[detections[di].cls_id].push_back(
+                static_cast<int>(di));
+        }
+    }
+
+    std::map<int, std::vector<int> > old_visible_ids_by_cls;
+    std::set<int> classes_with_runtime;
+    for (std::map<int, InventoryItem>::const_iterator original =
+             operation_start_inventory_.begin();
+         original != operation_start_inventory_.end(); ++original) {
+        std::map<int, InventoryItem>::const_iterator current =
+            working_inventory_.find(original->first);
+        if (current == working_inventory_.end() ||
+            original->second.status == ItemStatus::OCCLUDED ||
+            current->second.status == ItemStatus::OCCLUDED) {
+            continue;
+        }
+        const bool confirmed_by_visible_count =
+            visible_count_confirmed_out_ids_.count(original->first) > 0;
+        if (pending_out_ids_.count(original->first) && !confirmed_by_visible_count) {
+            continue;
+        }
+        const OperationTrack* runtime = find_runtime_for_item_(original->first);
+        if (runtime && runtime->is_suspect_new) continue;
+        if (runtime && !confirmed_by_visible_count &&
+            (runtime->resolution == ExistingItemResolution::OUT_CONFIRMED ||
+             runtime->resolution == ExistingItemResolution::OCCLUDED_CONFIRMED)) {
+            continue;
+        }
+        old_visible_ids_by_cls[original->second.cls_id].push_back(original->first);
+        if (runtime && (is_active_runtime_track(*runtime) ||
+                        existing_item_needs_settlement(*runtime) ||
+                        confirmed_by_visible_count)) {
+            classes_with_runtime.insert(original->second.cls_id);
+        }
+    }
+
+    visible_count_detection_owner_.clear();
+    visible_count_survivor_ids_.clear();
+    std::set<int> next_out_candidates;
+    std::set<int> active_deficit_classes;
+    std::set<int> continuity_reset_item_ids;
+
+    for (std::map<int, std::vector<int> >::const_iterator group =
+             old_visible_ids_by_cls.begin();
+         group != old_visible_ids_by_cls.end(); ++group) {
+        const int cls_id = group->first;
+        const std::vector<int>& old_ids = group->second;
+        std::map<int, std::vector<int> >::const_iterator detections_it =
+            detection_indices_by_cls.find(cls_id);
+        const std::vector<int> empty_detection_indices;
+        const std::vector<int>& detection_indices =
+            detections_it == detection_indices_by_cls.end()
+                ? empty_detection_indices : detections_it->second;
+
+        bool has_protected_old_track = false;
+        for (size_t oi = 0; oi < old_ids.size(); ++oi) {
+            const OperationTrack* runtime = find_runtime_for_item_(old_ids[oi]);
+            if (runtime && is_claim_protected(*runtime)) {
+                has_protected_old_track = true;
+                break;
+            }
+        }
+        if (old_ids.size() < 2 || !classes_with_runtime.count(cls_id) ||
+            has_protected_old_track || detection_indices.size() >= old_ids.size()) {
+            continue;
+        }
+
+        active_deficit_classes.insert(cls_id);
+        std::set<int> remaining_items(old_ids.begin(), old_ids.end());
+        std::set<int> remaining_detections;
+        std::set<int> confirmed_d_detection_indices;
+        for (size_t di = 0; di < detection_indices.size(); ++di) {
+            const int detection_index = detection_indices[di];
+            const Detection& detection = detections[detection_index];
+            const bool owned_by_confirmed_d = detection_matches_confirmed_suspect_d(
+                detection, track_buffer_);
+            trace_("VISIBLE-COUNT",
+                   "cls=%d detection=%d input box=(%.1f,%.1f,%.1f,%.1f) score=%.3f confirmed-d=%d",
+                   cls_id, detection_index, detection.box.x1, detection.box.y1,
+                   detection.box.x2, detection.box.y2, detection.score,
+                   owned_by_confirmed_d ? 1 : 0);
+            if (!owned_by_confirmed_d) {
+                remaining_detections.insert(detection_index);
+            } else {
+                confirmed_d_detection_indices.insert(detection_index);
+            }
+        }
+        std::set<int> survivors;
+        std::map<int, const char*> assignment_reasons;
+
+        // 先用双方都唯一的严格原位框锁住静止邻居。这样 B 的独立框不会
+        // 被 A 的宽松路径再次解释为歧义。
+        bool made_progress = true;
+        while (made_progress) {
+            made_progress = false;
+            std::map<int, std::vector<int> > item_candidates;
+            std::map<int, std::vector<int> > detection_candidates;
+            for (std::set<int>::const_iterator item_id = remaining_items.begin();
+                 item_id != remaining_items.end(); ++item_id) {
+                std::map<int, InventoryItem>::const_iterator original =
+                    operation_start_inventory_.find(*item_id);
+                if (original == operation_start_inventory_.end()) continue;
+                const BBox reference = original->second.base_box.area() > 0.0f
+                    ? original->second.base_box : original->second.box;
+                for (std::set<int>::const_iterator detection_index =
+                         remaining_detections.begin();
+                     detection_index != remaining_detections.end(); ++detection_index) {
+                    if (!strict_match_box(original->second.cls_id, reference,
+                                          detections[*detection_index].cls_id,
+                                          detections[*detection_index].box)) {
+                        continue;
+                    }
+                    item_candidates[*item_id].push_back(*detection_index);
+                    detection_candidates[*detection_index].push_back(*item_id);
+                }
+            }
+            for (std::map<int, std::vector<int> >::const_iterator item =
+                     item_candidates.begin();
+                 item != item_candidates.end(); ++item) {
+                if (item->second.size() != 1) continue;
+                const int detection_index = item->second.front();
+                if (detection_candidates[detection_index].size() != 1 ||
+                    !remaining_items.count(item->first) ||
+                    !remaining_detections.count(detection_index)) {
+                    continue;
+                }
+                visible_count_detection_owner_[detection_index] = item->first;
+                visible_count_survivor_ids_.insert(item->first);
+                survivors.insert(item->first);
+                assignment_reasons[detection_index] = "unique-direct-static";
+                remaining_items.erase(item->first);
+                remaining_detections.erase(detection_index);
+                trace_("VISIBLE-COUNT",
+                       "cls=%d detection=%d reserved-for-item=%d reason=unique-direct-static",
+                       cls_id, detection_index, item->first);
+                made_progress = true;
+            }
+        }
+
+        // 只有画面真的不可区分时才使用上一张无手帧的存活 id 作为稳定决胜；
+        // 它不是 map 遍历顺序，也不会单独证明 MOVED。
+        const std::map<int, std::set<int> >::const_iterator previous_survivors_it =
+            visible_count_prior_survivors_by_cls_.find(cls_id);
+        const std::set<int> empty_previous_survivors;
+        const std::set<int>& previous_survivors =
+            previous_survivors_it == visible_count_prior_survivors_by_cls_.end()
+                ? empty_previous_survivors : previous_survivors_it->second;
+        const std::map<int, std::map<int, BBox> >::const_iterator previous_boxes_it =
+            visible_count_prior_survivor_boxes_by_cls_.find(cls_id);
+        const std::map<int, BBox> empty_previous_boxes;
+        const std::map<int, BBox>& previous_survivor_boxes =
+            previous_boxes_it == visible_count_prior_survivor_boxes_by_cls_.end()
+                ? empty_previous_boxes : previous_boxes_it->second;
+        for (std::set<int>::const_iterator prior = previous_survivors.begin();
+             prior != previous_survivors.end(); ++prior) {
+            if (!remaining_items.count(*prior) || remaining_detections.empty()) continue;
+            const std::map<int, BBox>::const_iterator previous_box =
+                previous_survivor_boxes.find(*prior);
+            if (previous_box == previous_survivor_boxes.end()) continue;
+            const OperationTrack* runtime = find_runtime_for_item_(*prior);
+            std::map<int, InventoryItem>::const_iterator original =
+                operation_start_inventory_.find(*prior);
+            if (original == operation_start_inventory_.end()) continue;
+            int best_detection = -1;
+            float best_cost = std::numeric_limits<float>::infinity();
+            for (std::set<int>::const_iterator detection_index =
+                     remaining_detections.begin();
+                 detection_index != remaining_detections.end(); ++detection_index) {
+                if (!visible_count_survivor_box_is_continuous(
+                        cls_id, previous_box->second,
+                        detections[*detection_index].box)) {
+                    trace_("VISIBLE-COUNT",
+                           "cls=%d detection=%d prior-survivor=%d action=reject-prior reason=box-discontinuous",
+                           cls_id, *detection_index, *prior);
+                    continue;
+                }
+                const float cost = visible_count_owner_cost(
+                    original->second, runtime, detections[*detection_index]);
+                if (cost + 0.0001f < best_cost ||
+                    (std::fabs(cost - best_cost) <= 0.0001f &&
+                     (best_detection < 0 || *detection_index < best_detection))) {
+                    best_cost = cost;
+                    best_detection = *detection_index;
+                }
+            }
+            if (best_detection < 0) continue;
+            visible_count_detection_owner_[best_detection] = *prior;
+            visible_count_survivor_ids_.insert(*prior);
+            survivors.insert(*prior);
+            assignment_reasons[best_detection] = "previous-no-hand-survivor";
+            remaining_items.erase(*prior);
+            remaining_detections.erase(best_detection);
+            trace_("VISIBLE-COUNT",
+                   "cls=%d detection=%d reserved-for-item=%d reason=previous-no-hand-survivor",
+                   cls_id, best_detection, *prior);
+        }
+
+        // 仍不可区分时，选择全局最小成本 pair；完全相同才按 item_id /
+        // detection index 决胜，保证两张连续无手帧不会因遍历顺序换身份。
+        while (!remaining_items.empty() && !remaining_detections.empty()) {
+            int best_item = -1;
+            int best_detection = -1;
+            float best_cost = std::numeric_limits<float>::infinity();
+            for (std::set<int>::const_iterator item_id = remaining_items.begin();
+                 item_id != remaining_items.end(); ++item_id) {
+                const OperationTrack* runtime = find_runtime_for_item_(*item_id);
+                std::map<int, InventoryItem>::const_iterator original =
+                    operation_start_inventory_.find(*item_id);
+                if (original == operation_start_inventory_.end()) continue;
+                for (std::set<int>::const_iterator detection_index =
+                         remaining_detections.begin();
+                     detection_index != remaining_detections.end(); ++detection_index) {
+                    const float cost = visible_count_owner_cost(
+                        original->second, runtime, detections[*detection_index]);
+                    const bool better_cost = cost + 0.0001f < best_cost;
+                    const bool equal_cost = std::fabs(cost - best_cost) <= 0.0001f;
+                    const bool better_tie = equal_cost &&
+                        (best_item < 0 || *item_id < best_item ||
+                         (*item_id == best_item && *detection_index < best_detection));
+                    if (better_cost || better_tie) {
+                        best_cost = cost;
+                        best_item = *item_id;
+                        best_detection = *detection_index;
+                    }
+                }
+            }
+            if (best_item < 0 || best_detection < 0) break;
+            visible_count_detection_owner_[best_detection] = best_item;
+            visible_count_survivor_ids_.insert(best_item);
+            survivors.insert(best_item);
+            assignment_reasons[best_detection] = "min-cost";
+            remaining_items.erase(best_item);
+            remaining_detections.erase(best_detection);
+            trace_("VISIBLE-COUNT",
+                   "cls=%d detection=%d reserved-for-item=%d reason=min-cost",
+                   cls_id, best_detection, best_item);
+        }
+
+        std::map<int, BBox> current_survivor_boxes;
+        for (std::map<int, int>::const_iterator assignment =
+                 visible_count_detection_owner_.begin();
+             assignment != visible_count_detection_owner_.end(); ++assignment) {
+            if (!survivors.count(assignment->second) ||
+                detections[assignment->first].cls_id != cls_id) {
+                continue;
+            }
+            current_survivor_boxes[assignment->second] = detections[assignment->first].box;
+        }
+        bool survivor_box_discontinuous = false;
+        for (std::set<int>::const_iterator prior = previous_survivors.begin();
+             prior != previous_survivors.end(); ++prior) {
+            if (!survivors.count(*prior)) continue;
+            const std::map<int, BBox>::const_iterator previous_box =
+                previous_survivor_boxes.find(*prior);
+            const std::map<int, BBox>::const_iterator current_box =
+                current_survivor_boxes.find(*prior);
+            if (previous_box == previous_survivor_boxes.end() ||
+                current_box == current_survivor_boxes.end() ||
+                !visible_count_survivor_box_is_continuous(
+                    cls_id, previous_box->second, current_box->second)) {
+                survivor_box_discontinuous = true;
+                trace_("VISIBLE-COUNT",
+                       "cls=%d survivor=%d action=clear-deficit reason=survivor-box-discontinuous "
+                       "previous=(%.1f,%.1f,%.1f,%.1f) current=(%.1f,%.1f,%.1f,%.1f)",
+                       cls_id, *prior,
+                       previous_box == previous_survivor_boxes.end() ? 0.0f : previous_box->second.x1,
+                       previous_box == previous_survivor_boxes.end() ? 0.0f : previous_box->second.y1,
+                       previous_box == previous_survivor_boxes.end() ? 0.0f : previous_box->second.x2,
+                       previous_box == previous_survivor_boxes.end() ? 0.0f : previous_box->second.y2,
+                       current_box == current_survivor_boxes.end() ? 0.0f : current_box->second.x1,
+                       current_box == current_survivor_boxes.end() ? 0.0f : current_box->second.y1,
+                       current_box == current_survivor_boxes.end() ? 0.0f : current_box->second.x2,
+                       current_box == current_survivor_boxes.end() ? 0.0f : current_box->second.y2);
+            }
+        }
+        if (survivor_box_discontinuous) {
+            continuity_reset_item_ids.insert(old_ids.begin(), old_ids.end());
+        }
+        visible_count_prior_survivors_by_cls_[cls_id] = survivors;
+        visible_count_prior_survivor_boxes_by_cls_[cls_id] = current_survivor_boxes;
+        for (size_t oi = 0; oi < old_ids.size(); ++oi) {
+            if (!survivors.count(old_ids[oi])) {
+                next_out_candidates.insert(old_ids[oi]);
+            }
+        }
+        for (size_t di = 0; di < detection_indices.size(); ++di) {
+            const int detection_index = detection_indices[di];
+            const Detection& detection = detections[detection_index];
+            if (confirmed_d_detection_indices.count(detection_index)) {
+                trace_("VISIBLE-COUNT",
+                       "cls=%d detection=%d decision=confirmed-d box=(%.1f,%.1f,%.1f,%.1f) score=%.3f",
+                       cls_id, detection_index, detection.box.x1, detection.box.y1,
+                       detection.box.x2, detection.box.y2, detection.score);
+                continue;
+            }
+            const std::map<int, int>::const_iterator owner =
+                visible_count_detection_owner_.find(detection_index);
+            if (owner == visible_count_detection_owner_.end()) {
+                trace_("VISIBLE-COUNT",
+                       "cls=%d detection=%d decision=unassigned box=(%.1f,%.1f,%.1f,%.1f) score=%.3f",
+                       cls_id, detection_index, detection.box.x1, detection.box.y1,
+                       detection.box.x2, detection.box.y2, detection.score);
+                continue;
+            }
+            const std::map<int, const char*>::const_iterator reason =
+                assignment_reasons.find(detection_index);
+            trace_("VISIBLE-COUNT",
+                   "cls=%d detection=%d decision=reserve item=%d reason=%s box=(%.1f,%.1f,%.1f,%.1f) score=%.3f",
+                   cls_id, detection_index, owner->second,
+                   reason == assignment_reasons.end() ? "unknown" : reason->second,
+                   detection.box.x1, detection.box.y1, detection.box.x2, detection.box.y2,
+                   detection.score);
+        }
+        for (size_t oi = 0; oi < old_ids.size(); ++oi) {
+            if (survivors.count(old_ids[oi])) continue;
+            for (std::map<int, int>::const_iterator assignment =
+                     visible_count_detection_owner_.begin();
+                 assignment != visible_count_detection_owner_.end(); ++assignment) {
+                if (detections[assignment->first].cls_id != cls_id) continue;
+                trace_("VISIBLE-COUNT",
+                       "detection=%d reserved_for_item=%d excluded_from_item=%d "
+                       "reason=independent-same-class-survivor",
+                       assignment->first, assignment->second, old_ids[oi]);
+            }
+        }
+        trace_("VISIBLE-COUNT",
+               "cls=%d old-visible=%zu raw-detections=%zu retained-old=%zu deficit=%zu",
+               cls_id, old_ids.size(), detection_indices.size(), survivors.size(),
+               old_ids.size() - survivors.size());
+    }
+
+    for (std::map<int, std::set<int> >::iterator prior =
+             visible_count_prior_survivors_by_cls_.begin();
+         prior != visible_count_prior_survivors_by_cls_.end();) {
+        if (!active_deficit_classes.count(prior->first)) {
+            visible_count_prior_survivors_by_cls_.erase(prior++);
+        } else {
+            ++prior;
+        }
+    }
+    for (std::map<int, std::map<int, BBox> >::iterator prior =
+             visible_count_prior_survivor_boxes_by_cls_.begin();
+         prior != visible_count_prior_survivor_boxes_by_cls_.end();) {
+        if (!active_deficit_classes.count(prior->first)) {
+            visible_count_prior_survivor_boxes_by_cls_.erase(prior++);
+        } else {
+            ++prior;
+        }
+    }
+
+    // 数量恢复、类别不再短缺或手再次出现之前，都不能让上一轮缺失证据在
+    // 随机帧继续累积；已标记但尚未提交的 OUT 也要一并撤销。
+    for (std::map<int, int>::iterator missing = visible_count_missing_counts_.begin();
+         missing != visible_count_missing_counts_.end();) {
+        const bool reset_for_discontinuity =
+            continuity_reset_item_ids.count(missing->first) > 0;
+        if (next_out_candidates.count(missing->first) && !reset_for_discontinuity) {
+            ++missing;
+            continue;
+        }
+        const int item_id = missing->first;
+        if (visible_count_confirmed_out_ids_.count(item_id)) {
+            pending_out_ids_.erase(item_id);
+            visible_count_confirmed_out_ids_.erase(item_id);
+            OperationTrack* track = find_runtime_for_item_(item_id);
+            if (track && !track->is_suspect_new &&
+                track->resolution == ExistingItemResolution::OUT_CONFIRMED) {
+                track->resolution = ExistingItemResolution::NONE;
+                track->needs_no_hand_settlement = true;
+                track->release_reason = ReleaseReason::NONE;
+            }
+            trace_("VISIBLE-COUNT",
+                   "item=%d action=retract-confirmed-out reason=%s",
+                   item_id, reset_for_discontinuity
+                       ? "survivor-box-discontinuous" : "visible-count-recovered");
+        }
+        OperationTrack* track = find_runtime_for_item_(item_id);
+        if (track && !track->is_suspect_new) track->no_hand_missing_count = 0;
+        missing = visible_count_missing_counts_.erase(missing);
+    }
+
+    visible_count_out_candidate_ids_.swap(next_out_candidates);
+    for (std::set<int>::const_iterator candidate =
+             visible_count_out_candidate_ids_.begin();
+         candidate != visible_count_out_candidate_ids_.end(); ++candidate) {
+        const int old_count = visible_count_missing_counts_[*candidate];
+        const int new_count = old_count + 1;
+        visible_count_missing_counts_[*candidate] = new_count;
+        OperationTrack* track = find_runtime_for_item_(*candidate);
+        if (track && !track->is_suspect_new) {
+            track->no_hand_missing_count = new_count;
+        }
+        trace_("VISIBLE-COUNT",
+               "item=%d action=count-deficit old=%d new=%d threshold=%d",
+               *candidate, old_count, new_count, FLOW3_NO_HAND_OUT_MISSING_FRAMES);
+        if (new_count >= FLOW3_NO_HAND_OUT_MISSING_FRAMES &&
+            !pending_out_ids_.count(*candidate)) {
+            mark_pending_out_(*candidate);
+            visible_count_confirmed_out_ids_.insert(*candidate);
+            if (track && !track->is_suspect_new) {
+                trace_track_("VISIBLE-COUNT", *track,
+                             "confirm-out-visible-count-deficit");
+            } else {
+                trace_("VISIBLE-COUNT",
+                       "item=%d action=confirm-out reason=visible-count-deficit",
+                       *candidate);
+            }
+        }
+    }
+}
+
 void SessionManager::refresh_confirmed_blockers_(const std::set<int>& /*observed_working_ids*/) {
     // 最终无手直接帧中统一重算。手还在时不按任意框交集写 block_ids，
     // 避免旧 2.0 版本那种 blocker 不断膨胀的问题。
@@ -3814,6 +4353,28 @@ bool SessionManager::has_unresolved_no_hand_state_(
         const std::set<int>& observed_item_ids,
         const std::set<int>& fully_occluded_item_ids) {
     bool unresolved = false;
+
+    // 数量不足 OUT 候选中可能有“本次手操作没有单独建轨”的旧 C。它们也
+    // 必须让整轮操作等待到第二张直接无手帧，不能因为没有 OperationTrack
+    // 就在首帧把旧库存原样提交回去。
+    for (std::set<int>::const_iterator item =
+             visible_count_out_candidate_ids_.begin();
+         item != visible_count_out_candidate_ids_.end(); ++item) {
+        if (observed_item_ids.count(*item) || fully_occluded_item_ids.count(*item)) {
+            continue;
+        }
+        if (pending_out_ids_.count(*item)) {
+            trace_("VISIBLE-COUNT",
+                   "item=%d settlement=out-confirmed-visible-count-deficit",
+                   *item);
+        } else {
+            unresolved = true;
+            trace_("VISIBLE-COUNT",
+                   "item=%d settlement=defer-visible-count-deficit count=%d",
+                   *item, visible_count_missing_counts_[*item]);
+        }
+    }
+
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
@@ -3832,6 +4393,32 @@ bool SessionManager::has_unresolved_no_hand_state_(
         }
 
         if (!existing_item_needs_settlement(track)) continue;
+
+        const bool is_visible_count_out_candidate =
+            visible_count_out_candidate_ids_.count(track.item_id) &&
+            !observed_item_ids.count(track.item_id) &&
+            !fully_occluded_item_ids.count(track.item_id);
+        const bool is_visible_count_survivor =
+            visible_count_survivor_ids_.count(track.item_id) &&
+            observed_item_ids.count(track.item_id);
+        if (is_visible_count_out_candidate) {
+            // 该 C 已经在本帧同类一对一分配中没有任何可见框。邻居 B 的框
+            // 已被独占保留，不能再作为 A 的歧义候选阻止连续 OUT 计数。
+            trace_track_("VISIBLE-COUNT", track,
+                         pending_out_ids_.count(track.item_id)
+                             ? "out-confirmed-visible-count-deficit"
+                             : "await-visible-count-deficit-confirmation");
+            continue;
+        }
+        if (is_visible_count_survivor) {
+            // 强制保留只代表一个可见实例，不使它绕过本轮“连续无手”要求；
+            // 本函数被调用前已由 prepare_visible_count_settlement_ 保证两帧
+            // 都会重新建立同一保留关系。
+            track.no_hand_missing_count = 0;
+            trace_track_("VISIBLE-COUNT", track,
+                         "directly-observed-visible-count-survivor");
+            continue;
+        }
 
         // 状态被意外变成 NORMAL 绝不是“旧 C 已结案”。此时没有可靠活动
         // 轨迹可安全累计 OUT，必须保持未决并阻止本轮提交。
@@ -3935,6 +4522,10 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     SettlementResult result;
     if (!working_inventory_active_) return result;
 
+    // 细节9：先得到本帧同类“一框一物品”的唯一保留关系。它只在可见数量
+    // 已不足时填补单摄像头无法观察个体身份的空白，普通 C->B/D 仲裁不变。
+    prepare_visible_count_settlement_(detections);
+
     std::map<int, InventoryItem> final_items = working_inventory_;
     const std::vector<Detection>& observed = detections;
     std::vector<int> observation_owner(observed.size(), -1);
@@ -3988,6 +4579,29 @@ SettlementResult SessionManager::settle_no_hand_frame_(
          it != ambiguous_ids.end(); ++it) {
         all_ids.erase(*it);
         track_priority_ids.erase(*it);
+    }
+
+    // 已由可见数量结算保留给某个旧 C 的框必须先占用，不能让同一个框随后
+    // 又被另一个同类 C 的宽松轨迹绑定。即使旧 C 的运行时路径有歧义，这个
+    // 强制绑定也只表示“保留一个可见实例”，不单独生成 MOVED。
+    for (std::map<int, int>::const_iterator assignment =
+             visible_count_detection_owner_.begin();
+         assignment != visible_count_detection_owner_.end(); ++assignment) {
+        const int detection_index = assignment->first;
+        const int item_id = assignment->second;
+        if (detection_index < 0 ||
+            static_cast<size_t>(detection_index) >= observed.size() ||
+            !final_items.count(item_id) || pending_out_ids_.count(item_id) ||
+            observation_owner[detection_index] >= 0 ||
+            item_to_observation.count(item_id)) {
+            continue;
+        }
+        if (final_items[item_id].cls_id != observed[detection_index].cls_id) continue;
+        item_to_observation[item_id] = detection_index;
+        observation_owner[detection_index] = item_id;
+        trace_("VISIBLE-COUNT",
+               "detection=%d reserved-for-item=%d action=force-no-hand-observation",
+               detection_index, item_id);
     }
 
     // 动态轨迹没有唯一终点时，不能因为当前框暂时漏检就直接把旧物品
@@ -4280,6 +4894,12 @@ FrameProcessResult SessionManager::process_frame(
            working_inventory_active_ ? 1 : 0, track_buffer_.size(), no_hand_streak_);
 
     if (hand_present_) {
+        // 细节9的数量不足只属于一段连续无手收尾。手重新进入时，上一段
+        // 尚未提交的“一框一物品”候选必须撤销，不能跨操作继续凑 OUT 帧数。
+        if (!visible_count_missing_counts_.empty() ||
+            !visible_count_confirmed_out_ids_.empty()) {
+            clear_visible_count_settlement_(true);
+        }
         finalize_initial_check_before_hand_();
         no_hand_streak_ = 0;
         if (!has_local_inventory_) return output;

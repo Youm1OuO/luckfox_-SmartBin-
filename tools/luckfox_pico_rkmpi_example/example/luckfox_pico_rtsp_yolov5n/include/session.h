@@ -292,6 +292,10 @@ private:
                                            int frame_id);
     bool has_unresolved_no_hand_state_(const std::set<int>& observed_item_ids,
                                        const std::set<int>& fully_occluded_item_ids);
+    // 单摄像头下同类旧物品的最终可见实例结算。它只在连续无手帧中、
+    // 同类可见框数量持续少于旧库存时启用；有手阶段和 D 证据链不使用它。
+    void prepare_visible_count_settlement_(const std::vector<Detection>& detections);
+    void clear_visible_count_settlement_(bool restore_uncommitted_outs);
     void clear_runtime_after_commit_();
 
     // 运行时对象与工作库存操作
@@ -329,6 +333,18 @@ private:
     std::set<int> pending_out_ids_;
     std::set<int> confirmed_moved_ids_;
     std::set<int> released_hand_candidate_ids_;
+    // 每张无手帧的同类“一框一物品”保留结果。key 是 detection index，
+    // value 是唯一保留该框的旧 item_id；同一框绝不再同时阻止其他 C 的 OUT。
+    std::map<int, int> visible_count_detection_owner_;
+    std::set<int> visible_count_survivor_ids_;
+    std::set<int> visible_count_out_candidate_ids_;
+    // 这两个容器跨连续无手帧保存；手重新出现或可见数量恢复时必须撤销。
+    std::map<int, int> visible_count_missing_counts_;
+    std::set<int> visible_count_confirmed_out_ids_;
+    std::map<int, std::set<int> > visible_count_prior_survivors_by_cls_;
+    // 上一张直接无手帧中各保留实例的真实框。只有框仍连续时，才能沿用
+    // 对应的 survivor / OUT 缺失计数，避免一次框跳变被误当作连续缺失。
+    std::map<int, std::map<int, BBox> > visible_count_prior_survivor_boxes_by_cls_;
     std::vector<BBox> hand_track_;
     BBox old_hand_box_;
     bool has_old_hand_box_ = false;
