@@ -112,6 +112,9 @@ enum class ReleaseReason {
     ORIGINAL_DETECTION,
     CONTACT_RETURNED_ORIGINAL,
     FULLY_OCCLUDED,
+    // 有手阶段已临时静态确认的旧 C，在无手阶段连续两帧得到唯一、
+    // 尺度一致的近原位框后才使用；它不是普通原位检测。
+    STABLE_NEAR_ORIGINAL_NO_HAND,
 };
 
 struct MoveValue {
@@ -183,6 +186,13 @@ struct OperationTrack {
     int no_hand_self_match_count = 0;
     // 旧 C 在无手阶段未被直接认领、也没有完整遮挡解释的连续次数。
     int no_hand_missing_count = 0;
+
+    // r16：仅用于 operation-start 旧 C 的无手静态灰区收尾。它不能与
+    // OUT 缺失、alias D 缺失或 D 的直接匹配计数混用。两张连续、唯一且
+    // 尺度一致的近原位直接框，才允许旧 C 走既有 release 语义。
+    int stable_near_original_no_hand_count = 0;
+    bool has_stable_near_original_box = false;
+    BBox stable_near_original_box;
 
     // C-D alias 只存在于当前手操作的运行时层。被隔离的 D 仍逐帧更新，
     // 但在有手阶段不得写入 working_inventory_ 成为正式/排他所有者。
@@ -344,6 +354,14 @@ private:
                            int evidence_detection_index = -1,
                            const BBox* evidence_box = nullptr,
                            const char* caller = nullptr);
+    // r16 的窄收尾：只处理有手后已暂时静态、但框抖动落在 CONTACT 原位
+    // 门槛与正式 MOVED 门槛之间的 operation-start 旧 C。
+    bool try_release_stable_near_original_no_hand_(
+        OperationTrack* track, int detection_index, const Detection& detection,
+        const std::map<int, int>& independent_static_owner_by_detection,
+        const char* source);
+    void reset_stable_near_original_no_hand_evidence_(OperationTrack* track,
+                                                       const char* reason);
     void mark_pending_out_(int item_id);
     void refresh_confirmed_blockers_(const std::set<int>& observed_working_ids);
     void set_live_state_(OperationTrack* track, LiveObservationState state,

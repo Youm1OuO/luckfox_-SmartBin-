@@ -182,6 +182,8 @@ const char* release_reason_name(ReleaseReason reason) {
             return "CONTACT_RETURNED_ORIGINAL";
         case ReleaseReason::FULLY_OCCLUDED:
             return "FULLY_OCCLUDED";
+        case ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND:
+            return "STABLE_NEAR_ORIGINAL_NO_HAND";
     }
     return "UNKNOWN";
 }
@@ -2153,7 +2155,8 @@ void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
     const BBox expected = estimated_box(track);
     trace_(tag,
            "item=%d suspect=%d cls=%d state=%s contact=%s resolution=%s "
-           "needs_settle=%d grace=%d hold=%d not_hold=%d missing=%d ambiguous=%d "
+           "needs_settle=%d static-near-original=%d/%d grace=%d hold=%d not_hold=%d "
+           "missing=%d ambiguous=%d "
            "owner-kind=%s quarantine=%d alias-old=%zu alias-d=%zu alias-no-hand=%d "
            "alias-missing=%d "
            "live=%s provisional=%d "
@@ -2165,6 +2168,8 @@ void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
            contact_state_name(track.contact_state),
            existing_resolution_name(track.resolution),
            track.needs_no_hand_settlement ? 1 : 0,
+           track.stable_near_original_no_hand_count,
+           track.has_stable_near_original_box ? 1 : 0,
            track.claim_grace_remaining, track.hold_evidence_count,
            track.not_hold_evidence_count, track.no_hand_missing_count,
            (track.b_claim_ambiguous || track.contact_path_ambiguous ||
@@ -2787,6 +2792,9 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     track.resolution = ExistingItemResolution::MOVED_CONFIRMED;
     track.release_reason = ReleaseReason::NONE;
     track.needs_no_hand_settlement = false;
+    track.stable_near_original_no_hand_count = 0;
+    track.has_stable_near_original_box = false;
+    track.stable_near_original_box = BBox();
     track.b_claim_ambiguous = false;
     track.no_hand_candidate_ambiguous = false;
     track.claim_grace_remaining = 0;
@@ -2810,6 +2818,10 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
     const int old_hold = track.hold_evidence_count;
     const int old_not_hold = track.not_hold_evidence_count;
     const bool had_reappear_candidate = track.has_reappear_candidate_box;
+    const int old_stable_near_original_count =
+        track.stable_near_original_no_hand_count;
+    const bool had_stable_near_original_box =
+        track.has_stable_near_original_box;
     // 有手帧里的“仍在原位”只能说明当前这一刻没有移动。手可能在同一
     // 连续操作中随后再次拿起它，因此要保留一个可重新激活的锚点，并等
     // 无手直接帧完成真正静态结算。完整遮挡和无手原位证据才是终态。
@@ -2831,6 +2843,9 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
         ? ExistingItemResolution::OCCLUDED_CONFIRMED
         : ExistingItemResolution::STATIC_CONFIRMED;
     track.needs_no_hand_settlement = keep_reopen_anchor;
+    track.stable_near_original_no_hand_count = 0;
+    track.has_stable_near_original_box = false;
+    track.stable_near_original_box = BBox();
     track.shelter_or_hold = false;
     track.hold_and_move = false;
     track.hold_evidence_count = 0;
@@ -2871,7 +2886,8 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
         trace_("RELEASE",
                "item=%d old_state=%s old_contact=%s -> NORMAL reason=%s "
                "original_evidence=%d evidence_index=%d evidence_box=(%.1f,%.1f,%.1f,%.1f) "
-               "caller=%s hold=%d not_hold=%d candidate_cleared=%d provisional=%d",
+               "caller=%s hold=%d not_hold=%d candidate_cleared=%d "
+               "stable-near-original-before=%d stable-near-original-box=%d provisional=%d",
                track.item_id, operation_track_state_name(old_state),
                contact_state_name(old_contact_state), release_reason_name(reason),
                reason == ReleaseReason::ORIGINAL_DETECTION ||
@@ -2880,21 +2896,202 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
                evidence_box->x2, evidence_box->y2, caller ? caller : "NONE",
                old_hold, old_not_hold,
                had_reappear_candidate ? 1 : 0,
+               old_stable_near_original_count,
+               had_stable_near_original_box ? 1 : 0,
                keep_reopen_anchor ? 1 : 0);
     } else {
         trace_("RELEASE",
                "item=%d old_state=%s old_contact=%s -> NORMAL reason=%s "
                "original_evidence=0 evidence_index=-1 evidence_box=NONE hold=%d "
-               "not_hold=%d caller=%s candidate_cleared=%d provisional=%d",
+               "not_hold=%d caller=%s candidate_cleared=%d "
+               "stable-near-original-before=%d stable-near-original-box=%d provisional=%d",
                track.item_id, operation_track_state_name(old_state),
                contact_state_name(old_contact_state), release_reason_name(reason),
                old_hold, old_not_hold, caller ? caller : "NONE",
                had_reappear_candidate ? 1 : 0,
+               old_stable_near_original_count,
+               had_stable_near_original_box ? 1 : 0,
                keep_reopen_anchor ? 1 : 0);
     }
     trace_track_("STATE", track, keep_reopen_anchor
                  ? "provisional-static-confirmed-awaiting-no-hand"
                  : "released-with-confirmed-resolution");
+}
+
+void SessionManager::reset_stable_near_original_no_hand_evidence_(
+        OperationTrack* track, const char* reason) {
+    if (!track || track->is_suspect_new ||
+        (track->stable_near_original_no_hand_count == 0 &&
+         !track->has_stable_near_original_box)) {
+        return;
+    }
+    trace_("STATIC-SETTLE",
+           "item=%d phase=%s detection=-1 stable-count=%d/%d "
+           "action=reset-stable-near-original reason=%s",
+           track->item_id, trace_hand_phase_ ? "HAND" : "NO_HAND",
+           track->stable_near_original_no_hand_count,
+           FLOW3_NO_HAND_D_CONFIRM_FRAMES,
+           reason ? reason : "NONE");
+    track->stable_near_original_no_hand_count = 0;
+    track->has_stable_near_original_box = false;
+    track->stable_near_original_box = BBox();
+}
+
+bool SessionManager::try_release_stable_near_original_no_hand_(
+        OperationTrack* track, int detection_index, const Detection& detection,
+        const std::map<int, int>& independent_static_owner_by_detection,
+        const char* source) {
+    if (!track) return false;
+
+    OperationTrack& c = *track;
+    const std::map<int, InventoryItem>::iterator working =
+        working_inventory_.find(c.item_id);
+    const std::map<int, int>::const_iterator static_owner =
+        independent_static_owner_by_detection.find(detection_index);
+    const bool operation_start_old_c =
+        !c.is_suspect_new && c.item_id > 0 &&
+        operation_start_inventory_.count(c.item_id) > 0;
+    const bool provisional_static_after_hand = operation_start_old_c &&
+        c.state == OperationTrackState::NORMAL &&
+        c.contact_state == ContactState::NONE &&
+        c.resolution == ExistingItemResolution::STATIC_CONFIRMED &&
+        c.needs_no_hand_settlement && c.has_hand_estimate_anchor_box &&
+        c.hand_estimate_anchor_box.area() > 0.0f;
+    const bool direct_unique_owner = detection_index >= 0 &&
+        static_owner != independent_static_owner_by_detection.end() &&
+        static_owner->second == c.item_id;
+    const bool scale_aware_near_original =
+        strict_match_box(c.cls_id, c.original_box,
+                         detection.cls_id, detection.box) &&
+        partial_match_box(c.cls_id, c.original_box,
+                          detection.cls_id, detection.box,
+                          FLOW3_TRACK_PARTIAL_IOM);
+    const float center_delta = center_distance(c.original_box, detection.box);
+    const float normalized_center_delta =
+        normalized_nearby_distance(c.original_box, detection.box);
+    const bool formal_move = boxes_differ_as_move(c.original_box, detection.box);
+    // 这条路径只处理 12px CONTACT 原位门槛与既有正式 MOVED 门槛之间的
+    // 静态灰区；两端的正常分支继续沿用原有语义。
+    const bool static_gray_zone =
+        center_delta > FLOW3_CONTACT_OBJECT_MOVE_EPS && !formal_move;
+    const bool hand_or_contact_move_evidence =
+        c.hold_and_move || has_meaningful_hand_move(c) ||
+        c.contact_state != ContactState::NONE;
+    const bool reappearance_claim_or_path_ambiguity =
+        c.reappearance_pending || c.b_claim_ambiguous ||
+        c.contact_path_ambiguous || c.no_hand_candidate_ambiguous ||
+        c.claim_grace_remaining > 0;
+    const bool has_prior_stable_box = c.has_stable_near_original_box;
+    const bool prior_evidence_consistent =
+        (c.stable_near_original_no_hand_count == 0) == !has_prior_stable_box;
+    const bool previous_stable_match = !has_prior_stable_box ||
+        (strict_match_box(c.cls_id, c.stable_near_original_box,
+                          detection.cls_id, detection.box) &&
+         partial_match_box(c.cls_id, c.stable_near_original_box,
+                           detection.cls_id, detection.box,
+                           FLOW3_TRACK_PARTIAL_IOM));
+    const bool working_item_is_visible =
+        working != working_inventory_.end() &&
+        working->second.status == ItemStatus::VISIBLE &&
+        !pending_out_ids_.count(c.item_id);
+
+    const char* reason = "eligible";
+    if (!provisional_static_after_hand) {
+        reason = "not-operation-start-provisional-static-c";
+    } else if (!direct_unique_owner) {
+        reason = "no-direct-unique-static-owner";
+    } else if (!scale_aware_near_original) {
+        reason = "not-scale-aware-near-original";
+    } else if (formal_move) {
+        reason = "formal-move-threshold-reached";
+    } else if (!static_gray_zone) {
+        reason = "not-contact-static-gray-zone";
+    } else if (hand_or_contact_move_evidence) {
+        reason = "hand-or-contact-move-evidence";
+    } else if (reappearance_claim_or_path_ambiguity) {
+        reason = "reappearance-or-claim-ambiguity";
+    } else if (!working_item_is_visible) {
+        reason = "missing-visible-working-inventory-item";
+    } else if (!prior_evidence_consistent) {
+        reason = "inconsistent-previous-static-evidence";
+    } else if (!previous_stable_match) {
+        reason = "not-continuous-with-previous-static-frame";
+    }
+    const bool eligible = provisional_static_after_hand && direct_unique_owner &&
+        scale_aware_near_original && static_gray_zone &&
+        !hand_or_contact_move_evidence &&
+        !reappearance_claim_or_path_ambiguity && working_item_is_visible &&
+        prior_evidence_consistent && previous_stable_match;
+
+    if (!eligible) {
+        trace_("STATIC-SETTLE",
+               "item=%d phase=NO_HAND detection=%d source=%s "
+               "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
+               "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=%d "
+               "has-real-move-evidence=%d unique-static-owner=%d "
+               "previous-stable-present=%d previous-stable-match=%d "
+               "stable-count=%d/%d action=reset-stable-near-original reason=%s",
+               c.item_id, detection_index, source ? source : "NONE",
+               center_delta, normalized_center_delta, iom(c.original_box, detection.box),
+               ratio_difference(c.original_box.w(), detection.box.w()),
+               ratio_difference(c.original_box.h(), detection.box.h()),
+               formal_move ? 1 : 0, hand_or_contact_move_evidence ? 1 : 0,
+               direct_unique_owner ? 1 : 0, has_prior_stable_box ? 1 : 0,
+               previous_stable_match ? 1 : 0,
+               c.stable_near_original_no_hand_count,
+               FLOW3_NO_HAND_D_CONFIRM_FRAMES, reason);
+        reset_stable_near_original_no_hand_evidence_(track, reason);
+        return false;
+    }
+
+    ++c.stable_near_original_no_hand_count;
+    c.stable_near_original_box = detection.box;
+    c.has_stable_near_original_box = true;
+    if (c.stable_near_original_no_hand_count <
+        FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
+        trace_("STATIC-SETTLE",
+               "item=%d phase=NO_HAND detection=%d source=%s "
+               "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
+               "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=0 "
+               "has-real-move-evidence=0 unique-static-owner=1 "
+               "previous-stable-present=%d previous-stable-match=%d "
+               "stable-count=%d/%d action=wait-stable-near-original reason=eligible",
+               c.item_id, detection_index, source ? source : "NONE",
+               center_delta, normalized_center_delta, iom(c.original_box, detection.box),
+               ratio_difference(c.original_box.w(), detection.box.w()),
+               ratio_difference(c.original_box.h(), detection.box.h()),
+               has_prior_stable_box ? 1 : 0, previous_stable_match ? 1 : 0,
+               c.stable_near_original_no_hand_count,
+               FLOW3_NO_HAND_D_CONFIRM_FRAMES);
+        return false;
+    }
+
+    const int stable_count_before_release = c.stable_near_original_no_hand_count;
+    const bool needs_settlement_before_release = c.needs_no_hand_settlement;
+    // 不把 unresolved C-D alias 当作这里的阻塞条件：正是 C 用自己的直接
+    // 证据完成 release 后，r15 才能安全判断 runtime-only D 是否应该回收。
+    update_seen(working->second, detection, 0);
+    release_not_held_(c, false, ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND,
+                      detection_index, &detection.box,
+                      "no-hand-stable-near-original");
+    trace_("STATIC-SETTLE",
+           "item=%d phase=NO_HAND detection=%d source=%s "
+           "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
+           "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=0 "
+           "has-real-move-evidence=0 unique-static-owner=1 "
+           "previous-stable-present=%d previous-stable-match=%d "
+           "stable-count=%d/%d action=release-stable-near-original "
+           "release-reason=STABLE_NEAR_ORIGINAL_NO_HAND needs-settle-before=%d "
+           "needs-settle-after=%d inventory-update=existing-item-only event=none",
+           c.item_id, detection_index, source ? source : "NONE",
+           center_delta, normalized_center_delta, iom(c.original_box, detection.box),
+           ratio_difference(c.original_box.w(), detection.box.w()),
+           ratio_difference(c.original_box.h(), detection.box.h()),
+           has_prior_stable_box ? 1 : 0, previous_stable_match ? 1 : 0,
+           stable_count_before_release, FLOW3_NO_HAND_D_CONFIRM_FRAMES,
+           needs_settlement_before_release ? 1 : 0,
+           c.needs_no_hand_settlement ? 1 : 0);
+    return true;
 }
 
 void SessionManager::advance_claim_grace_(
@@ -4089,6 +4286,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             // HAND_* 分支。手离开后只按原位置和真实 observed_track 收尾。
             if (!track.is_suspect_new &&
                 track.contact_state != ContactState::NONE) {
+                reset_stable_near_original_no_hand_evidence_(
+                    &track, "contact-track-active");
                 int contact_found = unique_contact_original_detection(
                     detections, claimed, track, working_inventory_);
                 if (contact_found >= 0) {
@@ -4341,6 +4540,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             }
 
             if (!track.is_suspect_new && is_claim_protected(track)) {
+                reset_stable_near_original_no_hand_evidence_(
+                    &track, "active-claim-grace");
                 if (found < 0) {
                     // 保护期内的缺失只是未决，不产生 HOLD/OUT 证据；同时
                     // register_post_hand_reveal_suspects_ 会继续屏蔽同类 D。
@@ -4407,6 +4608,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                            strict_owner.item_id, strict_owner.runtime_key);
                     trace_track_("MATCH", track,
                                  "no-hand-candidate-belongs-to-pending-runtime-d");
+                    reset_stable_near_original_no_hand_evidence_(
+                        &track, "pending-runtime-owner");
                     continue;
                 }
                 if (strict_owner_blocks_old_c(strict_owner.kind)) {
@@ -4427,6 +4630,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                            stale_tentative_b_cleared ? 1 : 0, found_source);
                     trace_track_("MATCH", track,
                                  "no-hand-candidate-strictly-owned-by-old-or-confirmed-item");
+                    reset_stable_near_original_no_hand_evidence_(
+                        &track, "reappearance-or-claim-ambiguity");
                     continue;
                 }
             }
@@ -4450,6 +4655,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                            stale_reappear_candidate_cleared ? 1 : 0,
                            stale_tentative_b_cleared ? 1 : 0, found_source);
                     trace_track_("MATCH", track, "no-hand-shared-candidate");
+                    reset_stable_near_original_no_hand_evidence_(
+                        &track, "reappearance-or-claim-ambiguity");
                     continue;
                 }
                 if (mature_owner >= 0 && mature_owner != track.item_id) {
@@ -4464,12 +4671,16 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                            stale_reappear_candidate_cleared ? 1 : 0,
                            stale_tentative_b_cleared ? 1 : 0, found_source);
                     trace_track_("MATCH", track, "no-hand-candidate-owned-by-other-c");
+                    reset_stable_near_original_no_hand_evidence_(
+                        &track, "reappearance-or-claim-ambiguity");
                     continue;
                 }
                 track.b_claim_ambiguous = false;
             }
             if (found < 0) {
                 if (!track.is_suspect_new) {
+                    reset_stable_near_original_no_hand_evidence_(
+                        &track, "no-direct-unique-owner");
                     track.no_hand_candidate_ambiguous =
                         has_ambiguous_no_hand_reappear_candidate(
                             detections, candidate_claimed, it->first, track,
@@ -4726,6 +4937,23 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                                       &d.box,
                                       "no-hand-original");
                 } else {
+                    // r16：普通原位 release 已因 CONTACT 的 12px 门槛被
+                    // 拒绝时，只有这个旧 C 自己连续两张唯一、尺度一致的
+                    // 无手近原位框才可完成静态结算。这里绝不改动 D 的
+                    // alias 仲裁；C 结算后，后续 phase=1 仍完全走 r15。
+                    const bool may_be_static_gray_zone_old_c =
+                        track.state == OperationTrackState::NORMAL &&
+                        track.contact_state == ContactState::NONE &&
+                        track.resolution == ExistingItemResolution::STATIC_CONFIRMED &&
+                        track.needs_no_hand_settlement &&
+                        track.has_hand_estimate_anchor_box;
+                    if (may_be_static_gray_zone_old_c &&
+                        try_release_stable_near_original_no_hand_(
+                            &track, found, d,
+                            independent_static_owner_by_detection,
+                            found_source)) {
+                        continue;
+                    }
                     const bool should_observe_candidate =
                         found_as_reappear_candidate || track.reappearance_pending ||
                         track.has_reappear_candidate_box;
@@ -4845,6 +5073,9 @@ void SessionManager::mark_pending_out_(int item_id) {
         track->resolution = ExistingItemResolution::OUT_CONFIRMED;
         track->release_reason = ReleaseReason::NONE;
         track->needs_no_hand_settlement = false;
+        track->stable_near_original_no_hand_count = 0;
+        track->has_stable_near_original_box = false;
+        track->stable_near_original_box = BBox();
         trace_track_("NO-HAND", *track, "confirm-out-after-direct-missing-frames");
     }
 }
@@ -5415,6 +5646,9 @@ bool SessionManager::has_unresolved_no_hand_state_(
             track.resolution = ExistingItemResolution::OCCLUDED_CONFIRMED;
             track.release_reason = ReleaseReason::FULLY_OCCLUDED;
             track.needs_no_hand_settlement = false;
+            track.stable_near_original_no_hand_count = 0;
+            track.has_stable_near_original_box = false;
+            track.stable_near_original_box = BBox();
             trace_track_("NO-HAND", track, "fully-occluded-by-confirmed-front-item");
             continue;
         }
@@ -5867,7 +6101,14 @@ FrameProcessResult SessionManager::process_frame(
         for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
              it != track_buffer_.end(); ++it) {
             OperationTrack& track = it->second;
-            if (!track.is_suspect_new || !track.pending_d_quarantined_by_old_c ||
+            // r16 的静态近原位证据只允许来自连续无手帧。手重新出现时，
+            // 无论手是否接触该 C，都不能把前后两段无手证据拼在一起。
+            if (!track.is_suspect_new) {
+                reset_stable_near_original_no_hand_evidence_(
+                    &track, "hand-returned");
+                continue;
+            }
+            if (!track.pending_d_quarantined_by_old_c ||
                 track.alias_no_hand_missing_count == 0) {
                 continue;
             }

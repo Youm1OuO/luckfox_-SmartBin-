@@ -1682,6 +1682,197 @@ void test_no_hand_occlusion_uses_cover_union() {
     }
 }
 
+// 细节13 / r16：手边短暂出现同类低分假框时，r15 必须先保护 alias D。
+// 这里的旧苏打罐 C 有自己的无手直接框，但其中心偏移约 14.4px：超过
+// CONTACT 原位 12px、低于正式 MOVED 28px。C 需要先用两张尺度一致的
+// 无手框完成静态 release，之后 r15 才能按既有两帧缺失规则回收 fake D。
+// 同一轮操作中的苹果 A 仍必须正常提交 MOVED。
+void test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 520, 100, 620, 200));      // moved apple A
+    initial.push_back(item(2, 25, 163, 138, 401, 400));     // static soda C
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 520, 100, 620, 200));
+    stable.push_back(det(25, 163, 138, 401, 400));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    // 两张静止手帧只让 C 的 claim grace 自然结束，不能积累“没有拿起”的
+    // 移动证据。之后的两张有效手移动帧让 A 获得正常整理路径，同时 C
+    // 仍稳定在原位；第一个成熟手移动帧中额外出现一个同类 fake D。
+    const fridge::BBox hand0(0, 0, 1000, 600);
+    const fridge::BBox hand1(30, 0, 1030, 600);
+    const fridge::BBox hand2(60, 0, 1060, 600);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+
+    std::vector<fridge::Detection> first_moved_hand;
+    first_moved_hand.push_back(det(0, 550, 100, 650, 200));
+    first_moved_hand.push_back(det(25, 163, 138, 401, 400));
+    first_moved_hand.push_back(det(25, 850, 450, 940, 550, 0.266f));  // fake D
+    send_frame(&session, first_moved_hand,
+               std::vector<fridge::BBox>(1, hand1), &frame);
+
+    bool found_quarantined_fake_d = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        const fridge::OperationTrack& track = it->second;
+        if (track.is_suspect_new && track.pending_d_quarantined_by_old_c &&
+            track.conflicting_old_item_ids.count(2)) {
+            found_quarantined_fake_d = true;
+            assert(track.item_id <= 0);
+            assert(!track.promoted_to_working_inventory);
+        }
+    }
+    assert(found_quarantined_fake_d);
+
+    std::vector<fridge::Detection> second_moved_hand;
+    second_moved_hand.push_back(det(0, 580, 100, 680, 200));
+    second_moved_hand.push_back(det(25, 163, 138, 401, 400));
+    send_frame(&session, second_moved_hand,
+               std::vector<fridge::BBox>(1, hand2), &frame);
+
+    const std::map<int, fridge::OperationTrack>& after_hand =
+        session.operation_tracks();
+    assert(after_hand.find(2) != after_hand.end());
+    assert(after_hand.find(2)->second.state == fridge::OperationTrackState::NORMAL);
+    assert(after_hand.find(2)->second.contact_state == fridge::ContactState::NONE);
+    assert(after_hand.find(2)->second.resolution ==
+           fridge::ExistingItemResolution::STATIC_CONFIRMED);
+    assert(after_hand.find(2)->second.needs_no_hand_settlement);
+    assert(after_hand.find(2)->second.has_hand_estimate_anchor_box);
+
+    // 真实 C 的无手框相对 original 的中心偏移为约 14.4px，严格位于
+    // 现有 12px CONTACT 门槛与 28px 正式 MOVED 门槛之间。
+    std::vector<fridge::Detection> no_hand;
+    no_hand.push_back(det(0, 580, 100, 680, 200));
+    no_hand.push_back(det(25, 145, 141, 392, 407));
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        no_hand, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+    const std::map<int, fridge::OperationTrack>& after_first =
+        session.operation_tracks();
+    assert(after_first.find(2) != after_first.end());
+    assert(after_first.find(2)->second.needs_no_hand_settlement);
+    assert(after_first.find(2)->second.stable_near_original_no_hand_count == 1);
+    bool fake_d_waits_for_c = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             after_first.begin(); it != after_first.end(); ++it) {
+        const fridge::OperationTrack& track = it->second;
+        if (track.is_suspect_new && track.pending_d_quarantined_by_old_c &&
+            track.conflicting_old_item_ids.count(2)) {
+            fake_d_waits_for_c = track.alias_no_hand_missing_count == 0;
+        }
+    }
+    assert(fake_d_waits_for_c);
+    assert(!has_event(first.settlement, fridge::EventKind::IN, 3));
+    assert(!has_event(first.settlement, fridge::EventKind::OUT, 2));
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        no_hand, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(!second.settlement.committed);
+    assert(session.operation_pending());
+    const std::map<int, fridge::OperationTrack>& after_second =
+        session.operation_tracks();
+    assert(after_second.find(2) != after_second.end());
+    assert(!after_second.find(2)->second.needs_no_hand_settlement);
+    assert(after_second.find(2)->second.release_reason ==
+           fridge::ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND);
+    assert(after_second.find(2)->second.stable_near_original_no_hand_count == 0);
+    assert(!after_second.find(2)->second.has_stable_near_original_box);
+    bool fake_d_started_stale_missing = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             after_second.begin(); it != after_second.end(); ++it) {
+        const fridge::OperationTrack& track = it->second;
+        if (track.is_suspect_new && track.pending_d_quarantined_by_old_c &&
+            track.conflicting_old_item_ids.count(2)) {
+            fake_d_started_stale_missing = track.alias_no_hand_missing_count == 1;
+        }
+    }
+    assert(fake_d_started_stale_missing);
+    assert(!has_event(second.settlement, fridge::EventKind::IN, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 2));
+
+    const int third_no_hand = frame++;
+    fridge::FrameProcessResult third = session.process_frame(
+        no_hand, std::vector<fridge::BBox>(), third_no_hand, third_no_hand);
+    assert(third.no_hand_frame_processed);
+    assert(third.settlement.committed);
+    assert(session.inventory().size() == 2);
+    const fridge::InventoryItem* final_a = session.inventory().find_by_item(1);
+    const fridge::InventoryItem* final_c = session.inventory().find_by_item(2);
+    assert(final_a != 0);
+    assert(final_c != 0);
+    assert(final_c->cls_id == 25);
+    assert(final_c->status == fridge::ItemStatus::VISIBLE);
+    assert(has_event(third.settlement, fridge::EventKind::MOVED, 1));
+    assert(!has_event(third.settlement, fridge::EventKind::MOVED, 2));
+    assert(!has_event(third.settlement, fridge::EventKind::IN, 3));
+    assert(!has_event(third.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(third.settlement, fridge::EventKind::OUT, 2));
+}
+
+// r16 的两张近原位证据必须是连续的无手帧。手一旦重新进入，哪怕它没有
+// 再次改变 C 的最终结论，也必须清除已有的 1/2，不能让手前后一张灰区框
+// 拼成错误的静态 release。
+void test_static_gray_zone_evidence_resets_when_hand_returns() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 25, 163, 138, 401, 400));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    const std::vector<fridge::Detection> stable(
+        1, det(25, 163, 138, 401, 400));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    const fridge::BBox hand0(0, 0, 1000, 600);
+    const fridge::BBox hand1(30, 0, 1030, 600);
+    const fridge::BBox hand2(60, 0, 1060, 600);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand1), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand2), &frame);
+
+    const std::vector<fridge::Detection> gray_zone(
+        1, det(25, 145, 141, 392, 407));
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        gray_zone, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_tracks().find(1)->second
+           .stable_near_original_no_hand_count == 1);
+
+    // 复用最后一个手框，避免给 C 注入新的移动路径；这里只验证 hand return
+    // 作为时间边界清除静态证据。
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand2), &frame);
+    const fridge::OperationTrack& after_hand_return =
+        session.operation_tracks().find(1)->second;
+    assert(after_hand_return.needs_no_hand_settlement);
+    assert(after_hand_return.stable_near_original_no_hand_count == 0);
+    assert(!after_hand_return.has_stable_near_original_box);
+
+    const int first_after_hand = frame++;
+    fridge::FrameProcessResult after_hand_first = session.process_frame(
+        gray_zone, std::vector<fridge::BBox>(), first_after_hand, first_after_hand);
+    assert(after_hand_first.no_hand_frame_processed);
+    assert(!after_hand_first.settlement.committed);
+    assert(session.operation_pending());
+}
+
 // 细节11-8.2：同一个被移动的旧 C 在有手帧中可能同时被 YOLO 给出一个
 // 局部/过期候选和一个完整新位置框。后者不能被直接 promote 成工作库存
 // D；它应保留为 C-D alias runtime track，并在两张直接无手帧后归回旧 C。
@@ -2011,6 +2202,8 @@ int main() {
     test_adjacent_same_class_deficit_requires_continuous_survivor_box();
     test_out_requires_two_direct_missing_frames();
     test_no_hand_occlusion_uses_cover_union();
+    test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup();
+    test_static_gray_zone_evidence_resets_when_hand_returns();
     test_quarantined_same_class_duplicate_merges_back_to_old_c();
     test_quarantined_same_class_stale_alias_disappears_after_old_c_settles();
     test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes();
