@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r14";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r15";
 
 // =========================================================================
 //  类别 ID 配置
@@ -259,10 +259,12 @@ constexpr bool ALLOW_INITIAL_FRAME_BOOTSTRAP_WHEN_BACKEND_UNAVAILABLE = true;
 // =========================================================================
 // 手证据阈值：业务层只要检测到这种手框，就停止无手收尾。
 constexpr float HAND_CONTEXT_SCORE_THRESH = YOLO_HAND_SCORE_THRESH;
-// 强手框仅用于 OSD 显示，避免 UI 被普通小手框干扰。
+// 强手框仅用于 OSD 状态提示，避免 UI 被普通小手框干扰。
 constexpr float OSD_STRONG_HAND_SCORE_THRESH = 0.45f;
 constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
-constexpr float OSD_OBJECT_SCORE_THRESH = 0.50f;
+// 所有进入业务层的食品/手框都必须绘制；这个值只决定低置信度业务框的
+// 视觉颜色，不再作为第二道显示过滤。
+constexpr float OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH = 0.50f;
 
 // =========================================================================
 //  3.0 HAND_* / Track 参数

@@ -1332,6 +1332,27 @@ bool old_c_has_independently_settled_identity(const OperationTrack& old) {
              old.contact_state == ContactState::NONE));
 }
 
+// 细节12：只有 D 关联的每个 operation-start old C 都已由自己的既有无手
+// 证据链结算，D 的连续无直接证据才可以作为“过期 alias”的证据。找不到
+// 任一 C 或 C 仍未结算都必须继续等待，不能凭 D 的缺失删除真实物品。
+bool all_conflicting_old_c_independently_settled(
+        const OperationTrack& suspect,
+        const std::map<int, OperationTrack>& tracks) {
+    if (!suspect.is_suspect_new || !suspect.pending_d_quarantined_by_old_c ||
+        suspect.conflicting_old_item_ids.empty()) {
+        return false;
+    }
+    for (std::set<int>::const_iterator old_id = suspect.conflicting_old_item_ids.begin();
+         old_id != suspect.conflicting_old_item_ids.end(); ++old_id) {
+        std::map<int, OperationTrack>::const_iterator old = tracks.find(*old_id);
+        if (old == tracks.end() ||
+            !old_c_has_independently_settled_identity(old->second)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool detection_is_duplicate_of_settled_old_c(const OperationTrack& old,
                                               int detection_index,
                                               const Detection& detection) {
@@ -2124,6 +2145,7 @@ void SessionManager::unlink_quarantined_suspect_(int runtime_key,
     d.conflicting_old_item_ids.clear();
     d.pending_d_quarantined_by_old_c = false;
     d.alias_no_hand_match_count = 0;
+    d.alias_no_hand_missing_count = 0;
 }
 
 void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
@@ -2133,6 +2155,7 @@ void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
            "item=%d suspect=%d cls=%d state=%s contact=%s resolution=%s "
            "needs_settle=%d grace=%d hold=%d not_hold=%d missing=%d ambiguous=%d "
            "owner-kind=%s quarantine=%d alias-old=%zu alias-d=%zu alias-no-hand=%d "
+           "alias-missing=%d "
            "live=%s provisional=%d "
            "original=(%.1f,%.1f,%.1f,%.1f) expected=(%.1f,%.1f,%.1f,%.1f) "
            "last=%d:(%.1f,%.1f,%.1f,%.1f) reappear=%d/%d:(%.1f,%.1f,%.1f,%.1f) "
@@ -2151,6 +2174,7 @@ void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
            track.conflicting_old_item_ids.size(),
            track.conflicting_suspect_keys.size(),
            track.alias_no_hand_match_count,
+           track.alias_no_hand_missing_count,
            live_observation_state_name(track.live_state),
            track.live_state_provisional ? 1 : 0,
            track.original_box.x1, track.original_box.y1,
@@ -4029,6 +4053,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
     std::vector<int> promote_keys;
     std::set<int> discard_keys;
     std::set<int> discard_settled_old_c_duplicate_keys;
+    std::set<int> discard_stale_alias_keys;
     const std::map<int, int> independent_static_owner_by_detection =
         build_independent_no_hand_static_owner_by_detection(
             detections, working_inventory_, operation_start_inventory_, track_buffer_);
@@ -4493,10 +4518,57 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         }
                     } else {
                         track.alias_no_hand_match_count = 0;
-                        trace_("C-D-ALIAS",
-                               "old-count=%zu suspect=%d phase=NO_HAND relation=no-direct-pair "
-                               "action=keep-unresolved",
-                               track.conflicting_old_item_ids.size(), track.suspect_id);
+                        const bool all_old_settled =
+                            all_conflicting_old_c_independently_settled(
+                                track, track_buffer_);
+                        const bool runtime_only =
+                            !track.promoted_to_working_inventory && track.item_id <= 0;
+                        if (all_old_settled && runtime_only) {
+                            ++track.alias_no_hand_missing_count;
+                            const bool discard_stale_alias =
+                                track.alias_no_hand_missing_count >=
+                                FLOW3_NO_HAND_D_CONFIRM_FRAMES;
+                            trace_(
+                                "C-D-ALIAS",
+                                "old-count=%zu suspect=%d phase=NO_HAND relation=no-direct-pair "
+                                "all-conflicting-old-settled=1 runtime-only=1 "
+                                "missing-count=%d/%d action=%s",
+                                track.conflicting_old_item_ids.size(), track.suspect_id,
+                                track.alias_no_hand_missing_count,
+                                FLOW3_NO_HAND_D_CONFIRM_FRAMES,
+                                discard_stale_alias
+                                    ? "discard-stale-alias-after-settled-old-c-no-hand-missing"
+                                    : "wait-stale-alias-evidence");
+                            trace_track_(
+                                "C-D-ALIAS", track,
+                                discard_stale_alias
+                                    ? "stale-alias-no-direct-evidence-confirmed"
+                                    : "stale-alias-no-direct-evidence-wait");
+                            if (discard_stale_alias) {
+                                discard_keys.insert(it->first);
+                                discard_stale_alias_keys.insert(it->first);
+                            }
+                        } else {
+                            const int previous_missing_count =
+                                track.alias_no_hand_missing_count;
+                            track.alias_no_hand_missing_count = 0;
+                            trace_(
+                                "C-D-ALIAS",
+                                "old-count=%zu suspect=%d phase=NO_HAND relation=no-direct-pair "
+                                "all-conflicting-old-settled=%d runtime-only=%d "
+                                "missing-count=%d/%d action=%s",
+                                track.conflicting_old_item_ids.size(), track.suspect_id,
+                                all_old_settled ? 1 : 0, runtime_only ? 1 : 0,
+                                previous_missing_count,
+                                FLOW3_NO_HAND_D_CONFIRM_FRAMES,
+                                previous_missing_count > 0
+                                    ? "reset-stale-alias-evidence"
+                                    : "keep-unresolved");
+                            trace_track_("C-D-ALIAS", track,
+                                         all_old_settled
+                                             ? "quarantined-alias-not-runtime-only"
+                                             : "conflicting-old-c-not-yet-settled");
+                        }
                     }
                     continue;
                 }
@@ -4526,6 +4598,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     OperationTrack& alias_d = suspect->second;
                     alias_d.alias_no_hand_matched_this_frame = true;
                     ++alias_d.alias_no_hand_match_count;
+                    alias_d.alias_no_hand_missing_count = 0;
                     track.alias_no_hand_match_count =
                         alias_d.alias_no_hand_match_count;
                     track.reappearance_pending = true;
@@ -4563,6 +4636,11 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             }
 
             if (track.is_suspect_new) {
+                if (track.pending_d_quarantined_by_old_c) {
+                    // 任意直接无手证据（独立、共享或尚待仲裁）都会中断“D 消失”
+                    // 的连续计数。不能把被直接证据打断的缺失片段拼起来。
+                    track.alias_no_hand_missing_count = 0;
+                }
                 if (track.pending_d_quarantined_by_old_c &&
                     quarantined_suspect_detection_is_duplicate_of_settled_old_c(
                         track, track_buffer_, found, d)) {
@@ -4692,14 +4770,29 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             track->second.pending_d_quarantined_by_old_c;
         const bool duplicate_of_settled_old_c =
             discard_settled_old_c_duplicate_keys.count(*discard) > 0;
+        const bool stale_alias_after_settled_old_c =
+            discard_stale_alias_keys.count(*discard) > 0;
         if (discard_alias_duplicate) {
             unlink_quarantined_suspect_(
                 *discard,
-                duplicate_of_settled_old_c
-                    ? "discard-duplicate-settled-old-c"
-                    : "discard-duplicate");
+                stale_alias_after_settled_old_c
+                    ? "discard-stale-alias-after-settled-old-c-no-hand-missing"
+                    : (duplicate_of_settled_old_c
+                        ? "discard-duplicate-settled-old-c"
+                        : "discard-duplicate"));
         }
-        if (duplicate_of_settled_old_c) {
+        if (stale_alias_after_settled_old_c) {
+            printf("[3.0] suspect#%d 的关联旧 C 已独立结算，且连续无手帧无直接证据，"
+                   "按过期 alias 丢弃\n", track->second.suspect_id);
+            trace_(
+                "C-D-ALIAS",
+                "suspect=%d phase=NO_HAND "
+                "action=discard-stale-alias-after-settled-old-c-no-hand-missing "
+                "working-inventory-write=0 pending-in-write=0 event=none",
+                track->second.suspect_id);
+            trace_track_("C-D-ALIAS", track->second,
+                         "discard-stale-alias-after-settled-old-c-no-hand-missing");
+        } else if (duplicate_of_settled_old_c) {
             printf("[3.0] suspect#%d 只命中已独立结算旧 C 的框，"
                    "按重复身份丢弃\n", track->second.suspect_id);
             trace_track_("C-D-ALIAS", track->second,
@@ -5751,16 +5844,41 @@ FrameProcessResult SessionManager::process_frame(
     trace_hand_phase_ = !hand_boxes.empty();
     current_time_ms_ = time_ms;
     hand_present_ = !hand_boxes.empty();
+    trace_("FRAME", "foods=%zu hands=%zu operation_active=%d tracks=%zu no_hand_streak=%d",
+           food_detections.size(), hand_boxes.size(),
+           working_inventory_active_ ? 1 : 0, track_buffer_.size(), no_hand_streak_);
+    for (size_t i = 0; i < food_detections.size(); ++i) {
+        const Detection& detection = food_detections[i];
+        trace_("FOOD-DETECTION",
+               "input-index=%zu cls=%d score=%.3f box=(%.1f,%.1f,%.1f,%.1f) "
+               "business-input=1 osd-business-visible=1",
+               i, detection.cls_id, detection.score,
+               detection.box.x1, detection.box.y1,
+               detection.box.x2, detection.box.y2);
+    }
+
     if (!session_active_) {
         trace_("FRAME", "ignore-inactive-session foods=%zu hands=%zu",
                food_detections.size(), hand_boxes.size());
         return output;
     }
-    trace_("FRAME", "foods=%zu hands=%zu operation_active=%d tracks=%zu no_hand_streak=%d",
-           food_detections.size(), hand_boxes.size(),
-           working_inventory_active_ ? 1 : 0, track_buffer_.size(), no_hand_streak_);
 
     if (hand_present_) {
+        for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+             it != track_buffer_.end(); ++it) {
+            OperationTrack& track = it->second;
+            if (!track.is_suspect_new || !track.pending_d_quarantined_by_old_c ||
+                track.alias_no_hand_missing_count == 0) {
+                continue;
+            }
+            trace_("C-D-ALIAS",
+                   "old-count=%zu suspect=%d phase=HAND relation=hand-returned "
+                   "missing-count=%d/%d action=reset-stale-alias-evidence",
+                   track.conflicting_old_item_ids.size(), track.suspect_id,
+                   track.alias_no_hand_missing_count,
+                   FLOW3_NO_HAND_D_CONFIRM_FRAMES);
+            track.alias_no_hand_missing_count = 0;
+        }
         // 细节9的数量不足只属于一段连续无手收尾。手重新进入时，上一段
         // 尚未提交的“一框一物品”候选必须撤销，不能跨操作继续凑 OUT 帧数。
         if (!visible_count_missing_counts_.empty() ||

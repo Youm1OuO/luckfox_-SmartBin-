@@ -190,6 +190,48 @@ static cv::Scalar display_color_for_class(int cls_id) {
 	return colors[idx];
 }
 
+// OSD 必须显示与 SessionManager 完全相同的业务输入。低分框仍然是业务证据，
+// 只改变颜色提示，不允许被第二个显示阈值隐藏。
+static void draw_business_input_detection(cv::Mat& frame,
+                                          const fridge::Detection& det,
+                                          size_t input_index,
+                                          bool is_hand_input) {
+	const bool low_confidence =
+		det.score < fridge::OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH;
+	const cv::Scalar color = low_confidence
+		? cv::Scalar(0, 165, 255)  // 橙色：进入业务层的低分框
+		: (is_hand_input ? cv::Scalar(0, 0, 255)
+		                 : display_color_for_class(det.cls_id));
+	const int x1 = (int)det.box.x1;
+	const int y1 = (int)det.box.y1;
+	const int x2 = (int)det.box.x2;
+	const int y2 = (int)det.box.y2;
+	cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 1);
+
+	char label[128];
+	snprintf(label, sizeof(label), "%c#%zu %s %.0f%% %s",
+		         is_hand_input ? 'H' : 'F', input_index,
+		         coco_cls_to_name(det.cls_id), det.score * 100.0f,
+		         low_confidence ? "[BUSINESS-LOW]" : "[BUSINESS]");
+	cv::putText(frame, label, cv::Point(x1, std::max(14, y1 - 6)),
+	            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+}
+
+// SessionManager 的 hand_boxes 接口只传坐标。为使日志仍能显示与这些坐标
+// 完全同源的类别和分数，在调用 process_frame() 前记录 hand_dets_for_display。
+static void trace_business_hand_inputs(
+	int frame_id, const std::vector<fridge::Detection>& hand_dets_for_display) {
+	if (!fridge::FLOW3_DEBUG_TRACE_LOG) return;
+	for (size_t i = 0; i < hand_dets_for_display.size(); ++i) {
+		const fridge::Detection& det = hand_dets_for_display[i];
+		printf("[3.0-TRACE][HAND-DETECTION][frame=%d][HAND] "
+		       "input-index=%zu cls=%d score=%.3f box=(%.1f,%.1f,%.1f,%.1f) "
+		       "business-input=1 osd-business-visible=1\n",
+		       frame_id, i, det.cls_id, det.score,
+		       det.box.x1, det.box.y1, det.box.x2, det.box.y2);
+	}
+}
+
 // 业务层只返回结构化事件；这里统一恢复终端可读的 [EVENT] 日志。
 // 遮挡 / 露出是库存状态变化，不会作为出入库事件上传云端。
 static void print_inventory_event(const fridge::InventoryEvent& ev) {
@@ -559,6 +601,7 @@ int main(int argc, char *argv[]) {
 					food_dets.push_back(d);
 				}
 			}
+			trace_business_hand_inputs(g_frame_id, hand_dets_for_display);
 
 			// 3.0 对每张无手帧直接推进收尾状态机；有手时只改工作库存和
 			// HAND_*/D 运行时状态，正式库存只在所有未决项收敛后提交。
@@ -727,24 +770,11 @@ int main(int argc, char *argv[]) {
 			// ============================================================
 			//  画面绘制：bbox + 系统状态
 			// ============================================================
-			for (const auto& d : detections) {
-				// if (fridge::is_hand(d.cls_id)) continue;
-				bool should_display_raw =
-					d.score >= fridge::OSD_OBJECT_SCORE_THRESH;
-				if (!should_display_raw) continue;
-
-				int x1 = (int)d.box.x1;
-				int y1 = (int)d.box.y1;
-				int x2 = (int)d.box.x2;
-				int y2 = (int)d.box.y2;
-				cv::Scalar color = display_color_for_class(d.cls_id);
-				cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 1);
-
-				char label[64];
-				snprintf(label, sizeof(label), "%s %.0f%%",
-				         coco_cls_to_name(d.cls_id), d.score * 100);
-				cv::putText(frame, label, cv::Point(x1, y1 - 6),
-				            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+			for (size_t i = 0; i < food_dets.size(); ++i) {
+				draw_business_input_detection(frame, food_dets[i], i, false);
+			}
+			for (size_t i = 0; i < hand_dets_for_display.size(); ++i) {
+				draw_business_input_detection(frame, hand_dets_for_display[i], i, true);
 			}
 
 			// 屏幕左上角：系统状态

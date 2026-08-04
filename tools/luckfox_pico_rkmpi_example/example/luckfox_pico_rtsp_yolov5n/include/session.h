@@ -190,6 +190,9 @@ struct OperationTrack {
     std::set<int> conflicting_old_item_ids;     // D -> operation-start old C
     std::set<int> conflicting_suspect_keys;     // old C -> runtime D key
     int alias_no_hand_match_count = 0;
+    // 所有关联旧 C 已独立结算后，隔离 D 连续没有任何直接无手证据的次数。
+    // 它不能复用旧 C 的 no_hand_missing_count，避免影响 OUT/遮挡语义。
+    int alias_no_hand_missing_count = 0;
     bool alias_no_hand_matched_this_frame = false;
     int no_hand_detection_index = -1;
 
