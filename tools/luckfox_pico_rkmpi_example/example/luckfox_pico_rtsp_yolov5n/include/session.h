@@ -320,6 +320,13 @@ private:
         const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner);
+    // 使用 reserve_visible_known_detections_ 的相同语义，在副本上计算本帧
+    // 可由普通静态库存唯一认领的 detection -> item 映射，不写入任何状态。
+    std::map<int, int> build_mutually_unique_hand_static_owner_by_detection_(
+        const BBox& hand_box,
+        const std::vector<Detection>& detections,
+        const std::set<int>& claimed_seed,
+        const std::map<int, int>& known_item_owner_seed) const;
     void apply_suspect_cover_evidence_(const BBox& hand_box,
                                        const std::vector<Detection>& detections,
                                        bool hand_moved);

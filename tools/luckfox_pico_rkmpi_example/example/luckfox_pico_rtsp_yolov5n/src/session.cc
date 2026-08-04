@@ -2675,13 +2675,18 @@ void SessionManager::promote_suspect_(int runtime_key, const Detection& detectio
     trace_track_("STATE", track, "promote-suspect-to-working-inventory");
 }
 
-void SessionManager::reserve_visible_known_detections_(
+std::map<int, int>
+SessionManager::build_mutually_unique_hand_static_owner_by_detection_(
         const BBox& hand_box,
         const std::vector<Detection>& detections,
-        std::set<int>* claimed_detection_indices,
-        std::map<int, int>* known_item_owner) {
-    // 只处理没有正在进行 HAND_* / PLACED 轨迹的普通旧物品。正在移动的
-    // 物品必须由自己的轨迹逻辑认领，不能被这里按原位置抢走。
+        const std::set<int>& claimed_seed,
+        const std::map<int, int>& known_item_owner_seed) const {
+    std::set<int> planned_claimed_detection_indices(claimed_seed);
+    std::map<int, int> planned_known_item_owner(known_item_owner_seed);
+    std::map<int, int> owner_by_detection;
+
+    // 只处理没有正在进行 HAND_* / PLACED 轨迹的普通静态物品。循环中的
+    // claimed / known owner 仅是副本，因此该计划可在 D 更新前安全预读。
     bool made_progress = true;
     while (made_progress) {
         made_progress = false;
@@ -2693,7 +2698,7 @@ void SessionManager::reserve_visible_known_detections_(
                  working_inventory_.begin();
              item != working_inventory_.end(); ++item) {
             if (item->second.status == ItemStatus::OCCLUDED ||
-                known_item_owner->count(item->first)) {
+                planned_known_item_owner.count(item->first)) {
                 continue;
             }
             const OperationTrack* runtime = find_runtime_for_item_(item->first);
@@ -2706,7 +2711,7 @@ void SessionManager::reserve_visible_known_detections_(
             bool tied = false;
             for (size_t di = 0; di < detections.size(); ++di) {
                 const int detection_index = static_cast<int>(di);
-                if (claimed_detection_indices->count(detection_index)) continue;
+                if (planned_claimed_detection_indices.count(detection_index)) continue;
                 const float cost = strict_match_cost(item->second.cls_id, reference,
                                                      detections[di]);
                 if (!(cost < std::numeric_limits<float>::infinity())) continue;
@@ -2764,13 +2769,38 @@ void SessionManager::reserve_visible_known_detections_(
             const int detection_index = best->second;
             if (!best_item_for_detection.count(detection_index) ||
                 best_item_for_detection[detection_index] != best->first ||
-                claimed_detection_indices->count(detection_index)) {
+                planned_claimed_detection_indices.count(detection_index)) {
                 continue;
             }
-            (*known_item_owner)[best->first] = detection_index;
-            claimed_detection_indices->insert(detection_index);
+            planned_known_item_owner[best->first] = detection_index;
+            planned_claimed_detection_indices.insert(detection_index);
+            owner_by_detection[detection_index] = best->first;
             made_progress = true;
         }
+    }
+
+    return owner_by_detection;
+}
+
+void SessionManager::reserve_visible_known_detections_(
+        const BBox& hand_box,
+        const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices,
+        std::map<int, int>* known_item_owner) {
+    const std::map<int, int> owner_by_detection =
+        build_mutually_unique_hand_static_owner_by_detection_(
+            hand_box, detections, *claimed_detection_indices, *known_item_owner);
+
+    for (std::map<int, int>::const_iterator owner = owner_by_detection.begin();
+         owner != owner_by_detection.end(); ++owner) {
+        const int detection_index = owner->first;
+        const int item_id = owner->second;
+        if (claimed_detection_indices->count(detection_index) ||
+            known_item_owner->count(item_id)) {
+            continue;
+        }
+        (*known_item_owner)[item_id] = detection_index;
+        claimed_detection_indices->insert(detection_index);
     }
 }
 
@@ -3130,6 +3160,26 @@ void SessionManager::update_existing_hand_tracks_(
     // 对 HAND_* + hold_and_move=false，静止手帧只能更新局部观测，不能把
     // “还在原位”或“跟手移动”当作新的有效证据。
     const bool hand_moved = move_length(delta) >= TRACK_HAND_MOVE_EPS;
+    bool has_hand_visible_suspect = false;
+    for (std::map<int, OperationTrack>::const_iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        if (it->second.is_suspect_new &&
+            it->second.suspect_source == SuspectSource::HAND_VISIBLE_D &&
+            (it->second.state == OperationTrackState::HAND_PARTIAL_BLOCKED ||
+             it->second.state == OperationTrackState::HAND_FULL_BLOCKED)) {
+            has_hand_visible_suspect = true;
+            break;
+        }
+    }
+    std::map<int, int> static_owner_by_detection;
+    if (has_hand_visible_suspect) {
+        // reserve_visible_known_detections_() 在本函数之后才实际写入静态 C 的
+        // claim。先在副本上得到完全相同的预约计划，避免已有 HAND_VISIBLE_D
+        // 按 map 顺序抢走本应唯一属于静态旧 C 的严格框。
+        static_owner_by_detection =
+            build_mutually_unique_hand_static_owner_by_detection_(
+                hand_box, detections, *claimed_detection_indices, *known_item_owner);
+    }
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
@@ -3237,6 +3287,18 @@ void SessionManager::update_existing_hand_tracks_(
         if (track.is_suspect_new) {
             if (observed_index >= 0) {
                 const Detection& d = detections[observed_index];
+                const std::map<int, int>::const_iterator static_owner =
+                    static_owner_by_detection.find(observed_index);
+                if (track.suspect_source == SuspectSource::HAND_VISIBLE_D &&
+                    static_owner != static_owner_by_detection.end() &&
+                    operation_start_inventory_.count(static_owner->second)) {
+                    trace_("D-GUARD",
+                           "suspect=%d cls=%d action=yield-to-mutually-unique-static-old-c "
+                           "detection=%d old-item=%d self-match=%d promote=0 claimed-write=0",
+                           track.suspect_id, track.cls_id, observed_index,
+                           static_owner->second, track.self_match_count);
+                    continue;
+                }
                 claimed_detection_indices->insert(observed_index);
                 if (track.item_id > 0) {
                     (*known_item_owner)[track.item_id] = observed_index;

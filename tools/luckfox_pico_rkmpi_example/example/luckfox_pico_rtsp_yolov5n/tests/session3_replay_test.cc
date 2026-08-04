@@ -483,6 +483,90 @@ void test_d_reappearance_does_not_claim_strict_existing_inventory() {
     assert(!has_event(result, fridge::EventKind::IN, 2));
 }
 
+// 手边橙子区域短暂额外出现 cls=0 苹果候选时，它可以先成为 provisional D，
+// 但不能在下一帧借远处静态旧苹果的严格框把 self_match_count 从 1 提到 2。
+// 这里第二个小手框的中心位移故意把假 D 的预测框带到旧苹果附近，同时对
+// 旧苹果的覆盖率仍低于 e2，因而旧苹果应被静态预约而非进入 HAND_*。
+void test_hand_visible_d_does_not_confirm_from_strict_static_old_c() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // 静态旧苹果 C
+    initial.push_back(item(2, 2, 500, 100, 600, 200));  // 橙子
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> first_hand_foods = stable;
+    // 和橙子框几乎完全重叠的跨类别假苹果候选。
+    first_hand_foods.push_back(det(0, 500, 100, 600, 200, 0.56f));
+    send_frame(&session, first_hand_foods,
+               std::vector<fridge::BBox>(1, fridge::BBox(540, 140, 560, 160)),
+               &frame);
+
+    bool found_provisional_false_d = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        if (it->second.is_suspect_new && it->second.cls_id == 0) {
+            found_provisional_false_d = true;
+            assert(!it->second.promoted_to_working_inventory);
+            assert(it->second.self_match_count == 1);
+        }
+    }
+    assert(found_provisional_false_d);
+
+    // 手中心左移 400px，使假 D 的宽松预测位置落到旧苹果；手框仅覆盖旧
+    // 苹果 4%，因此该苹果仍是本帧可静态预约的旧 C。
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(140, 140, 160, 160)),
+               &frame);
+
+    bool false_d_still_unconfirmed = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        if (it->second.is_suspect_new && it->second.cls_id == 0) {
+            false_d_still_unconfirmed = true;
+            assert(!it->second.promoted_to_working_inventory);
+            assert(it->second.self_match_count == 1);
+        }
+    }
+    assert(false_d_still_unconfirmed);
+
+    // 假 D 被让渡后，真实橙子仍可按原有 CONTACT 移动链路正常整理。
+    std::vector<fridge::Detection> moved_orange;
+    moved_orange.push_back(det(0, 100, 100, 200, 200));
+    moved_orange.push_back(det(2, 520, 100, 620, 200));
+    send_frame(&session, moved_orange,
+               std::vector<fridge::BBox>(1, fridge::BBox(560, 140, 580, 160)),
+               &frame);
+    moved_orange[1] = det(2, 540, 100, 640, 200);
+    send_frame(&session, moved_orange,
+               std::vector<fridge::BBox>(1, fridge::BBox(580, 140, 600, 160)),
+               &frame);
+    moved_orange[1] = det(2, 560, 100, 660, 200);
+    send_frame(&session, moved_orange,
+               std::vector<fridge::BBox>(1, fridge::BBox(600, 140, 620, 160)),
+               &frame);
+    send_frame(&session, moved_orange,
+               std::vector<fridge::BBox>(1, fridge::BBox(600, 140, 620, 160)),
+               &frame);
+
+    fridge::SettlementResult result = settle_after_hand(&session, moved_orange, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(1)->status ==
+           fridge::ItemStatus::VISIBLE);
+    assert(has_event(result, fridge::EventKind::MOVED, 2));
+    assert(!has_event(result, fridge::EventKind::IN, 3));
+    assert(!has_event(result, fridge::EventKind::OCCLUDED, 1));
+}
+
 // D 放下后手会继续移开。此时物品的最近真实观测比“旧框 + 手累计位移”可靠；
 // 若仍只使用估计框，D 会在无手直接帧中无法绑定而被错误丢弃。
 void test_new_item_dropped_before_hand_moves_away_keeps_its_identity() {
@@ -2283,6 +2367,7 @@ int main() {
     test_new_item_replacing_c_old_position_is_registered_without_hand_contact();
     test_post_hand_reveal_requires_continuous_no_hand_confirmation();
     test_d_reappearance_does_not_claim_strict_existing_inventory();
+    test_hand_visible_d_does_not_confirm_from_strict_static_old_c();
     test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
     test_partial_existing_item_is_not_registered_as_new_d();
     test_fast_same_class_b_becomes_c_candidate_not_d();
