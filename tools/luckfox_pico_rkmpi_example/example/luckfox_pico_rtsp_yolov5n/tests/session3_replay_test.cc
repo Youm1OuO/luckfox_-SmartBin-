@@ -1178,6 +1178,151 @@ void test_active_a_moves_next_to_static_same_class_b() {
     assert(!has_event(result, fridge::EventKind::IN, 3));
 }
 
+// 细节10：A 在有手阶段暂时看不见时，YOLO 的同类框可能让 A 的
+// reappear_candidate 错指向静止 C。手离开后 C 有自己的独立原位框，A 又在
+// 预计终点出现。C 对 A 只能是“排除证据”：清除旧候选后必须继续找到 A，
+// 不能永久 ambiguous，也不能抢 C、误 OUT 或误建 D。
+void test_stale_same_class_reappear_candidate_falls_back_to_moved_a() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 800, 100, 900, 200));  // A：右侧，被移动
+    initial.push_back(item(2, 0, 300, 100, 400, 200));  // B：静止
+    initial.push_back(item(3, 0, 500, 100, 600, 200));  // C：静止，但误入 A 候选
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 800, 100, 900, 200));
+    stable.push_back(det(0, 300, 100, 400, 200));
+    stable.push_back(det(0, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> b_and_c;
+    b_and_c.push_back(det(0, 300, 100, 400, 200));
+    b_and_c.push_back(det(0, 500, 100, 600, 200));
+
+    // t0：手完全遮住 A。t1：手路过 C，A 的候选会错误地落在 C 的原位。
+    send_frame(&session, b_and_c,
+               std::vector<fridge::BBox>(1, fridge::BBox(780, 80, 920, 220)), &frame);
+    send_frame(&session, b_and_c,
+               std::vector<fridge::BBox>(1, fridge::BBox(480, 80, 620, 220)), &frame);
+    // t2：手继续到 A 的真正放下位置；C 仍会被旧候选自匹配一次。
+    send_frame(&session, b_and_c,
+               std::vector<fridge::BBox>(1, fridge::BBox(180, 330, 320, 470)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& before_no_hand =
+        session.operation_tracks();
+    assert(before_no_hand.find(1) != before_no_hand.end());
+    assert(before_no_hand.find(1)->second.has_reappear_candidate_box);
+    assert(before_no_hand.find(1)->second.reappear_candidate_box.x1 == 500.0f);
+    assert(before_no_hand.find(1)->second.reappear_candidate_match_count >= 2);
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(det(0, 200, 350, 300, 450));  // A 的真正新位置
+    final_boxes.push_back(det(0, 300, 100, 400, 200));  // B 原位
+    final_boxes.push_back(det(0, 500, 100, 600, 200));  // C 原位
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        final_boxes, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+    assert(!has_event(first.settlement, fridge::EventKind::MOVED, 1));
+    assert(!has_event(first.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(first.settlement, fridge::EventKind::IN, 4));
+    const std::map<int, fridge::OperationTrack>& after_first =
+        session.operation_tracks();
+    assert(after_first.find(1) != after_first.end());
+    assert(!after_first.find(1)->second.no_hand_candidate_ambiguous);
+    assert(after_first.find(1)->second.has_reappear_candidate_box);
+    assert(after_first.find(1)->second.reappear_candidate_box.x1 == 200.0f);
+    assert(session.inventory().size() == 3);
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        final_boxes, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    assert(session.inventory().size() == 3);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(session.inventory().find_by_item(3) != 0);
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 2));
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 2));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::IN, 4));
+}
+
+// 细节10-7.2：静止 B/C 已独立保留，A 的旧候选却误指向 C；若本帧根本
+// 没检测到 A，修复也只能清除错误候选并等待正常的连续 OUT 证据，不能把 B/C
+// 交给 A、单帧 OUT，或借剩余框创建同类 D。
+void test_stale_same_class_reappear_candidate_without_a_waits_then_out() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 800, 100, 900, 200));  // A：被取出
+    initial.push_back(item(2, 0, 300, 100, 400, 200));  // B：静止
+    initial.push_back(item(3, 0, 500, 100, 600, 200));  // C：静止，误入 A 候选
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 800, 100, 900, 200));
+    stable.push_back(det(0, 300, 100, 400, 200));
+    stable.push_back(det(0, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> b_and_c;
+    b_and_c.push_back(det(0, 300, 100, 400, 200));
+    b_and_c.push_back(det(0, 500, 100, 600, 200));
+    send_frame(&session, b_and_c,
+               std::vector<fridge::BBox>(1, fridge::BBox(780, 80, 920, 220)), &frame);
+    send_frame(&session, b_and_c,
+               std::vector<fridge::BBox>(1, fridge::BBox(480, 80, 620, 220)), &frame);
+    send_frame(&session, b_and_c,
+               std::vector<fridge::BBox>(1, fridge::BBox(180, 330, 320, 470)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& before_no_hand =
+        session.operation_tracks();
+    assert(before_no_hand.find(1) != before_no_hand.end());
+    assert(before_no_hand.find(1)->second.has_reappear_candidate_box);
+    assert(before_no_hand.find(1)->second.reappear_candidate_box.x1 == 500.0f);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        b_and_c, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+    assert(session.inventory().size() == 3);
+    assert(!has_event(first.settlement, fridge::EventKind::MOVED, 1));
+    assert(!has_event(first.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(first.settlement, fridge::EventKind::IN, 4));
+    const std::map<int, fridge::OperationTrack>& after_first =
+        session.operation_tracks();
+    assert(after_first.find(1) != after_first.end());
+    assert(!after_first.find(1)->second.no_hand_candidate_ambiguous);
+    assert(!after_first.find(1)->second.has_reappear_candidate_box);
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        b_and_c, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) == 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(session.inventory().find_by_item(3) != 0);
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(has_event(second.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 2));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::IN, 4));
+}
+
 // 细节8-7.2 的自然时序：A 先连续两帧被直接看到仍在原位，触发暂时的
 // STATIC_CONFIRMED；手尚未离开就再次移动，A 在旧位置消失。此时必须重新
 // 激活 A 的轨迹，最终认回移动后的 A，而不是把它登记成新的同类 D。
@@ -1573,6 +1718,8 @@ int main() {
     test_post_hand_reveal_commits_on_second_direct_frame();
     test_c_reappear_commits_after_second_direct_frame();
     test_active_a_moves_next_to_static_same_class_b();
+    test_stale_same_class_reappear_candidate_falls_back_to_moved_a();
+    test_stale_same_class_reappear_candidate_without_a_waits_then_out();
     test_provisional_static_a_reopens_when_moved_later_in_same_operation();
     test_same_class_static_neighbor_box_allows_active_a_out();
     test_adjacent_same_class_real_boxes_out_only_removed_item();

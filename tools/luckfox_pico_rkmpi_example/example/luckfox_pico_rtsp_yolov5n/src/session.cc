@@ -966,13 +966,22 @@ bool has_ambiguous_no_hand_reappear_candidate(
         const std::vector<Detection>& detections, const std::set<int>& claimed,
         int runtime_key, const OperationTrack& track,
         const std::map<int, InventoryItem>& working,
-        const std::map<int, OperationTrack>& tracks) {
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& independent_static_owner_by_detection) {
     if (!is_claim_mature(track)) return false;
     const std::map<int, int> no_known_owner;
     int viable_count = 0;
     for (size_t i = 0; i < detections.size(); ++i) {
         if (claimed.count(static_cast<int>(i)) ||
             !reappear_candidate_path_matches(track, detections[i])) {
+            continue;
+        }
+        // 已经在本帧通过双方唯一的严格原位关系保留给另一旧 C 的框，对当前
+        // C 只表示“不是我”。它不能再次被解释成路径歧义并永久阻止回退搜索。
+        std::map<int, int>::const_iterator static_owner =
+            independent_static_owner_by_detection.find(static_cast<int>(i));
+        if (static_owner != independent_static_owner_by_detection.end() &&
+            static_owner->second != track.item_id) {
             continue;
         }
         if (detection_strictly_matches_other_item(detections[i], track.item_id,
@@ -1530,6 +1539,54 @@ const OperationTrack* find_track_for_item(
         if (it->second.item_id == item_id) return &it->second;
     }
     return nullptr;
+}
+
+// 无手帧的同类回退不能只因为一个框“几何上靠近”邻居就排除它。这里先建立
+// 双方都唯一的严格原位所有权：只有旧 B 在当前帧也只有这一个严格原位框，且
+// 该框不同时属于另一旧 C，才可作为 A 的排除证据。它不修改 claimed，不改变
+// 正常 C->B/D 仲裁，仅供过期 reappear candidate 被证伪后继续 fallback 使用。
+std::map<int, int> build_independent_no_hand_static_owner_by_detection(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::map<int, OperationTrack>& tracks) {
+    std::set<int> candidate_item_ids;
+    std::map<int, BBox> references;
+    for (std::map<int, InventoryItem>::const_iterator original =
+             operation_start.begin(); original != operation_start.end(); ++original) {
+        std::map<int, InventoryItem>::const_iterator current =
+            working.find(original->first);
+        if (current == working.end() ||
+            original->second.status == ItemStatus::OCCLUDED ||
+            current->second.status == ItemStatus::OCCLUDED) {
+            continue;
+        }
+        const OperationTrack* runtime = find_track_for_item(tracks, original->first);
+        if (runtime && (runtime->is_suspect_new ||
+                        runtime->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+                        runtime->resolution == ExistingItemResolution::OUT_CONFIRMED ||
+                        runtime->resolution == ExistingItemResolution::OCCLUDED_CONFIRMED)) {
+            continue;
+        }
+        const BBox reference = original->second.base_box.area() > 0.0f
+            ? original->second.base_box : original->second.box;
+        if (reference.area() <= 0.0f) continue;
+        candidate_item_ids.insert(original->first);
+        references[original->first] = reference;
+    }
+
+    std::map<int, int> item_to_detection;
+    std::vector<int> detection_owner(detections.size(), -1);
+    bind_mutually_unique(operation_start, candidate_item_ids, detections, &references,
+                         &item_to_detection, &detection_owner, false, false);
+
+    std::map<int, int> result;
+    for (size_t i = 0; i < detection_owner.size(); ++i) {
+        if (detection_owner[i] >= 0) {
+            result[static_cast<int>(i)] = detection_owner[i];
+        }
+    }
+    return result;
 }
 
 // 返回当前无手检测到该物品“完整候选轨迹”的最小匹配代价。它只在终点严格匹配
@@ -3482,6 +3539,9 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
     std::set<int> claimed;
     std::vector<int> promote_keys;
     std::set<int> discard_keys;
+    const std::map<int, int> independent_static_owner_by_detection =
+        build_independent_no_hand_static_owner_by_detection(
+            detections, working_inventory_, operation_start_inventory_, track_buffer_);
 
     // “本帧存在无法唯一归属的路径候选”是瞬时证据；每张直接无手帧都重新
     // 计算，不能让上一帧歧义永久阻塞，也不能把本帧歧义拿去累计 OUT。
@@ -3593,74 +3653,168 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             int found = -1;
             bool found_at_original_position = false;
             bool found_as_reappear_candidate = false;
+            std::set<int> excluded_static_neighbor_detections;
+            std::set<int> candidate_claimed;
+            const char* found_source = "NONE";
+            bool stale_reappear_candidate_cleared = false;
+            bool stale_tentative_b_cleared = false;
 
-            // 细节5的无手收尾顺序：已有 C 必须先回查原位置；若 C 仍在原处，
-            // 后面的动态路径和 B 候选都不能把它改判成移动。
-            if (!track.is_suspect_new && track.original_box.area() > 0.0f) {
-                found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                                  track.original_box, true, false);
-                found_at_original_position = found >= 0;
-                if (found < 0) {
-                    const int nearest = best_detection_for_box(
-                        detections, claimed, track.cls_id, track.original_box, true, false);
-                    if (nearest >= 0 && has_unique_operation_start_owner(
-                            detections[nearest], track.item_id,
-                            operation_start_inventory_)) {
-                        found = nearest;
-                        found_at_original_position = true;
+            // 细节10：已有 reappear candidate 仍然优先，但若它被本帧唯一严格
+            // 原位框明确证伪为静止邻居 B，就只能说明“不是 A”。跳过该框后要在
+            // 同一无手帧继续查找 A 的预计位置/真实路径，不能直接永久未决。
+            for (;;) {
+                candidate_claimed = claimed;
+                candidate_claimed.insert(excluded_static_neighbor_detections.begin(),
+                                         excluded_static_neighbor_detections.end());
+                found = -1;
+                found_at_original_position = false;
+                found_as_reappear_candidate = false;
+                bool found_from_saved_reappear_candidate = false;
+                found_source = "NONE";
+
+                // 细节5的无手收尾顺序：已有 C 必须先回查原位置；若 C 仍在原处，
+                // 后面的动态路径和 B 候选都不能把它改判成移动。
+                if (!track.is_suspect_new && track.original_box.area() > 0.0f) {
+                    found = unique_detection_for_box(detections, candidate_claimed,
+                                                      track.cls_id, track.original_box,
+                                                      true, false);
+                    found_at_original_position = found >= 0;
+                    if (found < 0) {
+                        const int nearest = best_detection_for_box(
+                            detections, candidate_claimed, track.cls_id,
+                            track.original_box, true, false);
+                        if (nearest >= 0 && has_unique_operation_start_owner(
+                                detections[nearest], track.item_id,
+                                operation_start_inventory_)) {
+                            found = nearest;
+                            found_at_original_position = true;
+                        }
+                    }
+                    if (found >= 0) found_source = "ORIGINAL";
+                    // 同上：由 CONTACT_* 转来的物品已拥有真实 B 路径。B 与
+                    // 原框局部重叠并不等于它仍在原位，必须再检查中心位移。
+                    if (track.has_hand_estimate_anchor_box && found >= 0 &&
+                        !contact_detection_is_at_original(track, detections[found])) {
+                        found = -1;
+                        found_at_original_position = false;
+                        found_source = "NONE";
                     }
                 }
-                // 同上：由 CONTACT_* 转来的物品已拥有真实 B 路径。B 与
-                // 原框局部重叠并不等于它仍在原位，必须再检查中心位移。
-                if (track.has_hand_estimate_anchor_box && found >= 0 &&
-                    !contact_detection_is_at_original(track, detections[found])) {
-                    found = -1;
-                    found_at_original_position = false;
+                // 已在有手阶段看到过 B 时，真实 B 候选比“旧框 + 手位移”的估计
+                // 更可信，但它同样需要连续自匹配，不能在本帧直接确认整理。
+                if (found < 0 && !track.is_suspect_new &&
+                    track.has_reappear_candidate_box) {
+                    found = unique_detection_for_box(
+                        detections, candidate_claimed, track.cls_id,
+                        track.reappear_candidate_box, true, true);
+                    if (found < 0) {
+                        found = best_detection_for_box(
+                            detections, candidate_claimed, track.cls_id,
+                            track.reappear_candidate_box, true, true);
+                    }
+                    found_as_reappear_candidate = found >= 0;
+                    found_from_saved_reappear_candidate = found >= 0;
+                    if (found >= 0) found_source = "REAPPEAR_CANDIDATE";
                 }
-            }
-            // 已在有手阶段看到过 B 时，真实 B 候选比“旧框 + 手位移”的估计
-            // 更可信，但它同样需要连续自匹配，不能在本帧直接确认整理。
-            if (found < 0 && !track.is_suspect_new &&
-                track.has_reappear_candidate_box) {
-                found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                                  track.reappear_candidate_box, true, true);
                 if (found < 0) {
-                    found = best_detection_for_box(detections, claimed, track.cls_id,
-                                                   track.reappear_candidate_box, true, true);
+                    found = unique_detection_for_box(detections, candidate_claimed,
+                                                     track.cls_id, reference, true, true);
+                    if (found >= 0) found_source = "REFERENCE";
                 }
-                found_as_reappear_candidate = found >= 0;
-            }
-            if (found < 0) {
-                found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                                 reference, true, true);
-            }
-            // D 刚放下时，完整框可能和“手中局部框 + 手位移”差异很大。它已经
-            // 通过前序来源建立了链路，收尾首帧应优先尝试自身最近一次真实观测。
-            // 普通旧库存不走这个宽松兜底。
-            if (found < 0 && track.is_suspect_new && track.has_last_seen_box) {
-                found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                                  track.last_seen_box, true, true);
-            }
-            if (found < 0 && track.is_suspect_new && track.has_last_hand_block_box) {
-                found = unique_detection_for_box(detections, claimed, track.cls_id,
-                                                  track.last_hand_block_box, true, true);
-            }
-            if (found < 0 && track.is_suspect_new) {
-                found = unique_d_reappearance_detection_for_track(
-                    detections, claimed, it->first, track, working_inventory_, track_buffer_);
-                if (found >= 0) {
-                    printf("[3.0] suspect#%d 通过局部→完整路径重现匹配到无手检测\n",
-                           track.suspect_id);
+                // D 刚放下时，完整框可能和“手中局部框 + 手位移”差异很大。它已经
+                // 通过前序来源建立了链路，收尾首帧应优先尝试自身最近一次真实观测。
+                // 普通旧库存不走这个宽松兜底。
+                if (found < 0 && track.is_suspect_new && track.has_last_seen_box) {
+                    found = unique_detection_for_box(detections, candidate_claimed,
+                                                      track.cls_id, track.last_seen_box,
+                                                      true, true);
+                    if (found >= 0) found_source = "SUSPECT_LAST_SEEN";
                 }
-            }
-            if (found < 0 && !track.is_suspect_new) {
-                found = unique_no_hand_reappear_detection_for_track(
-                    detections, claimed, it->first, track, working_inventory_, track_buffer_);
-                found_as_reappear_candidate = found >= 0;
-                if (found >= 0) {
-                    printf("[3.0] item#%d 在无手帧将同类 B 暂记为重新出现候选\n",
-                           track.item_id);
+                if (found < 0 && track.is_suspect_new && track.has_last_hand_block_box) {
+                    found = unique_detection_for_box(detections, candidate_claimed,
+                                                      track.cls_id, track.last_hand_block_box,
+                                                      true, true);
+                    if (found >= 0) found_source = "SUSPECT_HAND_BLOCK";
                 }
+                if (found < 0 && track.is_suspect_new) {
+                    found = unique_d_reappearance_detection_for_track(
+                        detections, candidate_claimed, it->first, track,
+                        working_inventory_, track_buffer_);
+                    if (found >= 0) {
+                        found_source = "SUSPECT_REAPPEAR";
+                        printf("[3.0] suspect#%d 通过局部→完整路径重现匹配到无手检测\n",
+                               track.suspect_id);
+                    }
+                }
+                if (found < 0 && !track.is_suspect_new) {
+                    found = unique_no_hand_reappear_detection_for_track(
+                        detections, candidate_claimed, it->first, track,
+                        working_inventory_, track_buffer_);
+                    found_as_reappear_candidate = found >= 0;
+                    if (found >= 0) {
+                        found_source = "UNIQUE_REAPPEAR";
+                        printf("[3.0] item#%d 在无手帧将同类 B 暂记为重新出现候选\n",
+                               track.item_id);
+                    }
+                }
+
+                if (found < 0 || track.is_suspect_new || is_claim_protected(track) ||
+                    found_at_original_position ||
+                    contact_detection_is_at_original(track, detections[found]) ||
+                    !detection_strictly_matches_other_item(
+                        detections[found], track.item_id, working_inventory_)) {
+                    break;
+                }
+
+                const std::map<int, int>::const_iterator static_owner =
+                    independent_static_owner_by_detection.find(found);
+                if (static_owner == independent_static_owner_by_detection.end() ||
+                    static_owner->second == track.item_id) {
+                    // 另一旧 C 没有本帧独立严格原位证据，仍属于细节8的真实
+                    // 同类歧义；交给下面原有的 ambiguous 分支处理。
+                    break;
+                }
+
+                const bool candidate_matches_static_neighbor =
+                    track.has_reappear_candidate_box &&
+                    track_match_box(track.cls_id, track.reappear_candidate_box,
+                                    detections[found].cls_id, detections[found].box);
+                const bool tentative_matches_static_neighbor =
+                    track.has_tentative_b_box &&
+                    track_match_box(track.cls_id, track.tentative_b_box,
+                                    detections[found].cls_id, detections[found].box);
+                if (candidate_matches_static_neighbor) {
+                    track.has_reappear_candidate_box = false;
+                    track.reappear_candidate_match_count = 0;
+                    track.reappear_candidate_started_touching_hand = false;
+                    track.drop_evidence_count = 0;
+                    stale_reappear_candidate_cleared = true;
+                }
+                if (tentative_matches_static_neighbor) {
+                    track.has_tentative_b_box = false;
+                    track.tentative_b_match_count = 0;
+                    track.tentative_b_started_touching_hand = false;
+                    stale_tentative_b_cleared = true;
+                }
+                // 即使本次候选来自 reference/path 而非保存的 candidate，排除后
+                // 的下一个真实框也必须重新走连续确认，不能单帧确认 MOVED。
+                track.reappearance_pending = true;
+                trace_(
+                    "MATCH",
+                    "item=%d detection=%d source=%s other-owner=%d "
+                    "other-owner-evidence=direct-original-mutually-unique "
+                    "action=exclude-independent-static-neighbor-and-fallback "
+                    "candidate-cleared=%d tentative-cleared=%d saved-candidate-source=%d "
+                    "box=(%.1f,%.1f,%.1f,%.1f)",
+                    track.item_id, found, found_source, static_owner->second,
+                    candidate_matches_static_neighbor ? 1 : 0,
+                    tentative_matches_static_neighbor ? 1 : 0,
+                    found_from_saved_reappear_candidate ? 1 : 0,
+                    detections[found].box.x1, detections[found].box.y1,
+                    detections[found].box.x2, detections[found].box.y2);
+                trace_track_("MATCH", track,
+                             "exclude-static-neighbor-candidate-continue-fallback");
+                excluded_static_neighbor_detections.insert(found);
             }
 
             if (!track.is_suspect_new && is_claim_protected(track)) {
@@ -3715,8 +3869,13 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 track.reappearance_pending = true;
                 track.no_hand_candidate_ambiguous = true;
                 trace_("MATCH",
-                       "item=%d detection=%d reject=strictly-belongs-to-other-old-item",
-                       track.item_id, found);
+                       "item=%d detection=%d reject=strictly-belongs-to-other-old-item "
+                       "excluded-static-neighbors=%zu stale-candidate-reset=%d "
+                       "tentative-reset=%d fallback-source=%s result=real-ambiguity",
+                       track.item_id, found,
+                       excluded_static_neighbor_detections.size(),
+                       stale_reappear_candidate_cleared ? 1 : 0,
+                       stale_tentative_b_cleared ? 1 : 0, found_source);
                 trace_track_("MATCH", track,
                              "no-hand-candidate-strictly-belongs-to-other-old-item");
                 continue;
@@ -3732,12 +3891,28 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                                                   no_known_owner);
                     track.reappearance_pending = true;
                     track.no_hand_candidate_ambiguous = true;
+                    trace_("MATCH",
+                           "item=%d detection=%d excluded-static-neighbors=%zu "
+                           "stale-candidate-reset=%d tentative-reset=%d fallback-source=%s "
+                           "result=real-shared-ambiguity",
+                           track.item_id, found,
+                           excluded_static_neighbor_detections.size(),
+                           stale_reappear_candidate_cleared ? 1 : 0,
+                           stale_tentative_b_cleared ? 1 : 0, found_source);
                     trace_track_("MATCH", track, "no-hand-shared-candidate");
                     continue;
                 }
                 if (mature_owner >= 0 && mature_owner != track.item_id) {
                     track.reappearance_pending = true;
                     track.no_hand_candidate_ambiguous = true;
+                    trace_("MATCH",
+                           "item=%d detection=%d excluded-static-neighbors=%zu "
+                           "stale-candidate-reset=%d tentative-reset=%d fallback-source=%s "
+                           "result=real-other-c-owner",
+                           track.item_id, found,
+                           excluded_static_neighbor_detections.size(),
+                           stale_reappear_candidate_cleared ? 1 : 0,
+                           stale_tentative_b_cleared ? 1 : 0, found_source);
                     trace_track_("MATCH", track, "no-hand-candidate-owned-by-other-c");
                     continue;
                 }
@@ -3747,12 +3922,28 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 if (!track.is_suspect_new) {
                     track.no_hand_candidate_ambiguous =
                         has_ambiguous_no_hand_reappear_candidate(
-                            detections, claimed, it->first, track,
-                            working_inventory_, track_buffer_);
+                            detections, candidate_claimed, it->first, track,
+                            working_inventory_, track_buffer_,
+                            independent_static_owner_by_detection);
                     trace_track_("MATCH", track,
                                  track.no_hand_candidate_ambiguous
                                      ? "no-hand-path-ambiguous"
                                      : "no-hand-no-path-candidate");
+                    if (!excluded_static_neighbor_detections.empty()) {
+                        trace_("MATCH",
+                               "item=%d excluded-static-neighbors=%zu "
+                               "stale-candidate-reset=%d tentative-reset=%d "
+                               "fallback-source=NONE fallback-detection=-1 "
+                               "ambiguous-after-exclusion=%d result=%s",
+                               track.item_id,
+                               excluded_static_neighbor_detections.size(),
+                               stale_reappear_candidate_cleared ? 1 : 0,
+                               stale_tentative_b_cleared ? 1 : 0,
+                               track.no_hand_candidate_ambiguous ? 1 : 0,
+                               track.no_hand_candidate_ambiguous
+                                   ? "real-path-ambiguity"
+                                   : "excluded-static-neighbor-then-no-a-candidate");
+                    }
                 }
                 // D 必须在后续直接无手帧中连续自匹配。未达到门槛就消失，
                 // 不保留为悬空 IN，更不能让它在后续随机帧重新凑次数。
@@ -3767,10 +3958,15 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             if (!track.is_suspect_new) {
                 track.no_hand_candidate_ambiguous = false;
                 trace_("MATCH",
-                       "item=%d detection=%d source=%s box=(%.1f,%.1f,%.1f,%.1f)",
+                       "item=%d detection=%d source=%s excluded-static-neighbors=%zu "
+                       "stale-candidate-reset=%d tentative-reset=%d "
+                       "ambiguous-after-exclusion=0 result=fallback-selected "
+                       "box=(%.1f,%.1f,%.1f,%.1f)",
                        track.item_id, found,
-                       found_at_original_position ? "ORIGINAL" :
-                           (found_as_reappear_candidate ? "REAPPEAR" : "TRACK"),
+                       found_source,
+                       excluded_static_neighbor_detections.size(),
+                       stale_reappear_candidate_cleared ? 1 : 0,
+                       stale_tentative_b_cleared ? 1 : 0,
                        d.box.x1, d.box.y1, d.box.x2, d.box.y2);
             }
 

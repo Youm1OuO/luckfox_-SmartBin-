@@ -15,7 +15,7 @@ tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/session.c
 修改参数后必须重新交叉编译。建议一次只改一项，并保存“参数版本 + 视频 +
 事件日志”；多个阈值一起放宽，出现误匹配时会无法判断是哪一项造成的。
 
-当前版本（3.0-r12）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
+当前版本（3.0-r13）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
 自己的唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用
 的框才有机会进入疑似 D 链路。若某个 HAND_* 旧 C 没有自己的检测框，而同类贴手
 B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_candidate` 暂存，不能
@@ -36,9 +36,14 @@ B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_ca
 
 本版本还明确区分“有手阶段暂时看到 C 在原位”和“无手阶段已经完成静态结算”：
 前者即使运行时状态为 NORMAL，仍保留 `needs_no_hand_settlement`。若同一只手在
-离开前再次有效移动、且 C 的原位独立框消失，C 会恢复 HAND_* 路径；若无手阶段
-同类框严格属于另一件旧库存或可同时属于多个旧 C，则保持未决，不会强认 MOVED、
-OUT 或新 D。
+离开前再次有效移动、且 C 的原位独立框消失，C 会恢复 HAND_* 路径。
+
+无手阶段的同类框若严格属于另一件旧库存 B，必须再区分两种情况：若当前帧中 B
+和该框是双方唯一的严格原位匹配，该框已独立属于 B；它对移动中的 A 是“排除证据”。
+若 A 的旧 `reappear_candidate` 恰好指向该框，程序会清除这个过期候选，并在同一帧
+继续检查 A 的预计位置、真实路径和剩余唯一框；A 的真实新框仍须走原有连续无手确认，
+不会单帧强认 MOVED。若 B 没有上述独立原位证据，或一个框仍可同时属于多个旧 C，
+则保持未决，不会强认 MOVED、OUT 或新 D。
 
 诊断追踪开关（不是匹配超参数）
 ----------------------------------
@@ -52,7 +57,14 @@ FLOW3_DEBUG_TRACE_LOG（当前 false）
     预计框、最近观测框、reappear candidate、保护期、hold/not_hold/缺失计数；
     `RELEASE` 还会带 release_reason、调用分支 caller、原位检测索引和 BBox（若存在）。
 
-    常用标签：STATE（状态转换）、MATCH（C->B 接受或拒绝原因）、D-GUARD（新 D
+    常用标签：STATE（状态转换）、MATCH（C->B 接受或拒绝原因；若出现
+    `exclude-independent-static-neighbor-and-fallback`，表示过期候选已被独立静止
+    邻居排除，程序正继续搜索当前 C 的真实框；其中
+    `other-owner-evidence=direct-original-mutually-unique` 表示邻居在当前帧和该框
+    双方均只有一个严格原位匹配，`result=fallback-selected` 表示已找到 C 的独立
+    后备框，`result=excluded-static-neighbor-then-no-a-candidate` 表示本帧确实没有
+    C 的新框，后续交由原有连续 OUT 规则处理；`real-*-ambiguity` 才表示排除后
+    仍有真实同类身份歧义）、D-GUARD（新 D
     防线及每个同类旧 C 的结论）、NO-HAND（无手匹配/OUT 证据）、VISIBLE-COUNT
     （同类可见框数、框到旧 C 的一对一保留、数量差额 OUT、框跳变清除及撤销）、SETTLE（拒绝或
     提交结算、库存变化和最终事件）。排查一次异常时，应按 operation_id 再按 item_id
