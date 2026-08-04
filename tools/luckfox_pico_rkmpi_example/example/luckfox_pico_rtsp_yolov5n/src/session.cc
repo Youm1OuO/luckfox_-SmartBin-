@@ -2500,7 +2500,9 @@ void SessionManager::update_existing_contact_tracks_(
         if (track.contact_state == ContactState::CONTACT_MOVING) {
             std::map<int, InventoryItem>::iterator item =
                 working_inventory_.find(track.item_id);
-            if (item != working_inventory_.end()) update_seen(item->second, detection, 0);
+            if (item != working_inventory_.end()) {
+                update_seen(item->second, detection, trace_frame_id_);
+            }
             continue;
         }
 
@@ -3070,7 +3072,7 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
     const bool needs_settlement_before_release = c.needs_no_hand_settlement;
     // 不把 unresolved C-D alias 当作这里的阻塞条件：正是 C 用自己的直接
     // 证据完成 release 后，r15 才能安全判断 runtime-only D 是否应该回收。
-    update_seen(working->second, detection, 0);
+    update_seen(working->second, detection, trace_frame_id_);
     release_not_held_(c, false, ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND,
                       detection_index, &detection.box,
                       "no-hand-stable-near-original");
@@ -3259,7 +3261,7 @@ void SessionManager::update_existing_hand_tracks_(
                     std::map<int, InventoryItem>::iterator item =
                         working_inventory_.find(track.item_id);
                     if (item != working_inventory_.end()) {
-                        update_seen(item->second, d, item->second.updated_frame + 1);
+                        update_seen(item->second, d, trace_frame_id_);
                         item->second.base_box = d.box;
                     }
                 }
@@ -3292,7 +3294,7 @@ void SessionManager::update_existing_hand_tracks_(
                     std::map<int, InventoryItem>::iterator item =
                         working_inventory_.find(track.item_id);
                     if (item != working_inventory_.end()) {
-                        update_seen(item->second, old_d, 0);
+                        update_seen(item->second, old_d, trace_frame_id_);
                     }
                     release_not_held_(track, false,
                                       ReleaseReason::ORIGINAL_DETECTION,
@@ -3366,7 +3368,7 @@ void SessionManager::update_existing_hand_tracks_(
                     track.drop_evidence_count = 0;
                 }
                 if (track.drop_evidence_count >= FLOW3_DROP_EVIDENCE_REQUIRED) {
-                    confirm_rearrange_(track, d.box, d.score, 0);
+                    confirm_rearrange_(track, d.box, d.score, trace_frame_id_);
                 }
             } else {
                 // B 暂时再次被手挡住时不能凭“看不见”判断放下；但连续放下
@@ -3394,7 +3396,9 @@ void SessionManager::update_existing_hand_tracks_(
             if (hand_moved &&
                 track.not_hold_evidence_count >= FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
                 std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
-                if (item != working_inventory_.end()) update_seen(item->second, old_d, 0);
+                if (item != working_inventory_.end()) {
+                    update_seen(item->second, old_d, trace_frame_id_);
+                }
                 release_not_held_(track, false,
                                   ReleaseReason::ORIGINAL_DETECTION,
                                   old_position_index,
@@ -3512,7 +3516,7 @@ void SessionManager::update_existing_hand_tracks_(
         d.box = track->second.last_seen_box;
         d.cls_id = track->second.cls_id;
         d.score = 0.0f;
-        promote_suspect_(promote_keys[i], d, 0);
+        promote_suspect_(promote_keys[i], d, trace_frame_id_);
     }
 }
 
@@ -4005,6 +4009,22 @@ void SessionManager::mark_newly_hand_blocked_items_(
                 ++rt;
             }
         }
+        // C 重新被手接触时会重建自己的 runtime；仍在隔离中的 D 保留了
+        // D -> C 的关系，必须用它恢复新 C -> D 的反向索引。否则后续同一
+        // 无手框只会被 C 看到，D 会被错误当作“缺失的 stale alias”。
+        for (std::map<int, OperationTrack>::const_iterator suspect =
+                 track_buffer_.begin(); suspect != track_buffer_.end(); ++suspect) {
+            if (!suspect->second.is_suspect_new ||
+                !suspect->second.pending_d_quarantined_by_old_c ||
+                !suspect->second.conflicting_old_item_ids.count(item.item_id)) {
+                continue;
+            }
+            track.conflicting_suspect_keys.insert(suspect->first);
+            trace_("C-D-ALIAS",
+                   "old-item=%d suspect=%d phase=HAND relation=restored "
+                   "action=rebind-after-retouch",
+                   item.item_id, suspect->first);
+        }
         track_buffer_[item.item_id] = track;
         if (new_existing_track_ids) new_existing_track_ids->insert(item.item_id);
         trace_track_("STATE", track_buffer_[item.item_id],
@@ -4308,7 +4328,9 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
                         std::map<int, InventoryItem>::iterator item =
                             working_inventory_.find(track.item_id);
-                        if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                        if (item != working_inventory_.end()) {
+                            update_seen(item->second, d, trace_frame_id_);
+                        }
                         release_not_held_(track, false,
                                           ReleaseReason::CONTACT_RETURNED_ORIGINAL,
                                           contact_found,
@@ -4317,7 +4339,9 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     } else if (was_moving) {
                         std::map<int, InventoryItem>::iterator item =
                             working_inventory_.find(track.item_id);
-                        if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                        if (item != working_inventory_.end()) {
+                            update_seen(item->second, d, trace_frame_id_);
+                        }
                     }
                     continue;
                 }
@@ -4350,7 +4374,9 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     if (track.item_id > 0) {
                         std::map<int, InventoryItem>::iterator item =
                             working_inventory_.find(track.item_id);
-                        if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                        if (item != working_inventory_.end()) {
+                            update_seen(item->second, d, trace_frame_id_);
+                        }
                     }
                     continue;
                 }
@@ -4568,7 +4594,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         std::map<int, InventoryItem>::iterator item =
                             working_inventory_.find(track.item_id);
                         if (item != working_inventory_.end()) {
-                            update_seen(item->second, provisional, 0);
+                            update_seen(item->second, provisional, trace_frame_id_);
                         }
                         release_not_held_(track, false,
                                           ReleaseReason::ORIGINAL_DETECTION,
@@ -4916,7 +4942,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 std::map<int, InventoryItem>::iterator item =
                     working_inventory_.find(track.item_id);
                 if (item != working_inventory_.end()) {
-                    update_seen(item->second, d, 0);
+                    update_seen(item->second, d, trace_frame_id_);
                     item->second.base_box = d.box;
                 }
                 continue;
@@ -4930,7 +4956,9 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 if (still_at_original) {
                     std::map<int, InventoryItem>::iterator item =
                         working_inventory_.find(track.item_id);
-                    if (item != working_inventory_.end()) update_seen(item->second, d, 0);
+                    if (item != working_inventory_.end()) {
+                        update_seen(item->second, d, trace_frame_id_);
+                    }
                     release_not_held_(track, false,
                                       ReleaseReason::ORIGINAL_DETECTION,
                                       found,
@@ -4975,7 +5003,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         (!shared_quarantined_alias ||
                          track.alias_no_hand_match_count >=
                              FLOW3_NO_HAND_D_CONFIRM_FRAMES)) {
-                        confirm_rearrange_(track, d.box, d.score, 0);
+                        confirm_rearrange_(track, d.box, d.score, trace_frame_id_);
                     }
                 }
             }
@@ -5053,7 +5081,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
         d.box = track->second.last_seen_box;
         d.cls_id = track->second.cls_id;
         d.score = 0.0f;
-        promote_suspect_(promote_keys[i], d, 0);
+        promote_suspect_(promote_keys[i], d, trace_frame_id_);
         track->second.placed_box = d.box;
         track->second.has_placed_box = true;
         track->second.drop_confirmed = true;

@@ -303,6 +303,10 @@ void test_new_item_requires_d_chain() {
     assert(result.committed);
     assert(session.inventory().size() == 1);
     assert(has_event(result, fridge::EventKind::IN, 1));
+    const fridge::InventoryItem* inserted = session.inventory().find_by_item(1);
+    assert(inserted != 0);
+    assert(inserted->created_frame > 0);
+    assert(inserted->updated_frame >= inserted->created_frame);
 }
 
 // 新物品可能只在一张有手帧露出局部框，手离开后才第一次看到完整框。
@@ -2079,6 +2083,111 @@ void test_quarantined_same_class_stale_alias_disappears_after_old_c_settles() {
     assert(!has_event(after_hand_third.settlement, fridge::EventKind::OUT, 2));
 }
 
+// 细节11：C 已在无手帧独立 release、随后又被手接触时，旧 runtime 会被
+// 重建。仍被隔离的 D 必须继续与新 C 保持双向 alias；同一无手框应作为
+// shared detection，而不是先把 D 误记为 stale missing。
+void test_retouch_old_c_preserves_alias_links_and_shared_resolution() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // old apple C
+    initial.push_back(item(2, 0, 700, 100, 800, 200));  // static same-class B
+    session.init_from_backend(initial, true);
+    int frame = 1;
+
+    const fridge::Detection original_c = det(0, 100, 100, 200, 200);
+    const fridge::Detection static_b = det(0, 700, 100, 800, 200);
+    std::vector<fridge::Detection> stable;
+    stable.push_back(original_c);
+    stable.push_back(static_b);
+    initial_no_hand_frame(&session, stable, &frame);
+
+    const fridge::BBox original_hand(80, 80, 220, 220);
+    const fridge::BBox moved_hand(370, 80, 610, 220);
+    const fridge::Detection complete_c = det(0, 430, 95, 550, 205);
+    const fridge::Detection alias_d = det(0, 560, 100, 660, 200);
+    send_frame(&session, std::vector<fridge::Detection>(1, static_b),
+               std::vector<fridge::BBox>(1, original_hand), &frame);
+
+    std::vector<fridge::Detection> conflicting_hand_frame;
+    conflicting_hand_frame.push_back(complete_c);
+    conflicting_hand_frame.push_back(alias_d);
+    conflicting_hand_frame.push_back(static_b);
+    for (int i = 0; i < 3; ++i) {
+        send_frame(&session, conflicting_hand_frame,
+                   std::vector<fridge::BBox>(1, moved_hand), &frame);
+    }
+
+    int alias_key = 0;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        if (it->second.is_suspect_new &&
+            it->second.pending_d_quarantined_by_old_c &&
+            it->second.conflicting_old_item_ids.count(1)) {
+            alias_key = it->first;
+            break;
+        }
+    }
+    assert(alias_key < 0);
+
+    // C 在原位被独立 release，但 D 仍是 quarantined runtime。
+    const int release_frame = frame++;
+    fridge::FrameProcessResult released = session.process_frame(
+        stable, std::vector<fridge::BBox>(), release_frame, release_frame);
+    assert(released.no_hand_frame_processed);
+    assert(session.operation_tracks().find(1) != session.operation_tracks().end());
+    assert(session.operation_tracks().find(alias_key) != session.operation_tracks().end());
+    assert(session.operation_tracks().find(1)->second.conflicting_suspect_keys.count(
+               alias_key));
+
+    // 重接触创建新的 C runtime。D 的 D -> C 关系必须恢复新 C 的 C -> D。
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, original_hand), &frame);
+    const std::map<int, fridge::OperationTrack>& after_retouch =
+        session.operation_tracks();
+    assert(after_retouch.find(1) != after_retouch.end());
+    assert(after_retouch.find(alias_key) != after_retouch.end());
+    assert(after_retouch.find(1)->second.conflicting_suspect_keys.count(alias_key));
+    assert(after_retouch.find(alias_key)->second.conflicting_old_item_ids.count(1));
+
+    // C 现在移动到 D 上次出现的位置。无手阶段只给出同一个框，必须按
+    // shared detection 连续两帧回收重复 D，而不是走 D missing 链路。
+    std::vector<fridge::Detection> moved_hand_frame;
+    moved_hand_frame.push_back(alias_d);
+    moved_hand_frame.push_back(static_b);
+    for (int i = 0; i < 3; ++i) {
+        send_frame(&session, moved_hand_frame,
+                   std::vector<fridge::BBox>(1, moved_hand), &frame);
+    }
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        moved_hand_frame, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_tracks().find(alias_key) != session.operation_tracks().end());
+    const fridge::OperationTrack& d_after_first =
+        session.operation_tracks().find(alias_key)->second;
+    assert(d_after_first.alias_no_hand_match_count == 1);
+    assert(d_after_first.alias_no_hand_missing_count == 0);
+    assert(d_after_first.alias_no_hand_matched_this_frame);
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        moved_hand_frame, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    assert(session.operation_tracks().find(alias_key) == session.operation_tracks().end());
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::IN, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 2));
+}
+
 // 细节11-8.3：防止假 D 不能退化为吞掉真实 D。C 的完整新框和一个真实
 // 同类 D 都在有手阶段形成 provisional alias；无手两帧分别得到不同框后，
 // C 保留 old item_id 并 MOVED，D 才正式 IN。
@@ -2206,6 +2315,7 @@ int main() {
     test_static_gray_zone_evidence_resets_when_hand_returns();
     test_quarantined_same_class_duplicate_merges_back_to_old_c();
     test_quarantined_same_class_stale_alias_disappears_after_old_c_settles();
+    test_retouch_old_c_preserves_alias_links_and_shared_resolution();
     test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes();
     return 0;
 }
