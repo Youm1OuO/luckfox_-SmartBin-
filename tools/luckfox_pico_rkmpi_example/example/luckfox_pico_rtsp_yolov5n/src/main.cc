@@ -42,6 +42,9 @@
 #include "session.h"
 #include "inventory.h"
 #include "cloud_uploader.h"
+#include "app_preprocess.h"
+#include "app_door_state.h"
+#include "app_display.h"
 
 // 1280*720, 1920*1080
 #define DISP_WIDTH  1280
@@ -57,43 +60,6 @@ int model_height = 704;
 float scale ;
 int leftPadding ;
 int topPadding  ;
-
-cv::Mat letterbox(cv::Mat input)
-{
-	float scaleX = (float)model_width  / (float)width;
-	float scaleY = (float)model_height / (float)height;
-	scale = scaleX < scaleY ? scaleX : scaleY;
-
-	int inputWidth   = (int)((float)width * scale);
-	int inputHeight  = (int)((float)height * scale);
-
-	leftPadding = (model_width  - inputWidth) / 2;
-	topPadding  = (model_height - inputHeight) / 2;
-
-	cv::Mat inputScale;
-    cv::resize(input, inputScale, cv::Size(inputWidth,inputHeight), 0, 0, cv::INTER_LINEAR);
-	cv::Mat letterboxImage(model_height, model_width, CV_8UC3, cv::Scalar(114, 114, 114));
-    cv::Rect roi(leftPadding, topPadding, inputWidth, inputHeight);
-    inputScale.copyTo(letterboxImage(roi));
-
-	return letterboxImage;
-}
-
-void mapCoordinates(int *x, int *y) {
-	int mx = *x - leftPadding;
-	int my = *y - topPadding;
-
-	int rx = (int)((float)mx / scale);
-	int ry = (int)((float)my / scale);
-
-	if (rx < 0)      rx = 0;
-	if (ry < 0)      ry = 0;
-	if (rx > width)  rx = width;
-	if (ry > height) ry = height;
-
-	*x = rx;
-	*y = ry;
-}
 
 static bool request_backend_inventory(const char* device_id,
                                       const char* session_id,
@@ -113,167 +79,6 @@ static bool request_backend_inventory(const char* device_id,
 	printf("[BACKEND] 开门库存获取接口未接入；将按测试配置处理首张无手帧\n");
 	return false;
 }
-
-static bool is_strong_hand_for_osd(const fridge::Detection& det) {
-    if (!fridge::is_hand(det.cls_id)) return false;
-    if (det.score < fridge::OSD_STRONG_HAND_SCORE_THRESH) return false;
-
-	float frame_area = fridge::FRAME_W * fridge::FRAME_H;
-	if (frame_area <= 0.0f) return false;
-
-	float area_ratio = det.box.area() / frame_area;
-    return area_ratio >= fridge::OSD_STRONG_HAND_MIN_AREA_RATIO;
-}
-
-static double update_no_event_pixel_diff(const cv::Mat& frame,
-                                         cv::Mat& last_gray_small) {
-	cv::Mat gray;
-	cv::Mat small;
-	cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-	cv::resize(gray, small, cv::Size(64, 36), 0, 0, cv::INTER_AREA);
-
-	if (last_gray_small.empty()) {
-		small.copyTo(last_gray_small);
-		return 0.0;
-	}
-
-	cv::Mat diff;
-	cv::absdiff(small, last_gray_small, diff);
-	double mean_diff = cv::mean(diff)[0];
-	small.copyTo(last_gray_small);
-	return mean_diff;
-}
-
-// 门状态机只使用原始 Y 平面，不依赖缩放、翻转或 YOLO 输出。
-static double raw_dark_pixel_ratio(const cv::Mat& y_plane) {
-	if (y_plane.empty() || y_plane.total() == 0) return 0.0;
-	cv::Mat dark_mask;
-	cv::threshold(y_plane, dark_mask, fridge::DOOR_DARK_PIXEL_THRESHOLD,
-	              255, cv::THRESH_BINARY_INV);
-	return (double)cv::countNonZero(dark_mask) / (double)y_plane.total();
-}
-
-static double median_brightness(const std::deque<double>& values) {
-	if (values.empty()) return 0.0;
-	std::vector<double> ordered(values.begin(), values.end());
-	std::sort(ordered.begin(), ordered.end());
-	const size_t mid = ordered.size() / 2;
-	return ordered.size() % 2 ? ordered[mid] : (ordered[mid - 1] + ordered[mid]) * 0.5;
-}
-
-static bool is_high_confidence_closing_dark(double mean_brightness,
-	                                           double dark_pixel_ratio,
-	                                           double open_brightness_reference) {
-	return open_brightness_reference > 0.0 &&
-	       mean_brightness <= fridge::DOOR_CLOSING_GUARD_THRESHOLD &&
-	       mean_brightness <= open_brightness_reference * fridge::DOOR_CLOSING_DROP_RATIO &&
-	       dark_pixel_ratio >= fridge::DOOR_CLOSING_DARK_PIXEL_RATIO_THRESHOLD;
-}
-
-static cv::Scalar display_color_for_class(int cls_id) {
-	static const cv::Scalar colors[] = {
-		cv::Scalar(  0, 255,   0),
-		cv::Scalar(255,   0,   0),
-		cv::Scalar(  0, 165, 255),
-		cv::Scalar(255,   0, 255),
-		cv::Scalar(255, 255,   0),
-		cv::Scalar(  0, 255, 255),
-		cv::Scalar(128, 255,   0),
-		cv::Scalar(255, 128,   0),
-		cv::Scalar(128,   0, 255),
-		cv::Scalar(  0, 128, 255),
-		cv::Scalar(255,   0, 128),
-		cv::Scalar(  0, 255, 128),
-	};
-	int n = (int)(sizeof(colors) / sizeof(colors[0]));
-	int idx = cls_id >= 0 ? cls_id % n : 0;
-	return colors[idx];
-}
-
-// OSD 必须显示与 SessionManager 完全相同的业务输入。低分框仍然是业务证据，
-// 只改变颜色提示，不允许被第二个显示阈值隐藏。
-static void draw_business_input_detection(cv::Mat& frame,
-                                          const fridge::Detection& det,
-                                          size_t input_index,
-                                          bool is_hand_input) {
-	const bool low_confidence =
-		det.score < fridge::OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH;
-	const cv::Scalar color = low_confidence
-		? cv::Scalar(0, 165, 255)  // 橙色：进入业务层的低分框
-		: (is_hand_input ? cv::Scalar(0, 0, 255)
-		                 : display_color_for_class(det.cls_id));
-	const int x1 = (int)det.box.x1;
-	const int y1 = (int)det.box.y1;
-	const int x2 = (int)det.box.x2;
-	const int y2 = (int)det.box.y2;
-	cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 1);
-
-	char label[128];
-	snprintf(label, sizeof(label), "%c#%zu %s %.0f%% %s",
-		         is_hand_input ? 'H' : 'F', input_index,
-		         coco_cls_to_name(det.cls_id), det.score * 100.0f,
-		         low_confidence ? "[BUSINESS-LOW]" : "[BUSINESS]");
-	cv::putText(frame, label, cv::Point(x1, std::max(14, y1 - 6)),
-	            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
-}
-
-// SessionManager 的 hand_boxes 接口只传坐标。为使日志仍能显示与这些坐标
-// 完全同源的类别和分数，在调用 process_frame() 前记录 hand_dets_for_display。
-static void trace_business_hand_inputs(
-	int frame_id, const std::vector<fridge::Detection>& hand_dets_for_display) {
-	if (!fridge::FLOW3_DEBUG_TRACE_LOG) return;
-	for (size_t i = 0; i < hand_dets_for_display.size(); ++i) {
-		const fridge::Detection& det = hand_dets_for_display[i];
-		printf("[3.0-TRACE][HAND-DETECTION][frame=%d][HAND] "
-		       "input-index=%zu cls=%d score=%.3f box=(%.1f,%.1f,%.1f,%.1f) "
-		       "business-input=1 osd-business-visible=1\n",
-		       frame_id, i, det.cls_id, det.score,
-		       det.box.x1, det.box.y1, det.box.x2, det.box.y2);
-	}
-}
-
-// 业务层只返回结构化事件；这里统一恢复终端可读的 [EVENT] 日志。
-// 遮挡 / 露出是库存状态变化，不会作为出入库事件上传云端。
-static void print_inventory_event(const fridge::InventoryEvent& ev) {
-	const char* name = coco_cls_to_name(ev.cls_id);
-	switch (ev.kind) {
-		case fridge::EventKind::IN:
-			printf("\033[1;32m[EVENT]\033[0m 放入: item#%d %s (置信度 %.0f%%) "
-			       "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
-			       ev.item_id, name, ev.score * 100.0f,
-			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
-			break;
-		case fridge::EventKind::OUT:
-			printf("\033[1;32m[EVENT]\033[0m 取出: item#%d %s "
-			       "原位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
-			       ev.item_id, name,
-			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
-			break;
-		case fridge::EventKind::MOVED:
-			printf("\033[1;32m[EVENT]\033[0m 整理: item#%d %s "
-			       "原位置=(%.0f,%.0f)~(%.0f,%.0f) -> "
-			       "新位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
-			       ev.item_id, name,
-			       ev.before_box.x1, ev.before_box.y1,
-			       ev.before_box.x2, ev.before_box.y2,
-			       ev.after_box.x1, ev.after_box.y1,
-			       ev.after_box.x2, ev.after_box.y2);
-			break;
-		case fridge::EventKind::OCCLUDED:
-			printf("\033[1;32m[EVENT]\033[0m 遮挡: item#%d %s "
-			       "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
-			       ev.item_id, name,
-			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
-			break;
-		case fridge::EventKind::REVEALED:
-			printf("\033[1;32m[EVENT]\033[0m 露出: item#%d %s "
-			       "位置=(%.0f,%.0f)~(%.0f,%.0f)\n",
-			       ev.item_id, name,
-			       ev.box.x1, ev.box.y1, ev.box.x2, ev.box.y2);
-			break;
-	}
-}
-
 
 int main(int argc, char *argv[]) {
   // 抑制 Rockchip MPP 硬件编码器的调试日志

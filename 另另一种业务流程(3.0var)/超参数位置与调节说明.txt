@@ -16,14 +16,35 @@ tools/luckfox_pico_rkmpi_example/include/rknn/postprocess.h
 
 tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/yolov5n.cc
 
-3.0 的会话状态机实现位于：
+3.0 的会话状态机入口、生命周期、运行时清理和 `process_frame()` 总编排位于：
 
 tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/session.cc
+
+从 3.0-r19 开始，其余会话实现按职责拆在同一 `src/` 目录：
+
+    session_geometry.cc    严格/局部匹配、手框关系、位移和遮挡几何 helper
+    session_ownership.cc   同类 owner、STRICT/LOCAL 仲裁和静态预约
+    session_hand.cc        HAND_*、CONTACT_*、D、C-D alias 与 claim grace
+    session_no_hand.cc     无手直接观察、灰区恢复、reappear 和未决判断
+    session_settlement.cc  数量结算、遮挡/揭示与 IN/OUT/MOVED 事件提交
+
+参数定义仍集中在 `include/fridge_config.h`；上述文件只是参数的使用位置，不能因为
+参数调用分散而在多个 `.cc` 中复制或修改常量。
 
 修改参数后必须重新交叉编译。建议一次只改一项，并保存“参数版本 + 视频 +
 事件日志”；多个阈值一起放宽，出现误匹配时会无法判断是哪一项造成的。
 
-当前版本（3.0-r18）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
+3.0-r19 是纯模块化拆分版本：没有修改任何超参数、阈值、确认帧数、匹配范围、
+状态机分支、事件语义、库存提交时机、NMS 或云端队列策略。下文中 r18 引入并验证过的
+业务规则均由 r19 原样继承；这里只更新它们的实现文件位置。
+
+与参数有关的新增源码位置如下：`postprocess.cc` 仍负责 NMS、类别最终阈值和结果整理，
+`postprocess_decode.cc` 负责 i8/RV1106/fp32 框解码，`postprocess_labels.cc` 唯一持有
+标签数组；`main.cc` 保留门状态和顶层帧循环，`app_door_state.cc` 是门亮度/暗帧计算，
+`app_display.cc` 是 OSD 与事件打印，`app_preprocess.cc` 是 letterbox 与坐标映射。
+这些位置变化不引入新的可调数值。
+
+当前版本（3.0-r19，业务规则继承 r18）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
 自己的唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用
 的框才有机会进入疑似 D 链路。若某个 HAND_* 旧 C 没有自己的检测框，而同类贴手
 B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_candidate` 暂存，不能
@@ -147,8 +168,9 @@ OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH（当前 0.50；r18 继承的显示颜色
     代码位置：fridge_config.h。此名称取代了 r14 的 OSD_OBJECT_SCORE_THRESH，避免把它
     误解为第二道业务或显示过滤阈值。
 
-    r18 的 main.cc 继续直接遍历当帧实际传入 process_frame() 的 food_dets，以及使用与
-    hand_boxes 完全相同 HAND_CONTEXT_SCORE_THRESH 条件生成的 hand_dets_for_display。
+    r19 的 main.cc 继续直接遍历当帧实际传入 process_frame() 的 food_dets，以及使用与
+    hand_boxes 完全相同 HAND_CONTEXT_SCORE_THRESH 条件生成的 hand_dets_for_display；实际
+    绘制函数已移动到 app_display.cc。
     因此每一个业务有效食品/手框都会画在 OSD 上；分数低于 0.50 的框仅改为黄色/橙色，
     并带有 input-index、类别和分数，分数达到 0.50 的框使用常规类别/手框颜色。
 

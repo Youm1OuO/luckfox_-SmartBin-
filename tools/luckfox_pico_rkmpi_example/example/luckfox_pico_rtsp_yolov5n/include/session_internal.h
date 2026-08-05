@@ -1,0 +1,309 @@
+#ifndef __FRIDGE_SESSION_INTERNAL_H
+#define __FRIDGE_SESSION_INTERNAL_H
+
+#include <limits>
+#include <map>
+#include <set>
+#include <utility>
+#include <vector>
+
+#include "fridge_config.h"
+#include "session.h"
+
+namespace fridge {
+namespace session_internal {
+
+float ratio_difference(float a, float b);
+float box_edge_distance(const BBox& a, const BBox& b);
+bool strict_match_box(int cls_id, const BBox& reference,
+                      int observed_cls_id, const BBox& observed);
+bool strict_match(const InventoryItem& item, const Detection& observed);
+bool partial_match_box(int cls_id, const BBox& reference,
+                       int observed_cls_id, const BBox& observed,
+                       float iom_threshold = INVENTORY_PARTIAL_IOM);
+bool partial_match(const InventoryItem& item, const Detection& observed);
+bool hand_partial_match_box(int cls_id, const BBox& reference,
+                            int observed_cls_id, const BBox& observed);
+bool track_match_box(int cls_id, const BBox& reference,
+                     int observed_cls_id, const BBox& observed);
+bool hand_is_near(const BBox& hand, const BBox& object);
+float hand_cover_ratio(const BBox& hand, const BBox& object);
+bool hand_fully_covers(const BBox& hand, const BBox& object);
+bool hand_affects(const BBox& hand, const BBox& object);
+bool hand_touches_detection(const BBox& hand, const BBox& detection_box);
+const char* suspect_source_name(SuspectSource source);
+const char* operation_track_state_name(OperationTrackState state);
+const char* contact_state_name(ContactState state);
+const char* existing_resolution_name(ExistingItemResolution resolution);
+const char* release_reason_name(ReleaseReason reason);
+const char* live_observation_state_name(LiveObservationState state);
+const char* runtime_owner_kind_name(const OperationTrack& track);
+const char* event_kind_name(EventKind kind);
+bool existing_item_needs_settlement(const OperationTrack& track);
+bool existing_item_resolved_without_current_detection(const OperationTrack* track);
+bool existing_track_is_terminal(const OperationTrack& track);
+bool hand_track_touches_detection(const std::vector<BBox>& hand_track,
+                                  const Detection& detection);
+BBox move_box(const BBox& box, const MoveValue& delta);
+MoveValue total_move(const OperationTrack& track);
+BBox estimated_box(const OperationTrack& track);
+bool is_active_existing_hand_track(const OperationTrack& track);
+bool is_active_contact_track(const OperationTrack& track);
+bool is_active_runtime_track(const OperationTrack& track);
+bool is_unresolved_operation_start_old_track(const OperationTrack& track);
+bool is_claim_protected(const OperationTrack& track);
+bool is_claim_mature(const OperationTrack& track);
+void record_tentative_b(OperationTrack* track, const Detection& detection,
+                        bool touching_hand);
+void seed_reappear_from_tentative_b(OperationTrack* track);
+bool reappear_candidate_is_confirmed(const OperationTrack& track);
+bool reappear_candidate_path_matches(const OperationTrack& track,
+                                     const Detection& observed);
+void start_reappear_candidate(OperationTrack* track, const Detection& detection,
+                              bool started_touching_hand);
+bool update_reappear_candidate(OperationTrack* track, const Detection& detection,
+                               bool started_touching_hand);
+float complete_box_size_difference(const BBox& complete, const BBox& observed);
+bool becomes_more_like_complete_box(const OperationTrack& track,
+                                    const BBox& previous,
+                                    const BBox& current);
+float move_length(const MoveValue& delta);
+bool has_meaningful_hand_move(const OperationTrack& track);
+InventoryItem make_inventory_item(int item_id, const Detection& detection,
+                                  int frame_id, long long time_ms);
+void update_seen(InventoryItem& item, const Detection& detection, int frame_id);
+InventoryEvent make_event(EventKind kind, const InventoryItem& item,
+                          const BBox& before = BBox(),
+                          const BBox& after = BBox());
+void subtract_cover(const BBox& piece, const BBox& cover,
+                    std::vector<BBox>* output);
+bool fully_covered_by(const BBox& target, const std::vector<BBox>& covers);
+
+int unique_detection_for_box(const std::vector<Detection>& detections,
+                             const std::set<int>& claimed, int cls_id,
+                             const BBox& reference, bool allow_partial,
+                             bool allow_track);
+int best_detection_for_box(const std::vector<Detection>& detections,
+                           const std::set<int>& claimed, int cls_id,
+                           const BBox& reference, bool allow_partial,
+                           bool allow_track);
+bool matches_hand_affected_reference(int cls_id, const BBox& reference,
+                                     const Detection& detection,
+                                     const BBox& hand);
+int unique_hand_affected_detection_for_box(const std::vector<Detection>& detections,
+                                           const std::set<int>& claimed,
+                                           int cls_id, const BBox& reference,
+                                           const BBox& hand);
+int best_hand_affected_detection_for_box(const std::vector<Detection>& detections,
+                                         const std::set<int>& claimed,
+                                         int cls_id, const BBox& reference,
+                                         const BBox& hand);
+int hand_affected_existing_candidate_count(
+        const std::map<int, InventoryItem>& working, const Detection& detection,
+        const BBox& hand);
+int unique_detection_at_old_position(const std::vector<Detection>& detections,
+                                     const std::set<int>& claimed,
+                                     const OperationTrack& track);
+bool any_detection_at_old_position(const std::vector<Detection>& detections,
+                                   const OperationTrack& track);
+bool old_position_is_clean(const std::vector<Detection>& detections,
+                           const OperationTrack& track,
+                           const std::map<int, InventoryItem>& working);
+bool detection_strictly_matches_other_item(const Detection& detection,
+                                           int excluded_item_id,
+                                           const std::map<int, InventoryItem>& working);
+
+enum class StrictOwnerKind {
+    NONE,
+    START_OLD_C,
+    PENDING_D,
+    QUARANTINED_PENDING_D,
+    CONFIRMED_D,
+};
+
+struct StrictDetectionOwner {
+    StrictOwnerKind kind = StrictOwnerKind::NONE;
+    int item_id = -1;
+    int runtime_key = 0;
+};
+
+const char* strict_owner_kind_name(StrictOwnerKind kind);
+const OperationTrack* runtime_for_working_item(
+        int item_id, const std::map<int, OperationTrack>& tracks,
+        int* runtime_key);
+StrictDetectionOwner strict_owner_for_detection(
+        const Detection& detection, int excluded_item_id,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks);
+bool strict_owner_blocks_old_c(StrictOwnerKind kind);
+bool strict_owner_is_quarantined_alias_of_old_c(
+        const StrictDetectionOwner& owner, int old_item_id,
+        const std::map<int, OperationTrack>& tracks);
+
+float contact_reference_cost(const OperationTrack& track,
+                             const BBox& reference,
+                             const Detection& observed);
+float contact_path_match_cost(const OperationTrack& track,
+                              const Detection& observed);
+void append_contact_observation(OperationTrack* track, const Detection& detection,
+                                bool touching_hand);
+bool contact_detection_is_at_original(const OperationTrack& track,
+                                      const Detection& detection);
+int unique_contact_original_detection(const std::vector<Detection>& detections,
+                                      const std::set<int>& claimed,
+                                      const OperationTrack& track,
+                                      const std::map<int, InventoryItem>& working);
+int unique_contact_detection_for_track(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        const OperationTrack& track, const std::map<int, InventoryItem>& working,
+        const std::map<int, OperationTrack>& tracks);
+bool has_contact_path_candidate(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        const OperationTrack& track, const std::map<int, InventoryItem>& working);
+int unique_c_reappear_owner_for_detection(
+        const Detection& detection, const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner);
+void mark_mature_hand_b_ambiguity(
+        const Detection& detection, std::map<int, OperationTrack>* tracks,
+        const std::map<int, int>& known_item_owner);
+float suspect_d_reappearance_path_cost(const OperationTrack& track,
+                                       const Detection& observed);
+int unique_no_hand_reappear_detection_for_track(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        int runtime_key, const OperationTrack& track,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks);
+bool has_ambiguous_no_hand_reappear_candidate(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        int runtime_key, const OperationTrack& track,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& independent_static_owner_by_detection);
+bool confirmed_blocker_covers_old_c(
+        const OperationTrack& c, const std::vector<Detection>& detections,
+        const std::map<int, int>& known_item_owner,
+        const std::map<int, OperationTrack>& tracks);
+int unique_c_replacement_owner_for_detection(
+        const Detection& detection, const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner);
+bool quarantined_suspect_matches_detection(const OperationTrack& suspect,
+                                           const Detection& detection);
+bool old_c_has_independently_settled_identity(const OperationTrack& old);
+bool all_conflicting_old_c_independently_settled(
+        const OperationTrack& suspect,
+        const std::map<int, OperationTrack>& tracks);
+bool detection_is_duplicate_of_settled_old_c(const OperationTrack& old,
+                                             int detection_index,
+                                             const Detection& detection);
+bool quarantined_suspect_detection_is_duplicate_of_settled_old_c(
+        const OperationTrack& suspect,
+        const std::map<int, OperationTrack>& tracks,
+        int suspect_detection_index, const Detection& detection);
+bool quarantined_suspect_has_distinct_old_c_detections(
+        const OperationTrack& suspect,
+        const std::map<int, OperationTrack>& tracks,
+        int suspect_detection_index, const Detection& suspect_detection);
+int unique_d_reappearance_detection_for_track(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        int runtime_key, const OperationTrack& track,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, OperationTrack>& tracks);
+bool detection_can_belong_to_active_track(const Detection& detection,
+                                          const OperationTrack& track);
+bool detection_matches_old_working_inventory(
+        const Detection& detection, const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start);
+bool has_unique_operation_start_owner(
+        const Detection& detection, int item_id,
+        const std::map<int, InventoryItem>& operation_start);
+bool detection_conflicts_with_active_track(
+        const Detection& detection, const std::map<int, OperationTrack>& tracks);
+bool protected_existing_track_blocks_post_hand_d(
+        const Detection& detection, const std::map<int, OperationTrack>& tracks);
+bool has_active_runtime_for_item(const std::map<int, OperationTrack>& tracks,
+                                 int item_id);
+void reserve_unique_no_hand_static_inventory_detections(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::map<int, OperationTrack>& tracks,
+        std::set<int>* claimed_detection_indices);
+
+float final_motion_reference_diagonal(const BBox& before);
+float normalized_final_motion_distance(const BBox& before, const BBox& after);
+bool boxes_differ_as_move(const BBox& before, const BBox& after);
+float strict_match_cost(int cls_id, const BBox& reference,
+                        const Detection& observed);
+
+struct HandDirectOldOwnerCandidate {
+    int item_id = -1;
+    int detection_index = -1;
+    HandDirectOldOwnerStrength strength = HandDirectOldOwnerStrength::STRICT;
+    enum class LocalContinuity {
+        NONE,
+        STRICT_LAST_HAND_BOX,
+        TRACK_LAST_HAND_BOX,
+        PARTIAL_LAST_HAND_BOX,
+    } local_continuity = LocalContinuity::NONE;
+    float cost = std::numeric_limits<float>::infinity();
+};
+
+int hand_direct_old_owner_strength_rank(HandDirectOldOwnerStrength strength);
+int hand_direct_old_owner_local_continuity_rank(
+        HandDirectOldOwnerCandidate::LocalContinuity continuity);
+bool hand_direct_old_owner_candidate_better(
+        const HandDirectOldOwnerCandidate& left,
+        const HandDirectOldOwnerCandidate& right);
+bool hand_direct_old_owner_candidate_tied(
+        const HandDirectOldOwnerCandidate& left,
+        const HandDirectOldOwnerCandidate& right);
+int direct_old_owner_detection_for_item(const HandDirectOldOwnerPlan& plan,
+                                        int item_id);
+HandDirectOldOwnerStrength direct_old_owner_strength_for_detection(
+        const HandDirectOldOwnerPlan& plan, int detection_index);
+std::set<int> claimed_with_other_direct_old_owners(
+        const std::set<int>& claimed, const HandDirectOldOwnerPlan& plan,
+        int current_item_id);
+float visible_count_owner_cost(const InventoryItem& original,
+                               const OperationTrack* runtime,
+                               const Detection& observed);
+bool visible_count_survivor_box_is_continuous(int cls_id, const BBox& previous,
+                                               const BBox& current);
+bool detection_matches_confirmed_suspect_d(
+        const Detection& detection, const std::map<int, OperationTrack>& tracks);
+BBox choose_primary_hand(const std::vector<BBox>& hand_boxes);
+bool hand_boxes_effectively_same(const BBox& a, const BBox& b);
+void bind_mutually_unique(const std::map<int, InventoryItem>& items,
+                          const std::set<int>& candidate_item_ids,
+                          const std::vector<Detection>& observed,
+                          std::map<int, BBox>* references,
+                          std::map<int, int>* item_to_observation,
+                          std::vector<int>* observation_owner,
+                          bool track_mode, bool partial_mode);
+const OperationTrack* find_track_for_item(
+        const std::map<int, OperationTrack>& tracks, int item_id);
+std::map<int, int> build_independent_no_hand_static_owner_by_detection(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::map<int, OperationTrack>& tracks);
+float track_path_match_cost(const InventoryItem& item, const OperationTrack& track,
+                            const Detection& observed);
+void bind_mutually_unique_track_paths(
+        const std::map<int, InventoryItem>& items,
+        const std::set<int>& candidate_item_ids,
+        const std::vector<Detection>& observed,
+        const std::map<int, OperationTrack>& tracks,
+        std::map<int, int>* item_to_observation,
+        std::vector<int>* observation_owner);
+
+}  // namespace session_internal
+}  // namespace fridge
+
+#endif  // __FRIDGE_SESSION_INTERNAL_H

@@ -1,0 +1,62 @@
+// Unique runner for every split SessionManager replay scenario.
+#include "session3_replay_support.h"
+
+int main() {
+    using namespace session3_replay;
+    test_move_keeps_identity();
+    test_drop_at_middle_of_candidate_path_keeps_identity();
+    test_out_removes_existing_identity();
+    test_unconfirmed_hand_candidate_is_out_after_final_absence();
+    test_unconfirmed_hand_candidate_reappears_at_old_position();
+    test_fully_hand_hidden_item_can_out();
+    test_hand_cover_ratio_controls_hand_state();
+    test_new_item_requires_d_chain();
+    test_new_item_can_confirm_from_first_no_hand_frame();
+    test_partially_seen_new_item_can_reappear_full_on_middle_path();
+    test_fully_hidden_new_item_can_enter_from_post_hand_reveal();
+    test_new_item_replacing_c_old_position_is_registered_without_hand_contact();
+    test_post_hand_reveal_requires_continuous_no_hand_confirmation();
+    test_d_reappearance_does_not_claim_strict_existing_inventory();
+    test_hand_visible_d_does_not_confirm_from_strict_static_old_c();
+    test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
+    test_partial_existing_item_is_not_registered_as_new_d();
+    test_fast_same_class_b_becomes_c_candidate_not_d();
+    test_new_track_claim_grace_defers_same_class_d();
+    test_mature_same_class_tracks_keep_shared_b_ambiguous_until_no_hand_count_settlement();
+    test_no_hand_frame_respects_new_track_claim_grace();
+    test_drop_requires_continuous_evidence();
+    test_ambiguous_hand_partial_box_does_not_create_d();
+    test_adjacent_same_class_new_item_gets_its_own_d_chain();
+    test_unbound_no_hand_box_never_auto_in();
+    test_moved_front_item_occludes_then_reveals();
+    test_low_coverage_contact_move_keeps_identity();
+    test_low_coverage_contact_without_endpoint_stays_pending();
+    test_low_coverage_contact_candidate_releases_at_original();
+    test_contact_to_hand_transition_keeps_observed_anchor();
+    test_stationary_hand_frame_does_not_change_hand_evidence();
+    test_post_hand_reveal_commits_on_second_direct_frame();
+    test_c_reappear_commits_after_second_direct_frame();
+    test_active_a_moves_next_to_static_same_class_b();
+    test_stale_same_class_reappear_candidate_falls_back_to_moved_a();
+    test_stale_same_class_reappear_candidate_without_a_waits_then_out();
+    test_provisional_static_a_reopens_when_moved_later_in_same_operation();
+    test_same_class_static_neighbor_box_allows_active_a_out();
+    test_adjacent_same_class_real_boxes_out_only_removed_item();
+    test_adjacent_same_class_single_frame_deficit_recovers_without_out();
+    test_adjacent_same_class_deficit_requires_continuous_survivor_box();
+    test_out_requires_two_direct_missing_frames();
+    test_no_hand_occlusion_uses_cover_union();
+    test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup();
+    test_static_gray_zone_evidence_resets_when_hand_returns();
+    test_quarantined_same_class_duplicate_merges_back_to_old_c();
+    test_quarantined_same_class_stale_alias_disappears_after_old_c_settles();
+    test_retouch_old_c_preserves_alias_links_and_shared_resolution();
+    test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes();
+    test_item7_gray_recovery_does_not_block_item8_move();
+    test_cover_union_keeps_multiple_tiny_residuals_until_total_area_check();
+    test_hand_affected_old_c_does_not_block_static_owner_reservation();
+    test_same_class_old_owner_blocks_path_match_before_identity_swap();
+    test_direct_original_evidence_rolls_back_provisional_moved();
+    test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
+    return 0;
+}
