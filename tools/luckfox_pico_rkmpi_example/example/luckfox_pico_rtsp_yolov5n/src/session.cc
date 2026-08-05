@@ -1682,8 +1682,28 @@ void reserve_unique_no_hand_static_inventory_detections(
     }
 }
 
+// 最终库存位置变化必须以操作开始时的完整可靠框为尺度。不能复用
+// normalized_nearby_distance()：它会按两个框中较小的对角线归一化，而被手
+// 遮挡后的局部框恰好可能更小。这里始终只使用 before 的完整框，并把尺度
+// clamp 到可调范围，避免极小/极大检测框把结果放大或缩小得失真。
+float final_motion_reference_diagonal(const BBox& before) {
+    if (before.area() <= 0.0f) return 0.0f;
+    return std::max(
+        FLOW3_MOTION_REFERENCE_DIAGONAL_MIN_PX,
+        std::min(FLOW3_MOTION_REFERENCE_DIAGONAL_MAX_PX, diagonal(before)));
+}
+
+float normalized_final_motion_distance(const BBox& before, const BBox& after) {
+    const float reference_diagonal = final_motion_reference_diagonal(before);
+    if (reference_diagonal <= 0.0f || after.area() <= 0.0f) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return center_distance(before, after) / reference_diagonal;
+}
+
 bool boxes_differ_as_move(const BBox& before, const BBox& after) {
-    return center_distance(before, after) >= FLOW3_COMMIT_MOVE_CENTER_DISTANCE;
+    return normalized_final_motion_distance(before, after) >=
+        FLOW3_FORMAL_MOVE_CENTER_SHIFT_NORM;
 }
 
 // 严格匹配已经成立时，用一个连续代价挑选“最像”的框。逐帧预扫描不能
@@ -2601,7 +2621,10 @@ void SessionManager::update_existing_contact_tracks_(
         if (direct_owner_index >= 0 &&
             direct_owner_strength == HandDirectOldOwnerStrength::LOCAL_CONTINUOUS) {
             // 连续局部框可以继续服务于它自己的真实 CONTACT 路径，但对其他
-            // C/D 已经是排他所有权，不能再按遍历顺序借走。
+            // C/D 已经是排他所有权，不能再按遍历顺序借走。严格原位框仍由
+            // 下方的 CONTACT 原位 helper 处理；活动 CONTACT 的严格框若已
+            // 超过 12px，会在所有权计划阶段保留为普通路径观察，不能清掉
+            // 原有 tentative/hold 连续证据。
             observed_index = direct_owner_index;
         } else {
             observed_index = unique_contact_detection_for_track(
@@ -3004,13 +3027,12 @@ SessionManager::build_mutually_unique_hand_direct_old_owner_by_detection_(
             candidate.detection_index = detection_index;
             candidate.cost = strict_match_cost(original->second.cls_id, original_box,
                                                detections[di]);
-            // CONTACT 的严格几何容差本来大于 CONTACT_OBJECT_MOVE_EPS；若不
-            // 保留既有的原位中心门槛，真实推/拉 20px 会被新计划错误压成
-            // "严格原位"，从而破坏已验证的 CONTACT_MOVING 路径。由 CONTACT
-            // 转入 HAND 后同样沿用这个保护，其他普通 HAND_* 仍按严格原位。
+            // 对活动 CONTACT，严格几何范围可能覆盖“相对原框已推开超过
+            // 12px”的真实 B；这类框必须继续走既有 CONTACT tentative/hold
+            // 路径，不能在直接所有权计划里提前变成严格原位证据。HAND
+            // 恢复路径则保留严格候选，供无手灰区结算使用。
             const bool contact_origin_guard = runtime &&
-                (is_active_contact_track(*runtime) ||
-                 runtime->has_hand_estimate_anchor_box) &&
+                is_active_contact_track(*runtime) &&
                 !contact_detection_is_at_original(*runtime, detections[di]);
             if (candidate.cost < std::numeric_limits<float>::infinity() &&
                 !contact_origin_guard) {
@@ -3403,12 +3425,18 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
                           FLOW3_TRACK_PARTIAL_IOM);
     const float center_delta = center_distance(c.original_box, detection.box);
     const float normalized_center_delta =
-        normalized_nearby_distance(c.original_box, detection.box);
+        normalized_final_motion_distance(c.original_box, detection.box);
     const bool formal_move = boxes_differ_as_move(c.original_box, detection.box);
-    // 这条路径只处理 12px CONTACT 原位门槛与既有正式 MOVED 门槛之间的
-    // 静态灰区；两端的正常分支继续沿用原有语义。
-    const bool static_gray_zone =
-        center_delta > FLOW3_CONTACT_OBJECT_MOVE_EPS && !formal_move;
+    const bool low_motion_static = normalized_center_delta <=
+        FLOW3_STATIC_CENTER_SHIFT_NORM;
+    // 有 hand_estimate_anchor_box 的恢复候选无论落在 CONTACT 原位门槛内还是
+    // 12px~正式阈值灰区，都必须走同一条连续无手结算；只有正式归一化移动
+    // 才能阻止静态释放。low_motion_static 表示“更像 YOLO 抖动”，不是可以
+    // 把候选提前丢掉的理由。
+    const bool static_gray_zone = !formal_move;
+    const char* motion_zone = formal_move
+        ? "FORMAL_MOVE"
+        : (low_motion_static ? "LOW_MOTION_STATIC" : "STATIC_GRAY_ZONE");
     const bool hand_or_contact_move_evidence =
         c.hold_and_move || has_meaningful_hand_move(c) ||
         c.contact_state != ContactState::NONE;
@@ -3430,6 +3458,12 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
         working->second.status == ItemStatus::VISIBLE &&
         !pending_out_ids_.count(c.item_id);
 
+    trace_("STATIC-SETTLE",
+           "item=%d phase=NO_HAND detection=%d source=%s "
+           "motion-reference-diagonal-px=%.3f motion-zone=%s",
+           c.item_id, detection_index, source ? source : "NONE",
+           final_motion_reference_diagonal(c.original_box), motion_zone);
+
     const char* reason = "eligible";
     if (!provisional_static_after_hand) {
         reason = "not-operation-start-provisional-static-c";
@@ -3439,8 +3473,6 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
         reason = "not-scale-aware-near-original";
     } else if (formal_move) {
         reason = "formal-move-threshold-reached";
-    } else if (!static_gray_zone) {
-        reason = "not-contact-static-gray-zone";
     } else if (hand_or_contact_move_evidence) {
         reason = "hand-or-contact-move-evidence";
     } else if (reappearance_claim_or_path_ambiguity) {
@@ -3463,7 +3495,7 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
                "item=%d phase=NO_HAND detection=%d source=%s "
                "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
                "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=%d "
-               "has-real-move-evidence=%d unique-static-owner=%d "
+               "has-real-move-evidence=%d low-motion-static=%d unique-static-owner=%d "
                "previous-stable-present=%d previous-stable-match=%d "
                "stable-count=%d/%d action=reset-stable-near-original reason=%s",
                c.item_id, detection_index, source ? source : "NONE",
@@ -3471,6 +3503,7 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
                ratio_difference(c.original_box.w(), detection.box.w()),
                ratio_difference(c.original_box.h(), detection.box.h()),
                formal_move ? 1 : 0, hand_or_contact_move_evidence ? 1 : 0,
+               low_motion_static ? 1 : 0,
                direct_unique_owner ? 1 : 0, has_prior_stable_box ? 1 : 0,
                previous_stable_match ? 1 : 0,
                c.stable_near_original_no_hand_count,
@@ -3488,13 +3521,14 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
                "item=%d phase=NO_HAND detection=%d source=%s "
                "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
                "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=0 "
-               "has-real-move-evidence=0 unique-static-owner=1 "
+               "has-real-move-evidence=0 low-motion-static=%d unique-static-owner=1 "
                "previous-stable-present=%d previous-stable-match=%d "
                "stable-count=%d/%d action=wait-stable-near-original reason=eligible",
                c.item_id, detection_index, source ? source : "NONE",
                center_delta, normalized_center_delta, iom(c.original_box, detection.box),
                ratio_difference(c.original_box.w(), detection.box.w()),
                ratio_difference(c.original_box.h(), detection.box.h()),
+               low_motion_static ? 1 : 0,
                has_prior_stable_box ? 1 : 0, previous_stable_match ? 1 : 0,
                c.stable_near_original_no_hand_count,
                FLOW3_NO_HAND_D_CONFIRM_FRAMES);
@@ -3513,7 +3547,7 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
            "item=%d phase=NO_HAND detection=%d source=%s "
            "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
            "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=0 "
-           "has-real-move-evidence=0 unique-static-owner=1 "
+           "has-real-move-evidence=0 low-motion-static=%d unique-static-owner=1 "
            "previous-stable-present=%d previous-stable-match=%d "
            "stable-count=%d/%d action=release-stable-near-original "
            "release-reason=STABLE_NEAR_ORIGINAL_NO_HAND needs-settle-before=%d "
@@ -3522,6 +3556,7 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
            center_delta, normalized_center_delta, iom(c.original_box, detection.box),
            ratio_difference(c.original_box.w(), detection.box.w()),
            ratio_difference(c.original_box.h(), detection.box.h()),
+           low_motion_static ? 1 : 0,
            has_prior_stable_box ? 1 : 0, previous_stable_match ? 1 : 0,
            stable_count_before_release, FLOW3_NO_HAND_D_CONFIRM_FRAMES,
            needs_settlement_before_release ? 1 : 0,
@@ -3610,8 +3645,12 @@ void SessionManager::update_existing_hand_tracks_(
                 ? direct_old_owner_strength_for_detection(
                       direct_old_owner_plan, direct_owner_index)
                 : HandDirectOldOwnerStrength::LOCAL_WEAK;
+        const bool direct_owner_is_contact_original = direct_owner_index >= 0 &&
+            contact_detection_is_at_original(track, detections[direct_owner_index]);
         if (direct_owner_index >= 0 &&
-            direct_owner_strength == HandDirectOldOwnerStrength::STRICT) {
+            direct_owner_strength == HandDirectOldOwnerStrength::STRICT &&
+            (!track.has_hand_estimate_anchor_box ||
+             direct_owner_is_contact_original)) {
             // 自己唯一的严格原位框必须先于任何 estimated/track/reappear 路径。
             // 它只累计既有的“没有拿起”反向证据，不能被同一帧的宽松路径
             // 重新解释成 MOVED，也不能被别的 C/D 借走。
@@ -4986,7 +5025,6 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     found = unique_detection_for_box(detections, candidate_claimed,
                                                       track.cls_id, track.original_box,
                                                       true, false);
-                    found_at_original_position = found >= 0;
                     if (found < 0) {
                         const int nearest = best_detection_for_box(
                             detections, candidate_claimed, track.cls_id,
@@ -4995,17 +5033,25 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                                 detections[nearest], track.item_id,
                                 operation_start_inventory_)) {
                             found = nearest;
-                            found_at_original_position = true;
                         }
                     }
-                    if (found >= 0) found_source = "ORIGINAL";
-                    // 同上：由 CONTACT_* 转来的物品已拥有真实 B 路径。B 与
-                    // 原框局部重叠并不等于它仍在原位，必须再检查中心位移。
-                    if (track.has_hand_estimate_anchor_box && found >= 0 &&
-                        !contact_detection_is_at_original(track, detections[found])) {
-                        found = -1;
-                        found_at_original_position = false;
-                        found_source = "NONE";
+                    if (found >= 0) {
+                        // 对 HAND/CONTACT 恢复中的 C，严格/局部原框匹配先只
+                        // 确定身份。超过 CONTACT 12px 时它不再是“立即原位”
+                        // 证据，却仍必须保留给静态灰区或正式移动判断；此前在
+                        // 这里清掉 found 会让稳定候选永远进不到 STATIC-SETTLE。
+                        // 有 hand_estimate_anchor_box 的 C 已经在有手阶段暂时
+                        // 释放过；无手帧即使重新看到严格原框，也要经过连续直接
+                        // 观测结算，不能把 anchor 物体的一帧框当成最终结论。
+                        // anchor 恢复中的 C 只有在候选超过 CONTACT 的短时
+                        // 原位门槛时才需要进入灰区连续结算；真正回到原位的
+                        // 框继续沿原有 ORIGINAL 立即释放路径处理，避免手
+                        // 随后重新进入时把一张无手静态帧误当成未完成恢复。
+                        found_at_original_position = !track.has_hand_estimate_anchor_box ||
+                            contact_detection_is_at_original(
+                                track, detections[found]);
+                        found_source = found_at_original_position
+                            ? "ORIGINAL" : "ORIGINAL_RECOVERY_CANDIDATE";
                     }
                 }
                 // 已在有手阶段看到过 B 时，真实 B 候选比“旧框 + 手位移”的估计

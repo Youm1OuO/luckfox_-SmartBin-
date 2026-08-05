@@ -2347,6 +2347,78 @@ void test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes() 
     assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
 }
 
+// 细节16现场回放：item#8 苹果确实移动，邻近的 item#7 橙子没有主动整理，
+// 但手离开后 YOLO 框从完整框向左扩张，中心变化约 21.7px。该变化位于
+// CONTACT 的 12px 原位门槛和正式归一化 MOVED 门槛之间；稳定、唯一的灰区
+// 候选必须完成静态恢复，不能让整轮操作永久 defer-commit。
+void test_item7_gray_recovery_does_not_block_item8_move() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(7, 2, 638, 460, 785, 634));  // orange: recovery gray zone
+    initial.push_back(item(8, 0, 500, 100, 600, 200));  // apple: real move
+    session.init_from_backend(initial, true);
+    int frame = 1;
+
+    const fridge::Detection orange_original = det(2, 638, 460, 785, 634);
+    const fridge::Detection apple_original = det(0, 500, 100, 600, 200);
+    std::vector<fridge::Detection> stable;
+    stable.push_back(orange_original);
+    stable.push_back(apple_original);
+    initial_no_hand_frame(&session, stable, &frame);
+
+    // 先给两个旧 C 三张稳定的有手帧，让原有 claim-grace/静态保护逻辑
+    // 自然完成；手框本身不依赖物品移动方向。
+    const fridge::BBox hand0(0, 0, 1000, 720);
+    const fridge::BBox hand1(30, 0, 1030, 720);
+    const fridge::BBox hand2(60, 0, 1060, 720);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+    send_frame(&session, stable, std::vector<fridge::BBox>(1, hand0), &frame);
+
+    // 苹果沿明显的新位置移动；橙子仍提供完整原框，避免把两件物品的
+    // 身份证据混成一个路径。再给一张连续有手帧巩固苹果移动链路。
+    std::vector<fridge::Detection> moved;
+    moved.push_back(orange_original);
+    moved.push_back(det(0, 550, 100, 650, 200));
+    send_frame(&session, moved, std::vector<fridge::BBox>(1, hand1), &frame);
+    moved[1] = det(0, 580, 100, 680, 200);
+    send_frame(&session, moved, std::vector<fridge::BBox>(1, hand2), &frame);
+
+    // 现场恢复框：(594,460)~(787,645)，与完整原框中心相差约 21.7px。
+    // 连续无手帧允许边界/中心有轻微抖动，但这里使用稳定框以精确复现灰区。
+    const fridge::Detection orange_recovered = det(2, 594, 460, 787, 645);
+    const fridge::Detection apple_moved = det(0, 580, 100, 680, 200);
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(orange_recovered);
+    final_boxes.push_back(apple_moved);
+
+    fridge::SettlementResult result;
+    for (int i = 0; i < 4; ++i) {
+        const int no_hand_frame = frame++;
+        const fridge::FrameProcessResult processed = session.process_frame(
+            final_boxes, std::vector<fridge::BBox>(), no_hand_frame, no_hand_frame);
+        assert(processed.no_hand_frame_processed);
+        result = processed.settlement;
+        if (result.committed) break;
+    }
+
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    const fridge::InventoryItem* orange = session.inventory().find_by_item(7);
+    const fridge::InventoryItem* apple = session.inventory().find_by_item(8);
+    assert(orange != 0);
+    assert(apple != 0);
+    assert(orange->status == fridge::ItemStatus::VISIBLE);
+    assert(apple->status == fridge::ItemStatus::VISIBLE);
+    assert(has_event(result, fridge::EventKind::MOVED, 8));
+    assert(!has_event(result, fridge::EventKind::MOVED, 7));
+    assert(!has_event(result, fridge::EventKind::IN, 7));
+    assert(!has_event(result, fridge::EventKind::OUT, 7));
+    assert(!has_event(result, fridge::EventKind::OCCLUDED, 7));
+    assert(!has_event(result, fridge::EventKind::REVEALED, 7));
+}
+
 // 细节15-5.1：矩形差集过程中不能按单个残片面积提前丢弃。目标 C 的
 // 三个已确认前景 D 留下两个 0.4 x 10 的缝隙；每个缝隙面积正好为 4，
 // 但总面积为 8，仍然不能算作完全遮挡。这里刻意让 C 在最后一张有手帧
@@ -2718,6 +2790,7 @@ int main() {
     test_quarantined_same_class_stale_alias_disappears_after_old_c_settles();
     test_retouch_old_c_preserves_alias_links_and_shared_resolution();
     test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes();
+    test_item7_gray_recovery_does_not_block_item8_move();
     test_cover_union_keeps_multiple_tiny_residuals_until_total_area_check();
     test_hand_affected_old_c_does_not_block_static_owner_reservation();
     test_same_class_old_owner_blocks_path_match_before_identity_swap();

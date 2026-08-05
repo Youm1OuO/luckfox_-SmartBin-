@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r17";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r18";
 
 // =========================================================================
 //  类别 ID 配置
@@ -322,6 +322,17 @@ constexpr float FLOW3_DROP_FALL_BEHIND_RATIO = 0.45f;
 constexpr int   FLOW3_DROP_EVIDENCE_REQUIRED = 2;
 // B 的宽高相对完整 C 更接近多少，才可作为“逐渐露出完整框”的辅助放下证据。
 constexpr float FLOW3_DROP_FULL_BOX_IMPROVEMENT = 0.08f;
+// 最终 MOVED 判断使用 operation-start 的完整原框对角线作为尺度，并限制
+// 极端框尺寸对归一化结果的影响。当前值只影响最终位置变化判断，不影响
+// STRICT / LOCAL / CONTACT 的身份匹配几何范围。
+constexpr float FLOW3_MOTION_REFERENCE_DIAGONAL_MIN_PX = 80.0f;
+constexpr float FLOW3_MOTION_REFERENCE_DIAGONAL_MAX_PX = 500.0f;
+// 归一化最终位移的静态参考线与正式移动线。两者之间是灰区，必须依赖
+// 连续无手帧、唯一所有权和既有 HAND/CONTACT 证据，不能强制二选一。
+constexpr float FLOW3_STATIC_CENTER_SHIFT_NORM = 0.06f;
+constexpr float FLOW3_FORMAL_MOVE_CENTER_SHIFT_NORM = 0.12f;
+// 兼容保留：旧版本的固定像素值不再承担最终 MOVED 判定职责；CONTACT
+// 的短时物品移动仍使用 FLOW3_CONTACT_OBJECT_MOVE_EPS。
 constexpr float FLOW3_COMMIT_MOVE_CENTER_DISTANCE = 28.0f;
 
 // =========================================================================
