@@ -1266,10 +1266,9 @@ void test_active_a_moves_next_to_static_same_class_b() {
     assert(!has_event(result, fridge::EventKind::IN, 3));
 }
 
-// 细节10：A 在有手阶段暂时看不见时，YOLO 的同类框可能让 A 的
-// reappear_candidate 错指向静止 C。手离开后 C 有自己的独立原位框，A 又在
-// 预计终点出现。C 对 A 只能是“排除证据”：清除旧候选后必须继续找到 A，
-// 不能永久 ambiguous，也不能抢 C、误 OUT 或误建 D。
+// 细节10 + 细节15：A 在有手阶段暂时看不见时，静止 B/C 的直接原位框现在
+// 必须先被原位所有权计划保留，A 不应再把 C 写进 reappear_candidate。无手
+// 阶段仍要正常找到 A 的真实终点，不能抢 B/C、误 OUT 或误建 D。
 void test_stale_same_class_reappear_candidate_falls_back_to_moved_a() {
     fridge::SessionManager session;
     session.start_new_session();
@@ -1289,7 +1288,8 @@ void test_stale_same_class_reappear_candidate_falls_back_to_moved_a() {
     b_and_c.push_back(det(0, 300, 100, 400, 200));
     b_and_c.push_back(det(0, 500, 100, 600, 200));
 
-    // t0：手完全遮住 A。t1：手路过 C，A 的候选会错误地落在 C 的原位。
+    // t0：手完全遮住 A。t1：手路过 C；细节15要求 C 的原位框不能再被
+    // A 的宽松路径借走。
     send_frame(&session, b_and_c,
                std::vector<fridge::BBox>(1, fridge::BBox(780, 80, 920, 220)), &frame);
     send_frame(&session, b_and_c,
@@ -1301,9 +1301,7 @@ void test_stale_same_class_reappear_candidate_falls_back_to_moved_a() {
     const std::map<int, fridge::OperationTrack>& before_no_hand =
         session.operation_tracks();
     assert(before_no_hand.find(1) != before_no_hand.end());
-    assert(before_no_hand.find(1)->second.has_reappear_candidate_box);
-    assert(before_no_hand.find(1)->second.reappear_candidate_box.x1 == 500.0f);
-    assert(before_no_hand.find(1)->second.reappear_candidate_match_count >= 2);
+    assert(!before_no_hand.find(1)->second.has_reappear_candidate_box);
 
     std::vector<fridge::Detection> final_boxes;
     final_boxes.push_back(det(0, 200, 350, 300, 450));  // A 的真正新位置
@@ -1345,8 +1343,8 @@ void test_stale_same_class_reappear_candidate_falls_back_to_moved_a() {
     assert(!has_event(second.settlement, fridge::EventKind::IN, 4));
 }
 
-// 细节10-7.2：静止 B/C 已独立保留，A 的旧候选却误指向 C；若本帧根本
-// 没检测到 A，修复也只能清除错误候选并等待正常的连续 OUT 证据，不能把 B/C
+// 细节10-7.2 + 细节15：静止 B/C 已在有手帧直接保留，A 不应先保存错误
+// 候选。若无手后仍完全没有 A，只能等待正常连续 OUT 证据，不能把 B/C
 // 交给 A、单帧 OUT，或借剩余框创建同类 D。
 void test_stale_same_class_reappear_candidate_without_a_waits_then_out() {
     fridge::SessionManager session;
@@ -1376,8 +1374,7 @@ void test_stale_same_class_reappear_candidate_without_a_waits_then_out() {
     const std::map<int, fridge::OperationTrack>& before_no_hand =
         session.operation_tracks();
     assert(before_no_hand.find(1) != before_no_hand.end());
-    assert(before_no_hand.find(1)->second.has_reappear_candidate_box);
-    assert(before_no_hand.find(1)->second.reappear_candidate_box.x1 == 500.0f);
+    assert(!before_no_hand.find(1)->second.has_reappear_candidate_box);
 
     const int first_no_hand = frame++;
     fridge::FrameProcessResult first = session.process_frame(
@@ -2350,6 +2347,325 @@ void test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes() 
     assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
 }
 
+// 细节15-5.1：矩形差集过程中不能按单个残片面积提前丢弃。目标 C 的
+// 三个已确认前景 D 留下两个 0.4 x 10 的缝隙；每个缝隙面积正好为 4，
+// 但总面积为 8，仍然不能算作完全遮挡。这里刻意让 C 在最后一张有手帧
+// 才进入 HAND_* 且没有移动证据：旧实现若误判完整遮挡会完成操作并写
+// OCCLUDED；修复后应保留 C 的 VISIBLE 身份并继续等待直接无手证据。
+void test_cover_union_keeps_multiple_tiny_residuals_until_total_area_check() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 100, 100, 120, 110));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(2, 100, 100, 120, 110)), &frame);
+
+    // 三个 D 分别向目标 C 的左、中、右延伸。它们对 C 的覆盖依次为
+    // [100,106]、[106.4,113]、[113.4,120]，仅留下两个面积各约为 4 的
+    // 缝隙；单个残片都不超过 COVER_REMAINING_AREA_EPS，但总面积约为 8。
+    const fridge::Detection c = det(2, 100, 100, 120, 110);
+    const fridge::Detection left = det(0, 50, 100, 106, 110);
+    const fridge::Detection middle = det(1, 106.4f, 50, 113, 110);
+    const fridge::Detection right = det(3, 113.4f, 100, 120, 160);
+    const fridge::BBox hand(95, 95, 125, 115);
+
+    // 同一静止手框下连续观察三个 D。C 的完整框在前两张仍可见，第三张
+    // 只漏掉 C；前两张让三个 D 达到提升门槛。第三张把手移到远处，
+    // 让每个已提升 D 得到明确的脱手/放下证据；C 仍保留自己的 HAND_* runtime。
+    std::vector<fridge::Detection> all;
+    all.push_back(c);
+    all.push_back(left);
+    all.push_back(middle);
+    all.push_back(right);
+    send_frame(&session, all, std::vector<fridge::BBox>(1, hand), &frame);
+    send_frame(&session, all, std::vector<fridge::BBox>(1, hand), &frame);
+
+    std::vector<fridge::Detection> blockers_only;
+    blockers_only.push_back(left);
+    blockers_only.push_back(middle);
+    blockers_only.push_back(right);
+    const fridge::BBox hand_moved_away(300, 300, 330, 330);
+    const fridge::BBox hand_moved_further(320, 320, 350, 350);
+    // 让 D 先脱手，同时给 C 两张连续的“仍在原位”反向证据；这样 C
+    // 会暂时释放为静态，不把这段手位移历史带进后面的遮挡专用轨迹。
+    send_frame(&session, all,
+               std::vector<fridge::BBox>(1, hand_moved_away), &frame);
+    send_frame(&session, all,
+               std::vector<fridge::BBox>(1, hand_moved_further), &frame);
+    // 先插入一张无手帧，完成 C 的直接无手静态结算。若在这一步之前
+    // 立刻把手移回 C，reopen_released_static_tracks_ 会合法地恢复旧 C，
+    // 并把手位移历史带入测试，导致它走 OUT，而不是验证遮挡差集。
+    const int settle_static_frame = frame++;
+    const fridge::FrameProcessResult static_result = session.process_frame(
+        all, std::vector<fridge::BBox>(), settle_static_frame, settle_static_frame);
+    assert(static_result.no_hand_frame_processed);
+    assert(!static_result.settlement.committed);
+
+    // 远离 C 的静止手帧只清掉 released-hand candidate 保护标记，
+    // 不重新建立 C 轨迹。
+    send_frame(&session, blockers_only,
+               std::vector<fridge::BBox>(1, hand_moved_further), &frame);
+    // 手重新回到 C 原位，但 C 本帧故意漏检；这是没有历史移动证据的新
+    // HAND_* runtime。已放下的三个 D 仍是当前操作的确认前景。
+    send_frame(&session, blockers_only,
+               std::vector<fridge::BBox>(1, hand), &frame);
+
+    int promoted_d_count = 0;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        if (!it->second.is_suspect_new ||
+            !it->second.promoted_to_working_inventory) {
+            continue;
+        }
+        ++promoted_d_count;
+        assert(it->second.drop_confirmed);
+        assert(it->second.has_placed_box);
+    }
+    // 没有这三个已确认前景 D，后面的 no-hand 遮挡结算不会调用目标差集。
+    assert(promoted_d_count == 3);
+
+    for (int no_hand_index = 0; no_hand_index < 5; ++no_hand_index) {
+        const int no_hand_frame = frame++;
+        const fridge::FrameProcessResult result = session.process_frame(
+            blockers_only, std::vector<fridge::BBox>(), no_hand_frame, no_hand_frame);
+        assert(result.no_hand_frame_processed);
+        assert(!result.settlement.committed);
+    }
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
+}
+
+// 细节15-5.2：C1 已被手影响时，不得先以更低几何成本参加静态预约竞争，
+// 否则会挡住真正静态的 C2，令既有 HAND_VISIBLE_D 借 C2 的框自匹配升级。
+void test_hand_affected_old_c_does_not_block_static_owner_reservation() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // C1，第二帧被手影响
+    initial.push_back(item(2, 0, 130, 100, 230, 200));  // C2，第二帧静态
+    initial.push_back(item(3, 2, 500, 100, 600, 200));  // 仅用于制造假 D 的橙子
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 130, 100, 230, 200));
+    stable.push_back(det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    // t0 在橙子处建立一个 cls=0 的 HAND_VISIBLE_D。手中心为 512.5，下一帧
+    // 移到 117.5 时，它的预测位置恰好落到 C2 的近原位框。
+    std::vector<fridge::Detection> first = stable;
+    first.push_back(det(0, 500, 100, 600, 200, 0.56f));
+    send_frame(&session, first,
+               std::vector<fridge::BBox>(1, fridge::BBox(502.5f, 140, 522.5f, 160)),
+               &frame);
+
+    bool found_false_d = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        if (it->second.is_suspect_new && it->second.cls_id == 0) {
+            found_false_d = true;
+            assert(it->second.self_match_count == 1);
+            assert(!it->second.promoted_to_working_inventory);
+        }
+    }
+    assert(found_false_d);
+
+    // 这个框对 C1 的 strict cost 更低，但手只覆盖 C1 的 35%，只覆盖 C2
+    // 的 5%。因此 C1 必须在候选写入前被排除，C2 才能唯一预约该检测框。
+    std::vector<fridge::Detection> second;
+    second.push_back(det(0, 105, 100, 205, 200));
+    second.push_back(det(2, 500, 100, 600, 200));
+    send_frame(&session, second,
+               std::vector<fridge::BBox>(1, fridge::BBox(100, 100, 135, 200)),
+               &frame);
+
+    bool false_d_still_unconfirmed = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it =
+             session.operation_tracks().begin();
+         it != session.operation_tracks().end(); ++it) {
+        if (it->second.is_suspect_new && it->second.cls_id == 0) {
+            false_d_still_unconfirmed = true;
+            assert(it->second.self_match_count == 1);
+            assert(!it->second.promoted_to_working_inventory);
+        }
+    }
+    assert(false_d_still_unconfirmed);
+}
+
+// 同一个回放同时覆盖细节15-4.1（B 完整原位框）、4.2（B 只露局部框）和
+// 检测数组顺序独立性。真正移动的只有 soda_can；A 暂时漏检，B 的原位观测
+// 不能被 A 的宽松手路径借走。
+void run_same_class_old_owner_replay(bool b_is_partial, bool reverse_detection_order) {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 25, 520, 100, 620, 200));  // soda_can，唯一真实 MOVED
+    initial.push_back(item(2, 0, 100, 100, 200, 200));   // apple A，暂时漏检
+    initial.push_back(item(3, 0, 260, 100, 360, 200));   // apple B，始终留在原位
+    session.init_from_backend(initial, true);
+    int frame = 1;
+
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(25, 520, 100, 620, 200));
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 260, 100, 360, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    const fridge::BBox hand0(50, 50, 680, 250);
+    const fridge::BBox hand1(120, 50, 750, 250);
+    const fridge::BBox hand2(190, 50, 820, 250);
+    const fridge::BBox hand3(260, 50, 890, 250);
+    const fridge::Detection b_full = det(0, 260, 100, 360, 200);
+    const fridge::Detection b_partial = det(0, 270, 100, 330, 200);
+
+    // A 在 t0 已被大手框完整盖住且漏检；B 与 soda 仍给出各自的真实框。
+    std::vector<fridge::Detection> first;
+    first.push_back(det(25, 520, 100, 620, 200));
+    first.push_back(b_full);
+    if (reverse_detection_order) std::reverse(first.begin(), first.end());
+    send_frame(&session, first, std::vector<fridge::BBox>(1, hand0), &frame);
+
+    const fridge::Detection b = b_is_partial ? b_partial : b_full;
+    for (int i = 0; i < 3; ++i) {
+        std::vector<fridge::Detection> moving;
+        moving.push_back(det(25, 590.0f + 70.0f * i, 100,
+                             690.0f + 70.0f * i, 200));
+        moving.push_back(b);
+        if (reverse_detection_order) std::reverse(moving.begin(), moving.end());
+        const fridge::BBox hand = i == 0 ? hand1 : (i == 1 ? hand2 : hand3);
+        send_frame(&session, moving, std::vector<fridge::BBox>(1, hand), &frame);
+    }
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(det(25, 730, 100, 830, 200));
+    final_boxes.push_back(det(0, 100, 100, 200, 200));
+    final_boxes.push_back(b_full);
+    if (reverse_detection_order) std::reverse(final_boxes.begin(), final_boxes.end());
+    fridge::SettlementResult result = settle_after_hand(&session, final_boxes, &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 3);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(session.inventory().find_by_item(3) != 0);
+    assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::VISIBLE);
+    assert(session.inventory().find_by_item(3)->status == fridge::ItemStatus::VISIBLE);
+    assert(result.events.size() == 1);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::MOVED, 2));
+    assert(!has_event(result, fridge::EventKind::MOVED, 3));
+    assert(!has_event(result, fridge::EventKind::OCCLUDED, 2));
+    assert(!has_event(result, fridge::EventKind::OCCLUDED, 3));
+    assert(!has_event(result, fridge::EventKind::IN, 4));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 3));
+}
+
+void test_same_class_old_owner_blocks_path_match_before_identity_swap() {
+    run_same_class_old_owner_replay(false, false);
+    run_same_class_old_owner_replay(false, true);
+    run_same_class_old_owner_replay(true, false);
+    run_same_class_old_owner_replay(true, true);
+}
+
+// 细节15-4.4：有手阶段的 MOVED 只是临时工作状态。若同一操作尚未提交前
+// 再次出现唯一属于自己的严格原位框，必须清掉 placed/drop/confirmed_moved
+// 残留，最终不能提交一条假的 MOVED。
+void test_direct_original_evidence_rolls_back_provisional_moved() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 220, 100, 320, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(200, 80, 300, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(360, 80, 460, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(320, 80, 420, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(500, 80, 600, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 340, 100, 440, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(700, 80, 800, 220)), &frame);
+
+    const fridge::OperationTrack& moved = session.operation_tracks().find(1)->second;
+    assert(moved.state == fridge::OperationTrackState::PLACED);
+    assert(moved.resolution == fridge::ExistingItemResolution::MOVED_CONFIRMED);
+    assert(moved.has_placed_box);
+    assert(moved.drop_confirmed);
+
+    // 同一只手仍在画面中，但当前唯一框已经严格回到 item#1 的原位置。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    const fridge::OperationTrack& rolled_back = session.operation_tracks().find(1)->second;
+    assert(rolled_back.state == fridge::OperationTrackState::NORMAL);
+    assert(rolled_back.resolution == fridge::ExistingItemResolution::STATIC_CONFIRMED);
+    assert(!rolled_back.has_placed_box);
+    assert(!rolled_back.drop_confirmed);
+
+    fridge::SettlementResult result = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
+    assert(!has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+}
+
+// 细节15-2.3：两个旧 C 对同一个局部框都只有同级的连续匹配时，局部框
+// 更靠近其中一个 C 的中心也不能决定 owner。必须保留为原位置歧义，避免
+// 把遮挡导致的框中心偏移误写成某一个 C 的 tentative B / MOVED 证据。
+void test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 300, 300));
+    initial.push_back(item(2, 0, 400, 100, 600, 300));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(0, 400, 100, 600, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    // t0 为两个旧 C 分别建立自己的 last_hand_block_box。
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 620, 320)), &frame);
+
+    // 该局部框与两个 last_hand_block_box 都只满足 TRACK 连续性；它更靠近
+    // item#2，但对 item#1 也仍在相同的连续性等级内。它不满足任一完整
+    // 原位置的 strict / hand_partial，因此不能被 old-position 分支掩盖。
+    const std::vector<fridge::Detection> shared_local(
+        1, det(0, 259, 100, 459, 300));
+    send_frame(&session, shared_local,
+               std::vector<fridge::BBox>(1, fridge::BBox(100, 80, 640, 320)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    assert(tracks.find(1) != tracks.end());
+    assert(tracks.find(2) != tracks.end());
+    assert(!tracks.find(1)->second.has_tentative_b_box);
+    assert(!tracks.find(2)->second.has_tentative_b_box);
+    assert(!tracks.find(1)->second.hold_and_move);
+    assert(!tracks.find(2)->second.hold_and_move);
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2402,5 +2718,10 @@ int main() {
     test_quarantined_same_class_stale_alias_disappears_after_old_c_settles();
     test_retouch_old_c_preserves_alias_links_and_shared_resolution();
     test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes();
+    test_cover_union_keeps_multiple_tiny_residuals_until_total_area_check();
+    test_hand_affected_old_c_does_not_block_static_owner_reservation();
+    test_same_class_old_owner_blocks_path_match_before_identity_swap();
+    test_direct_original_evidence_rolls_back_provisional_moved();
+    test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
     return 0;
 }

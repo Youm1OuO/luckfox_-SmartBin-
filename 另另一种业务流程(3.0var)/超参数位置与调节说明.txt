@@ -23,7 +23,7 @@ tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/src/session.c
 修改参数后必须重新交叉编译。建议一次只改一项，并保存“参数版本 + 视频 +
 事件日志”；多个阈值一起放宽，出现误匹配时会无法判断是哪一项造成的。
 
-当前版本（3.0-r15）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
+当前版本（3.0-r17）的固定规则（不是超参数）：同一张有手帧里，若旧物品已经拥有
 自己的唯一最近严格检测框，该 item_id 会先占用该框；旁边同类、贴手且尚未被占用
 的框才有机会进入疑似 D 链路。若某个 HAND_* 旧 C 没有自己的检测框，而同类贴手
 B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_candidate` 暂存，不能
@@ -53,7 +53,7 @@ B 又能唯一落在 C 的候选轨迹附近，B 会先作为 C 的 `reappear_ca
 不会单帧强认 MOVED。若 B 没有上述独立原位证据，或一个框仍可同时属于多个旧 C，
 则保持未决，不会强认 MOVED、OUT 或新 D。
 
-r15 保留 r14 增加的仅限当前手操作的 C-D alias 隔离层，且没有修改
+r17 保留 r14 增加的仅限当前手操作的 C-D alias 隔离层，且没有修改
 任何数值超参数、几何匹配范围或 IN/OUT/MOVED 的确认帧数。若一个操作开始前的
 同类旧 C 仍处于活动且未结算状态，即使该 C 本帧已经暂时认领了另一个检测框，
 第二个未认领同类框也会立刻建立为可追踪的 `PROVISIONAL_D` runtime track；它和 C
@@ -67,12 +67,41 @@ item_id、不得作为“其他旧库存”排除 C。普通、无冲突 D 仍�
 才解除 D 的隔离并按原有流程提交 C 的 MOVED 和 D 的 IN。隔离 D 始终保留逐帧位置、
 贴手和路径更新，所以这不是“等手离开后才识别”。
 
-r15 补全第三个、同样只限隔离 alias 的终态：若关联的所有 operation-start old C
+r17 补全第三个、同样只限隔离 alias 的终态：若关联的所有 operation-start old C
 已经由原有无手证据独立结算，而 runtime-only 的隔离 D 连续两张有效无手帧既没有
 自己的直接检测框、也没有与 C 共用检测框，就只解除 alias 并删除该 runtime D。它
 不写入 working_inventory_ 或 pending_in_ids_，不产生 IN/OUT；随后仍由原有 settlement
 提交旧 C 的既有 STATIC/MOVED 等结果。这不是对普通 D 的删除规则，真实独立 D、共享框
 重复 D、入库、出库、遮挡、CONTACT 和同类邻居规则均保持不变。
+
+3.0-r17 本次新增的固定身份规则（不是超参数）
+------------------------------------------------
+
+每一张包含 HAND_* 或 CONTACT_* 旧 C 的有手帧，会先生成一次无副作用的“旧 C 原位置
+所有权计划”，再进入移动路径和疑似 D 扫描。计划只使用 operation-start 旧库存，
+不提前修改 claimed、库存或证据计数；同一检测框的所有权按以下优先级决定：
+
+    自身原位置 STRICT
+        > 自身 last_hand_block_box 的 LOCAL_CONTINUOUS
+        > 旧完整框包含当前小框的 LOCAL_WEAK
+
+STRICT 只允许原位置几何阈值通过；普通（非 HAND_*、非 CONTACT_*）状态严格匹配失败
+就保持未匹配，不退化成局部匹配。LOCAL_CONTINUOUS 可以继续服务于它自己的连续
+HAND/CONTACT 观测，但不能被另一个旧 C 或 D 借用。LOCAL_WEAK 只用于保护原位置所有权
+和保持未决，不能单独累计 MOVED、HOLD、DROP 或 D 的正向证据。一个检测框若同时被
+多个旧 C 以同级证据解释，标记为原位置歧义：本帧不作为任何 C 的移动、HOLD、MOVED、
+D、placed 或遮挡正向证据，等待后续连续帧。
+
+静态预约会在候选写入阶段先排除实际被手影响的旧 C，避免它以较低几何成本阻挡真正
+静态旧 C；该规则与活动 HAND/CONTACT 的原位置计划相互独立。若活动 C 先出现临时
+MOVED_CONFIRMED/PLACED，随后又获得唯一严格原位置证据，而本次操作尚未无手提交，
+程序会撤销 confirmed_moved_ids_、placed_box、drop_confirmed 及相关临时终点状态，
+恢复当前原位工作状态。已经正式提交到 backend 的历史事件不会回写。
+
+遮挡矩形差集会保留每个正面积残片，只有全部遮挡框处理完后才把残片面积汇总，并
+只在总面积上应用 COVER_REMAINING_AREA_EPS；因此多个各自很小但合计超过阈值的缝隙
+不会被误判为完全遮挡。以上规则均为状态机逻辑，本次没有修改任何数值超参数、匹配
+几何范围、确认帧数、NMS 阈值或 YOLO 分数阈值。
 
 检测输出、NMS、业务输入与 OSD 显示
 --------------------------------------
@@ -112,11 +141,11 @@ YOLO_HAND_SCORE_THRESH / HAND_CONTEXT_SCORE_THRESH（当前均 0.30）
     调大：手的误触发减少，但低分真手可能被漏掉，造成过早无手提交。
     调小：更早/更稳定地暂停无手提交，但低分误手框也会让操作保持 HAND。
 
-OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH（当前 0.50；r15 的显示颜色分界）
+OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH（当前 0.50；r17 继承的显示颜色分界）
     代码位置：fridge_config.h。此名称取代了 r14 的 OSD_OBJECT_SCORE_THRESH，避免把它
     误解为第二道业务或显示过滤阈值。
 
-    r15 的 main.cc 直接遍历当帧实际传入 process_frame() 的 food_dets，以及使用与
+    r17 的 main.cc 直接遍历当帧实际传入 process_frame() 的 food_dets，以及使用与
     hand_boxes 完全相同 HAND_CONTEXT_SCORE_THRESH 条件生成的 hand_dets_for_display。
     因此每一个业务有效食品/手框都会画在 OSD 上；分数低于 0.50 的框仅改为黄色/橙色，
     并带有 input-index、类别和分数，分数达到 0.50 的框使用常规类别/手框颜色。
@@ -157,7 +186,7 @@ FLOW3_DEBUG_TRACE_LOG（当前 true）
     提交结算、库存变化和最终事件）。排查一次异常时，应按 operation_id 再按 item_id
     过滤，查看第一个不符合预期的 STATE/MATCH/VISIBLE-COUNT 转换。
 
-    r15 还会输出 D-GUARD 和 C-D-ALIAS。`D-GUARD action=quarantine-pending-d` 表示
+    r17 还会输出 D-GUARD 和 C-D-ALIAS。`D-GUARD action=quarantine-pending-d` 表示
     同类未结算旧 C 与新框发生了身份冲突：D 已建立 runtime track，但
     `formal-owner-authority=0`，不会在有手阶段 promote。C-D-ALIAS 会说明关系是
     `shared-detection`、`distinct-detections` 还是尚未获得直接配对，并记录
@@ -170,7 +199,7 @@ FLOW3_DEBUG_TRACE_LOG（当前 true）
     `start-old-c`、`pending-d`、`quarantined-pending-d`、`confirmed-d`；只有
     `start-old-c` 或已确认库存才具有“其他旧物品”的正式排除权限。
 
-    r15 的新增诊断：每个实际传入 process_frame() 的食品框都会输出
+    r17 继承的新增诊断：每个实际传入 process_frame() 的食品框都会输出
     `[FOOD-DETECTION] input-index=<n> cls=<...> score=<...> box=<...>
     business-input=1 osd-business-visible=1`；每个实际传入 hand_boxes 的手框都会在调用
     前输出同格式的 `[HAND-DETECTION]`。若 `foods=4` 而物理上只有 3 个物品，应先用
@@ -423,13 +452,13 @@ NEW_ITEM_CONFIRM_FRAMES（当前 2）
     前两者从有手帧开始计数；第三者以首张无手完整 B 记为第 1 次，下一张有效无手帧
     必须自匹配才可提升。三者都不能绕过稳定快照直接正式 IN。
 
-    r15 不改变这个数值或普通 D 的提升时机。唯一例外是 `C_D_ALIAS` 中的
+    r17 不改变这个数值或普通 D 的提升时机。唯一例外是 `C_D_ALIAS` 中的
     QUARANTINED_PENDING_D：它仍从首次有手帧建立并实时更新，但要等旧 C 与 D 在
     连续直接无手帧中获得不同检测框，或旧 C 已独立结算，才允许进入原有的
     `NEW_ITEM_CONFIRM_FRAMES -> working_inventory_ -> IN` 链路。该例外是身份
     所有权隔离，不是放宽或降低 D 的确认要求。
 
-    r15 的 stale alias cleanup 也不改变这个数值或普通 D 的提升时机：它只会删除一个
+    r17 的 stale alias cleanup 也不改变这个数值或普通 D 的提升时机：它只会删除一个
     从未提升、没有 item_id、且所有关联旧 C 已独立结算后连续两张无直接无手证据的
     QUARANTINED_PENDING_D。只要 D 有独立或共享直接证据，计数立即清零并继续原有流程。
 

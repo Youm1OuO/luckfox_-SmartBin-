@@ -231,6 +231,25 @@ struct OperationTrack {
     bool no_hand_candidate_ambiguous = false;
 };
 
+// 一张有手帧中，operation-start 旧 C 对检测框的直接原位归属计划。它仅描述
+// 本帧事实，不写 claimed、working_inventory 或任何证据计数；调用方在路径
+// 匹配、D 扫描前依据该计划排除别的 C/D 对同一框的借用。
+enum class HandDirectOldOwnerStrength {
+    STRICT,
+    LOCAL_CONTINUOUS,
+    LOCAL_WEAK,
+};
+
+struct HandDirectOldOwnerPlan {
+    // detection index -> operation-start old item_id。
+    std::map<int, int> owner_by_detection;
+    // item_id -> detection index，便于当前 owner 自己继续使用 LOCAL_CONTINUOUS。
+    std::map<int, int> detection_by_item;
+    std::map<int, HandDirectOldOwnerStrength> strength_by_detection;
+    // 无法唯一裁决的原位候选。所有 C/D 都只能保持未决，不能把它当路径证据。
+    std::set<int> ambiguous_detection_indices;
+};
+
 class SessionManager {
 public:
     SessionManager();
@@ -288,7 +307,8 @@ private:
     void update_existing_contact_tracks_(
         const BBox& hand_box, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
-        std::map<int, int>* known_item_owner);
+        std::map<int, int>* known_item_owner,
+        const HandDirectOldOwnerPlan& direct_old_owner_plan);
     void mark_new_contact_candidates_(
         const BBox& hand_box, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
@@ -298,7 +318,8 @@ private:
                                       const std::vector<Detection>& detections,
                                       const MoveValue& delta,
                                       std::set<int>* claimed_detection_indices,
-                                      std::map<int, int>* known_item_owner);
+                                      std::map<int, int>* known_item_owner,
+                                      const HandDirectOldOwnerPlan& direct_old_owner_plan);
     void reopen_released_static_tracks_(const BBox& hand_box,
                                         const std::vector<Detection>& detections,
                                         const MoveValue& delta);
@@ -306,6 +327,7 @@ private:
                                   const std::vector<Detection>& detections,
                                   std::set<int>* claimed_detection_indices,
                                   const std::map<int, int>& known_item_owner,
+                                  const HandDirectOldOwnerPlan& direct_old_owner_plan,
                                   bool first_hand_frame);
     void mark_newly_hand_blocked_items_(const BBox& hand_box,
                                         const std::vector<Detection>& detections,
@@ -324,6 +346,10 @@ private:
     // 可由普通静态库存唯一认领的 detection -> item 映射，不写入任何状态。
     std::map<int, int> build_mutually_unique_hand_static_owner_by_detection_(
         const BBox& hand_box,
+        const std::vector<Detection>& detections,
+        const std::set<int>& claimed_seed,
+        const std::map<int, int>& known_item_owner_seed) const;
+    HandDirectOldOwnerPlan build_mutually_unique_hand_direct_old_owner_by_detection_(
         const std::vector<Detection>& detections,
         const std::set<int>& claimed_seed,
         const std::map<int, int>& known_item_owner_seed) const;
@@ -356,6 +382,8 @@ private:
                           int frame_id);
     void confirm_rearrange_(OperationTrack& track, const BBox& release_box,
                             float score, int frame_id);
+    void rollback_provisional_moved_to_direct_original_(
+        OperationTrack* track, int detection_index, const Detection& detection);
     void release_not_held_(OperationTrack& track, bool occluded,
                            ReleaseReason reason,
                            int evidence_detection_index = -1,

@@ -512,7 +512,10 @@ void subtract_cover(const BBox& piece, const BBox& cover,
         BBox(ix2, iy1, piece.x2, iy2),
     };
     for (size_t i = 0; i < sizeof(pieces) / sizeof(pieces[0]); ++i) {
-        if (pieces[i].area() > COVER_REMAINING_AREA_EPS) output->push_back(pieces[i]);
+        // 不能在每一步差集时套用最终的总面积阈值：多个单独很小的
+        // 未覆盖残片加起来仍可能超过阈值。这里只丢弃零面积残片，
+        // COVER_REMAINING_AREA_EPS 仅在 fully_covered_by() 的总面积判断中使用。
+        if (pieces[i].area() > 0.0f) output->push_back(pieces[i]);
     }
 }
 
@@ -1697,6 +1700,115 @@ float strict_match_cost(int cls_id, const BBox& reference,
     return center + 0.35f * width + 0.35f * height;
 }
 
+struct HandDirectOldOwnerCandidate {
+    int item_id = -1;
+    int detection_index = -1;
+    HandDirectOldOwnerStrength strength = HandDirectOldOwnerStrength::STRICT;
+    // LOCAL_CONTINUOUS 的可信度来自“和自己上一张局部框如何连续”，而不是
+    // 当前局部框离完整旧框的中心距离。手遮住不同一侧时，后者会天然偏移。
+    enum class LocalContinuity {
+        NONE,
+        STRICT_LAST_HAND_BOX,
+        TRACK_LAST_HAND_BOX,
+        PARTIAL_LAST_HAND_BOX,
+    } local_continuity = LocalContinuity::NONE;
+    float cost = std::numeric_limits<float>::infinity();
+};
+
+int hand_direct_old_owner_strength_rank(HandDirectOldOwnerStrength strength) {
+    switch (strength) {
+        case HandDirectOldOwnerStrength::STRICT:
+            return 0;
+        case HandDirectOldOwnerStrength::LOCAL_CONTINUOUS:
+            return 1;
+        case HandDirectOldOwnerStrength::LOCAL_WEAK:
+            return 2;
+    }
+    return 3;
+}
+
+int hand_direct_old_owner_local_continuity_rank(
+        HandDirectOldOwnerCandidate::LocalContinuity continuity) {
+    switch (continuity) {
+        case HandDirectOldOwnerCandidate::LocalContinuity::STRICT_LAST_HAND_BOX:
+            return 0;
+        case HandDirectOldOwnerCandidate::LocalContinuity::TRACK_LAST_HAND_BOX:
+            return 1;
+        case HandDirectOldOwnerCandidate::LocalContinuity::PARTIAL_LAST_HAND_BOX:
+            return 2;
+        case HandDirectOldOwnerCandidate::LocalContinuity::NONE:
+            return 3;
+    }
+    return 4;
+}
+
+bool hand_direct_old_owner_candidate_better(
+        const HandDirectOldOwnerCandidate& left,
+        const HandDirectOldOwnerCandidate& right) {
+    const int left_rank = hand_direct_old_owner_strength_rank(left.strength);
+    const int right_rank = hand_direct_old_owner_strength_rank(right.strength);
+    if (left_rank != right_rank) return left_rank < right_rank;
+    if (left.strength == HandDirectOldOwnerStrength::STRICT) {
+        return left.cost + 0.0001f < right.cost;
+    }
+    if (left.strength == HandDirectOldOwnerStrength::LOCAL_CONTINUOUS) {
+        return hand_direct_old_owner_local_continuity_rank(left.local_continuity) <
+            hand_direct_old_owner_local_continuity_rank(right.local_continuity);
+    }
+    // 两条 LOCAL_WEAK 只能保护原位置，不能靠小框中心距离强行分配 owner。
+    return false;
+}
+
+bool hand_direct_old_owner_candidate_tied(
+        const HandDirectOldOwnerCandidate& left,
+        const HandDirectOldOwnerCandidate& right) {
+    if (hand_direct_old_owner_strength_rank(left.strength) !=
+        hand_direct_old_owner_strength_rank(right.strength)) {
+        return false;
+    }
+    if (left.strength == HandDirectOldOwnerStrength::STRICT) {
+        return std::fabs(left.cost - right.cost) <= 0.0001f;
+    }
+    if (left.strength == HandDirectOldOwnerStrength::LOCAL_CONTINUOUS) {
+        return left.local_continuity == right.local_continuity;
+    }
+    return true;
+}
+
+int direct_old_owner_detection_for_item(const HandDirectOldOwnerPlan& plan,
+                                        int item_id) {
+    std::map<int, int>::const_iterator owner = plan.detection_by_item.find(item_id);
+    return owner == plan.detection_by_item.end() ? -1 : owner->second;
+}
+
+HandDirectOldOwnerStrength direct_old_owner_strength_for_detection(
+        const HandDirectOldOwnerPlan& plan, int detection_index) {
+    std::map<int, HandDirectOldOwnerStrength>::const_iterator strength =
+        plan.strength_by_detection.find(detection_index);
+    return strength == plan.strength_by_detection.end()
+        ? HandDirectOldOwnerStrength::LOCAL_WEAK : strength->second;
+}
+
+// 当前 C 自己的 LOCAL_CONTINUOUS 框仍可用于它自己的真实路径更新；严格
+// 原位框在调用方会先走原位分支，弱局部框只保护所有权、不作为移动正向证据。
+std::set<int> claimed_with_other_direct_old_owners(
+        const std::set<int>& claimed, const HandDirectOldOwnerPlan& plan,
+        int current_item_id) {
+    std::set<int> filtered(claimed);
+    filtered.insert(plan.ambiguous_detection_indices.begin(),
+                    plan.ambiguous_detection_indices.end());
+    for (std::map<int, int>::const_iterator owner = plan.owner_by_detection.begin();
+         owner != plan.owner_by_detection.end(); ++owner) {
+        const HandDirectOldOwnerStrength strength =
+            direct_old_owner_strength_for_detection(plan, owner->first);
+        if (owner->second != current_item_id ||
+            strength == HandDirectOldOwnerStrength::LOCAL_WEAK) {
+            filtered.insert(owner->first);
+        }
+    }
+    return filtered;
+}
+
 // 细节9的最终无手同类数量结算只在“一个框代表一个可见实例”时使用。
 // 即使几何证据完全重叠，也要给同类旧 C 一个稳定、可复现的保留顺序；
 // 这里的回退距离不会单独产生 MOVED，只决定不可区分时保留哪个 item_id。
@@ -2409,12 +2521,48 @@ void SessionManager::append_move_to_existing_hand_tracks_(const MoveValue& delta
 void SessionManager::update_existing_contact_tracks_(
         const BBox& hand_box, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
-        std::map<int, int>* known_item_owner) {
+        std::map<int, int>* known_item_owner,
+        const HandDirectOldOwnerPlan& direct_old_owner_plan) {
     std::vector<std::pair<int, int> > release_keys;
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
         if (!is_active_contact_track(track)) continue;
+
+        const int direct_owner_index = direct_old_owner_detection_for_item(
+            direct_old_owner_plan, track.item_id);
+        const HandDirectOldOwnerStrength direct_owner_strength =
+            direct_owner_index >= 0
+                ? direct_old_owner_strength_for_detection(
+                      direct_old_owner_plan, direct_owner_index)
+                : HandDirectOldOwnerStrength::LOCAL_WEAK;
+        if (direct_owner_index >= 0 &&
+            direct_owner_strength == HandDirectOldOwnerStrength::STRICT) {
+            const Detection& direct = detections[direct_owner_index];
+            claimed_detection_indices->insert(direct_owner_index);
+            (*known_item_owner)[track.item_id] = direct_owner_index;
+            // 严格原位框比 CONTACT 的路径候选优先。若之前已暂时进入
+            // CONTACT_MOVING，本帧直接原位证据也必须撤销未提交的正向证据。
+            if (track.contact_state == ContactState::CONTACT_MOVING) {
+                track.contact_state = ContactState::CONTACT_CANDIDATE;
+                track.hold_and_move = false;
+                track.drop_evidence_count = 0;
+            }
+            append_contact_observation(&track, direct,
+                                       hand_is_near(hand_box, direct.box));
+            track.has_tentative_b_box = false;
+            track.tentative_b_match_count = 0;
+            track.tentative_b_started_touching_hand = false;
+            track.has_reappear_candidate_box = false;
+            track.reappear_candidate_match_count = 0;
+            track.reappear_candidate_started_touching_hand = false;
+            ++track.not_hold_evidence_count;
+            track.hold_evidence_count = 0;
+            if (track.not_hold_evidence_count >= FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
+                release_keys.push_back(std::make_pair(it->first, direct_owner_index));
+            }
+            continue;
+        }
 
         // 若 CONTACT_* 已经用真实 B 看见过物品的新位置，覆盖率必须相对
         // 当前真实位置计算；仍拿最初 A.box 计算会使“先推、后握住”永远
@@ -2447,12 +2595,21 @@ void SessionManager::update_existing_contact_tracks_(
             continue;
         }
 
-        const int observed_index = unique_contact_detection_for_track(
-            detections, *claimed_detection_indices, track, working_inventory_,
-            track_buffer_);
+        const std::set<int> candidate_claimed = claimed_with_other_direct_old_owners(
+            *claimed_detection_indices, direct_old_owner_plan, track.item_id);
+        int observed_index = -1;
+        if (direct_owner_index >= 0 &&
+            direct_owner_strength == HandDirectOldOwnerStrength::LOCAL_CONTINUOUS) {
+            // 连续局部框可以继续服务于它自己的真实 CONTACT 路径，但对其他
+            // C/D 已经是排他所有权，不能再按遍历顺序借走。
+            observed_index = direct_owner_index;
+        } else {
+            observed_index = unique_contact_detection_for_track(
+                detections, candidate_claimed, track, working_inventory_, track_buffer_);
+        }
         if (observed_index < 0) {
             // 漏检、多个同类候选或与其他库存冲突都不是“未持有”的证据。
-            if (has_contact_path_candidate(detections, *claimed_detection_indices,
+            if (has_contact_path_candidate(detections, candidate_claimed,
                                            track, working_inventory_)) {
                 track.contact_path_ambiguous = true;
             }
@@ -2706,6 +2863,10 @@ SessionManager::build_mutually_unique_hand_static_owner_by_detection_(
 
             const BBox reference = item->second.base_box.area() > 0.0f
                 ? item->second.base_box : item->second.box;
+            // 细节15：静态预约只允许真正静态的旧 C 参加竞争。若先把被手
+            // 影响的 C 写进 candidates_for_detection，即使它随后不能获得
+            // 自己的预约，也会以更低成本挡住另一件静态旧 C。
+            if (hand_affects(hand_box, reference)) continue;
             float best_cost = std::numeric_limits<float>::infinity();
             int best_detection = -1;
             bool tied = false;
@@ -2725,10 +2886,7 @@ SessionManager::build_mutually_unique_hand_static_owner_by_detection_(
                     tied = true;
                 }
             }
-            // 手对该旧物品完整框的覆盖率已经达到 e2 时，必须交给 HAND_*
-            // 分支建立候选；不能根据缩小后的当前检测框来决定它是否静态。
-            if (best_detection >= 0 && !tied &&
-                !hand_affects(hand_box, reference)) {
+            if (best_detection >= 0 && !tied) {
                 best_detection_for_item[item->first] = best_detection;
             } else if (best_detection >= 0) {
                 tied_items.insert(item->first);
@@ -2780,6 +2938,210 @@ SessionManager::build_mutually_unique_hand_static_owner_by_detection_(
     }
 
     return owner_by_detection;
+}
+
+HandDirectOldOwnerPlan
+SessionManager::build_mutually_unique_hand_direct_old_owner_by_detection_(
+        const std::vector<Detection>& detections,
+        const std::set<int>& claimed_seed,
+        const std::map<int, int>& known_item_owner_seed) const {
+    HandDirectOldOwnerPlan plan;
+    std::map<int, std::vector<HandDirectOldOwnerCandidate> > candidates_by_item;
+    std::set<int> remaining_items;
+    std::set<int> remaining_detections;
+
+    for (size_t di = 0; di < detections.size(); ++di) {
+        if (!claimed_seed.count(static_cast<int>(di))) {
+            remaining_detections.insert(static_cast<int>(di));
+        }
+    }
+
+    // 这一步只从 operation-start 旧库存出发。普通 C 只产生严格原位候选；
+    // CONTACT/HAND C 才可在严格失败后使用自己的连续局部框，最后才允许
+    // "小框被旧完整框包含"的弱局部候选。PLACED/MOVED C 仅允许严格原位
+    // 证据，以免它自己的已放下终点被错误当成回滚证据。
+    for (std::map<int, InventoryItem>::const_iterator original =
+             operation_start_inventory_.begin();
+         original != operation_start_inventory_.end(); ++original) {
+        const int item_id = original->first;
+        if (known_item_owner_seed.count(item_id) ||
+            !working_inventory_.count(item_id) || pending_in_ids_.count(item_id)) {
+            continue;
+        }
+        const OperationTrack* runtime = find_runtime_for_item_(item_id);
+        if (runtime && (runtime->is_suspect_new ||
+                        runtime->resolution == ExistingItemResolution::OUT_CONFIRMED ||
+                        runtime->resolution == ExistingItemResolution::OCCLUDED_CONFIRMED)) {
+            continue;
+        }
+
+        const BBox original_box = runtime && runtime->original_box.area() > 0.0f
+            ? runtime->original_box
+            : (original->second.base_box.area() > 0.0f
+                   ? original->second.base_box : original->second.box);
+        if (original_box.area() <= 0.0f) continue;
+
+        const bool moved_or_placed = runtime &&
+            (runtime->state == OperationTrackState::PLACED ||
+             runtime->resolution == ExistingItemResolution::MOVED_CONFIRMED);
+        // CONTACT_* 在保护期内仍沿既有本地 tentative 路径运行，不能提前
+        // 把 B 写成全局排他 owner；保护期结束后才把其 last_hand_block_box
+        // 纳入本计划的局部连续仲裁。这样既保留推/拉连续路径，也避免成熟
+        // 的同类 CONTACT 轨迹按 map 顺序借走同一个 B。
+        const bool allows_local = runtime && !moved_or_placed &&
+            (is_active_existing_hand_track(*runtime) ||
+             (is_active_contact_track(*runtime) && !is_claim_protected(*runtime)));
+
+        for (size_t di = 0; di < detections.size(); ++di) {
+            const int detection_index = static_cast<int>(di);
+            if (!remaining_detections.count(detection_index) ||
+                detections[di].cls_id != original->second.cls_id) {
+                continue;
+            }
+
+            HandDirectOldOwnerCandidate candidate;
+            candidate.item_id = item_id;
+            candidate.detection_index = detection_index;
+            candidate.cost = strict_match_cost(original->second.cls_id, original_box,
+                                               detections[di]);
+            // CONTACT 的严格几何容差本来大于 CONTACT_OBJECT_MOVE_EPS；若不
+            // 保留既有的原位中心门槛，真实推/拉 20px 会被新计划错误压成
+            // "严格原位"，从而破坏已验证的 CONTACT_MOVING 路径。由 CONTACT
+            // 转入 HAND 后同样沿用这个保护，其他普通 HAND_* 仍按严格原位。
+            const bool contact_origin_guard = runtime &&
+                (is_active_contact_track(*runtime) ||
+                 runtime->has_hand_estimate_anchor_box) &&
+                !contact_detection_is_at_original(*runtime, detections[di]);
+            if (candidate.cost < std::numeric_limits<float>::infinity() &&
+                !contact_origin_guard) {
+                candidate.strength = HandDirectOldOwnerStrength::STRICT;
+                candidates_by_item[item_id].push_back(candidate);
+                continue;
+            }
+
+            if (!allows_local) continue;
+            if (runtime->has_last_hand_block_box) {
+                const bool strict_last_hand = strict_match_box(
+                    runtime->cls_id, runtime->last_hand_block_box,
+                    detections[di].cls_id, detections[di].box);
+                const bool track_last_hand = !strict_last_hand && track_match_box(
+                    runtime->cls_id, runtime->last_hand_block_box,
+                    detections[di].cls_id, detections[di].box);
+                const bool partial_last_hand = !strict_last_hand && !track_last_hand &&
+                    hand_partial_match_box(runtime->cls_id, runtime->last_hand_block_box,
+                                           detections[di].cls_id, detections[di].box);
+                if (strict_last_hand || track_last_hand || partial_last_hand) {
+                    candidate.strength = HandDirectOldOwnerStrength::LOCAL_CONTINUOUS;
+                    candidate.local_continuity = strict_last_hand
+                        ? HandDirectOldOwnerCandidate::LocalContinuity::STRICT_LAST_HAND_BOX
+                        : (track_last_hand
+                            ? HandDirectOldOwnerCandidate::LocalContinuity::TRACK_LAST_HAND_BOX
+                            : HandDirectOldOwnerCandidate::LocalContinuity::PARTIAL_LAST_HAND_BOX);
+                    candidates_by_item[item_id].push_back(candidate);
+                    continue;
+                }
+            }
+            if (hand_partial_match_box(original->second.cls_id, original_box,
+                                       detections[di].cls_id, detections[di].box)) {
+                candidate.strength = HandDirectOldOwnerStrength::LOCAL_WEAK;
+                candidates_by_item[item_id].push_back(candidate);
+            }
+        }
+        if (!candidates_by_item[item_id].empty()) remaining_items.insert(item_id);
+    }
+
+    // 迭代的双方唯一预约。严格 > 连续局部 > 弱局部；严格候选同级才按
+    // 成本裁决，局部候选必须有更强的自身连续性，否则保留歧义。无进展时
+    // 绝不回退到 map/item_id 顺序或局部框中心距离。
+    bool made_progress = true;
+    while (made_progress) {
+        made_progress = false;
+        std::map<int, HandDirectOldOwnerCandidate> best_for_item;
+        std::set<int> tied_items;
+        for (std::set<int>::const_iterator item = remaining_items.begin();
+             item != remaining_items.end(); ++item) {
+            const std::vector<HandDirectOldOwnerCandidate>& candidates =
+                candidates_by_item[*item];
+            HandDirectOldOwnerCandidate best;
+            bool has_best = false;
+            bool tied = false;
+            for (size_t ci = 0; ci < candidates.size(); ++ci) {
+                if (!remaining_detections.count(candidates[ci].detection_index)) continue;
+                if (!has_best || hand_direct_old_owner_candidate_better(candidates[ci], best)) {
+                    best = candidates[ci];
+                    has_best = true;
+                    tied = false;
+                } else if (hand_direct_old_owner_candidate_tied(candidates[ci], best)) {
+                    tied = true;
+                }
+            }
+            if (has_best && !tied) best_for_item[*item] = best;
+            if (has_best && tied) tied_items.insert(*item);
+        }
+
+        std::map<int, HandDirectOldOwnerCandidate> best_for_detection;
+        std::set<int> tied_detections;
+        for (std::set<int>::const_iterator item = remaining_items.begin();
+             item != remaining_items.end(); ++item) {
+            const std::vector<HandDirectOldOwnerCandidate>& candidates =
+                candidates_by_item[*item];
+            for (size_t ci = 0; ci < candidates.size(); ++ci) {
+                const HandDirectOldOwnerCandidate& candidate = candidates[ci];
+                if (!remaining_detections.count(candidate.detection_index)) continue;
+                std::map<int, HandDirectOldOwnerCandidate>::iterator best =
+                    best_for_detection.find(candidate.detection_index);
+                if (best == best_for_detection.end() ||
+                    hand_direct_old_owner_candidate_better(candidate, best->second)) {
+                    best_for_detection[candidate.detection_index] = candidate;
+                    tied_detections.erase(candidate.detection_index);
+                } else if (hand_direct_old_owner_candidate_tied(candidate, best->second)) {
+                    tied_detections.insert(candidate.detection_index);
+                }
+            }
+        }
+
+        std::vector<HandDirectOldOwnerCandidate> accepted;
+        for (std::map<int, HandDirectOldOwnerCandidate>::const_iterator best =
+                 best_for_item.begin(); best != best_for_item.end(); ++best) {
+            if (tied_items.count(best->first) ||
+                tied_detections.count(best->second.detection_index)) {
+                continue;
+            }
+            std::map<int, HandDirectOldOwnerCandidate>::const_iterator detection_best =
+                best_for_detection.find(best->second.detection_index);
+            if (detection_best == best_for_detection.end() ||
+                detection_best->second.item_id != best->first) {
+                continue;
+            }
+            accepted.push_back(best->second);
+        }
+
+        for (size_t ai = 0; ai < accepted.size(); ++ai) {
+            const HandDirectOldOwnerCandidate& candidate = accepted[ai];
+            if (!remaining_items.count(candidate.item_id) ||
+                !remaining_detections.count(candidate.detection_index)) {
+                continue;
+            }
+            plan.owner_by_detection[candidate.detection_index] = candidate.item_id;
+            plan.detection_by_item[candidate.item_id] = candidate.detection_index;
+            plan.strength_by_detection[candidate.detection_index] = candidate.strength;
+            remaining_items.erase(candidate.item_id);
+            remaining_detections.erase(candidate.detection_index);
+            made_progress = true;
+        }
+    }
+
+    for (std::set<int>::const_iterator item = remaining_items.begin();
+         item != remaining_items.end(); ++item) {
+        const std::vector<HandDirectOldOwnerCandidate>& candidates =
+            candidates_by_item[*item];
+        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+            if (remaining_detections.count(candidates[ci].detection_index)) {
+                plan.ambiguous_detection_indices.insert(candidates[ci].detection_index);
+            }
+        }
+    }
+    return plan;
 }
 
 void SessionManager::reserve_visible_known_detections_(
@@ -2838,6 +3200,47 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     set_live_state_(&track, LiveObservationState::PLACED, false,
                     "moved-confirmed-after-direct-evidence");
     trace_track_("STATE", track, "confirm-rearrange");
+}
+
+void SessionManager::rollback_provisional_moved_to_direct_original_(
+        OperationTrack* track, int detection_index, const Detection& detection) {
+    if (!track || track->is_suspect_new || track->item_id <= 0 ||
+        !working_inventory_active_ ||
+        !operation_start_inventory_.count(track->item_id) ||
+        detection.cls_id != track->cls_id) {
+        return;
+    }
+    if (track->resolution != ExistingItemResolution::MOVED_CONFIRMED &&
+        track->state != OperationTrackState::PLACED) {
+        return;
+    }
+
+    // confirm_rearrange_ 写入的是本次连续手操作的工作状态。唯一的严格
+    // 原位置所有权可以在提交前推翻它：必须同时撤掉 MOVED 集合、终点框、
+    // drop 标志和它作为前景 blocker 的资格，不能只把 state 改回 NORMAL。
+    std::map<int, InventoryItem>::iterator item = working_inventory_.find(track->item_id);
+    if (item == working_inventory_.end()) return;
+    update_seen(item->second, detection, trace_frame_id_);
+    item->second.base_box = detection.box;
+    item->second.status = ItemStatus::VISIBLE;
+    item->second.block_ids.clear();
+
+    confirmed_moved_ids_.erase(track->item_id);
+    pending_out_ids_.erase(track->item_id);
+    track->placed_box = BBox();
+    track->has_placed_box = false;
+    track->drop_confirmed = false;
+    track->drop_evidence_count = 0;
+    track->last_seen_box = detection.box;
+    track->has_last_seen_box = true;
+    trace_("ROLLBACK",
+           "item=%d action=rollback-provisional-moved-to-direct-original "
+           "detection=%d box=(%.1f,%.1f,%.1f,%.1f)",
+           track->item_id, detection_index, detection.box.x1, detection.box.y1,
+           detection.box.x2, detection.box.y2);
+    release_not_held_(*track, false, ReleaseReason::ORIGINAL_DETECTION,
+                      detection_index, &detection.box,
+                      "direct-original-owner-rolls-back-provisional-moved");
 }
 
 void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
@@ -3155,7 +3558,8 @@ void SessionManager::advance_claim_grace_(
 void SessionManager::update_existing_hand_tracks_(
         const BBox& hand_box, const std::vector<Detection>& detections,
         const MoveValue& delta, std::set<int>* claimed_detection_indices,
-        std::map<int, int>* known_item_owner) {
+        std::map<int, int>* known_item_owner,
+        const HandDirectOldOwnerPlan& direct_old_owner_plan) {
     std::vector<int> promote_keys;
     // 对 HAND_* + hold_and_move=false，静止手帧只能更新局部观测，不能把
     // “还在原位”或“跟手移动”当作新的有效证据。
@@ -3199,37 +3603,85 @@ void SessionManager::update_existing_hand_tracks_(
                 track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
             }
         }
+        const int direct_owner_index = track.is_suspect_new ? -1 :
+            direct_old_owner_detection_for_item(direct_old_owner_plan, track.item_id);
+        const HandDirectOldOwnerStrength direct_owner_strength =
+            direct_owner_index >= 0
+                ? direct_old_owner_strength_for_detection(
+                      direct_old_owner_plan, direct_owner_index)
+                : HandDirectOldOwnerStrength::LOCAL_WEAK;
+        if (direct_owner_index >= 0 &&
+            direct_owner_strength == HandDirectOldOwnerStrength::STRICT) {
+            // 自己唯一的严格原位框必须先于任何 estimated/track/reappear 路径。
+            // 它只累计既有的“没有拿起”反向证据，不能被同一帧的宽松路径
+            // 重新解释成 MOVED，也不能被别的 C/D 借走。
+            const Detection& old_d = detections[direct_owner_index];
+            claimed_detection_indices->insert(direct_owner_index);
+            (*known_item_owner)[track.item_id] = direct_owner_index;
+            track.b_claim_ambiguous = false;
+            track.has_tentative_b_box = false;
+            track.tentative_b_match_count = 0;
+            track.tentative_b_started_touching_hand = false;
+            track.has_reappear_candidate_box = false;
+            track.reappear_candidate_match_count = 0;
+            track.reappear_candidate_started_touching_hand = false;
+            track.reappearance_pending = false;
+            if (hand_moved) {
+                ++track.not_hold_evidence_count;
+                track.hold_evidence_count = 0;
+            }
+            track.last_seen_box = old_d.box;
+            track.has_last_seen_box = true;
+            track.last_hand_block_box = old_d.box;
+            track.has_last_hand_block_box = true;
+            if (hand_moved && track.not_hold_evidence_count >=
+                FLOW3_NOT_HOLD_EVIDENCE_REQUIRED) {
+                std::map<int, InventoryItem>::iterator item =
+                    working_inventory_.find(track.item_id);
+                if (item != working_inventory_.end()) {
+                    update_seen(item->second, old_d, trace_frame_id_);
+                    item->second.base_box = old_d.box;
+                }
+                release_not_held_(track, false, ReleaseReason::ORIGINAL_DETECTION,
+                                  direct_owner_index, &old_d.box,
+                                  "hand-direct-old-owner-strict-original");
+            }
+            continue;
+        }
+        const std::set<int> candidate_claimed = claimed_with_other_direct_old_owners(
+            *claimed_detection_indices, direct_old_owner_plan,
+            track.is_suspect_new ? -1 : track.item_id);
         int observed_index = unique_detection_for_box(
-            detections, *claimed_detection_indices, track.cls_id, expected,
+            detections, candidate_claimed, track.cls_id, expected,
             true, true);
         if (observed_index < 0) {
             observed_index = best_detection_for_box(
-                detections, *claimed_detection_indices, track.cls_id, expected,
+                detections, candidate_claimed, track.cls_id, expected,
                 true, true);
         }
         if (observed_index < 0 && track.has_last_hand_block_box) {
             const BBox local_expected = move_box(track.last_hand_block_box, delta);
             observed_index = unique_detection_for_box(
-                detections, *claimed_detection_indices, track.cls_id, local_expected,
+                detections, candidate_claimed, track.cls_id, local_expected,
                 true, true);
             if (observed_index < 0) {
                 observed_index = best_detection_for_box(
-                    detections, *claimed_detection_indices, track.cls_id, local_expected,
+                    detections, candidate_claimed, track.cls_id, local_expected,
                     true, true);
             }
             if (observed_index < 0) {
                 observed_index = unique_hand_affected_detection_for_box(
-                    detections, *claimed_detection_indices, track.cls_id,
+                    detections, candidate_claimed, track.cls_id,
                     local_expected, hand_box);
             }
         }
         if (observed_index < 0 && track.has_last_seen_box) {
             observed_index = unique_detection_for_box(
-                detections, *claimed_detection_indices, track.cls_id,
+                detections, candidate_claimed, track.cls_id,
                 track.last_seen_box, true, true);
             if (observed_index < 0) {
                 observed_index = best_detection_for_box(
-                    detections, *claimed_detection_indices, track.cls_id,
+                    detections, candidate_claimed, track.cls_id,
                     track.last_seen_box, true, true);
             }
         }
@@ -3237,17 +3689,17 @@ void SessionManager::update_existing_hand_tracks_(
         if (observed_index < 0 && !track.is_suspect_new &&
             track.has_reappear_candidate_box) {
             observed_index = unique_detection_for_box(
-                detections, *claimed_detection_indices, track.cls_id,
+                detections, candidate_claimed, track.cls_id,
                 track.reappear_candidate_box, true, true);
             if (observed_index < 0) {
                 observed_index = best_detection_for_box(
-                    detections, *claimed_detection_indices, track.cls_id,
+                    detections, candidate_claimed, track.cls_id,
                     track.reappear_candidate_box, true, true);
             }
             observed_matches_reappear_candidate = observed_index >= 0;
         }
         int old_position_index = unique_detection_at_old_position(
-            detections, *claimed_detection_indices, track);
+            detections, candidate_claimed, track);
         // CONTACT_* 转入 HAND_* 后，B 仍可能与最初 A.box 有较大 IoM。
         // 普通 HAND_* 的“局部重叠即旧位置”规则在这里会把已经推开的 B
         // 误当成 A 原地未动。因此该分支只接受真正仍贴近 original_box 的
@@ -3673,12 +4125,28 @@ void SessionManager::scan_or_update_suspects_(
         const BBox& hand_box, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         const std::map<int, int>& known_item_owner,
+        const HandDirectOldOwnerPlan& direct_old_owner_plan,
         bool /*first_hand_frame*/) {
     // scan 内也会把 B 暂认给 C。复制一份本帧归属，避免同一个尚未确认的 C
     // 在同一帧连续抢走两个同类框；外部在 scan 后不再需要这个临时映射。
     std::map<int, int> effective_known_item_owner = known_item_owner;
     for (size_t di = 0; di < detections.size(); ++di) {
         if (claimed_detection_indices->count(static_cast<int>(di))) continue;
+        const int detection_index = static_cast<int>(di);
+        std::map<int, int>::const_iterator direct_owner =
+            direct_old_owner_plan.owner_by_detection.find(detection_index);
+        if (direct_owner != direct_old_owner_plan.owner_by_detection.end() ||
+            direct_old_owner_plan.ambiguous_detection_indices.count(detection_index)) {
+            trace_("D-GUARD",
+                   "candidate=%zu cls=%d action=yield-to-direct-old-owner-plan "
+                   "owner=%d ambiguous=%d",
+                   di, detections[di].cls_id,
+                   direct_owner == direct_old_owner_plan.owner_by_detection.end()
+                       ? -1 : direct_owner->second,
+                   direct_old_owner_plan.ambiguous_detection_indices.count(detection_index)
+                       ? 1 : 0);
+            continue;
+        }
         const Detection& d = detections[di];
         const bool hand_visible_d = hand_touches_detection(hand_box, d.box);
         // D 已经被放到 C 原位置时，手可能继续移开，因此 D 不一定还贴手。
@@ -4164,13 +4632,47 @@ void SessionManager::process_effective_hand_frame_(
     std::set<int> claimed;
     std::map<int, int> known_item_owner;
     std::set<int> new_existing_track_ids;
+    const HandDirectOldOwnerPlan direct_old_owner_plan =
+        build_mutually_unique_hand_direct_old_owner_by_detection_(
+            detections, claimed, known_item_owner);
     if (!first_hand_frame) {
+        // 已确认 MOVED 仍是本次 operation 的临时工作状态。路径更新之前先
+        // 让唯一的严格原位 owner 有机会完整撤销它，避免 PLACED 继续污染
+        // 后续无手绑定、前景遮挡物与最终事件。
+        for (std::map<int, int>::const_iterator owner =
+                 direct_old_owner_plan.owner_by_detection.begin();
+             owner != direct_old_owner_plan.owner_by_detection.end(); ++owner) {
+            if (direct_old_owner_strength_for_detection(
+                    direct_old_owner_plan, owner->first) !=
+                HandDirectOldOwnerStrength::STRICT) {
+                continue;
+            }
+            std::map<int, OperationTrack>::iterator track =
+                track_buffer_.find(owner->second);
+            if (track != track_buffer_.end()) {
+                const bool was_provisional_moved =
+                    track->second.state == OperationTrackState::PLACED ||
+                    track->second.resolution == ExistingItemResolution::MOVED_CONFIRMED;
+                rollback_provisional_moved_to_direct_original_(
+                    &track->second, owner->first, detections[owner->first]);
+                // 回滚后这张严格原位框仍必须保留给旧 C，直到本帧结束。
+                // 否则后续的“新接触/新遮挡”扫描会把已经回滚为静态的
+                // runtime 当成未认领物品，再次覆盖为 HAND_*。这只是本帧
+                // 临时所有权；下一张有手帧仍按原有规则重新评估是否被拿起。
+                if (was_provisional_moved &&
+                    track->second.state == OperationTrackState::NORMAL &&
+                    track->second.resolution == ExistingItemResolution::STATIC_CONFIRMED) {
+                    claimed.insert(owner->first);
+                    known_item_owner[owner->second] = owner->first;
+                }
+            }
+        }
         // 低覆盖率 CONTACT_* 先用物品真实检测框更新；这里不能使用手位移
         // 推算的 estimated_box。
         update_existing_contact_tracks_(hand_box, detections, &claimed,
-                                        &known_item_owner);
+                                        &known_item_owner, direct_old_owner_plan);
         update_existing_hand_tracks_(hand_box, detections, delta, &claimed,
-                                     &known_item_owner);
+                                     &known_item_owner, direct_old_owner_plan);
         // 原位暂时确认后的 C 若在本帧再次随手离开原位置，必须先恢复
         // HAND_* 身份链，再让静态预约或 D 扫描处理剩余检测框。
         reopen_released_static_tracks_(hand_box, detections, delta);
@@ -4182,6 +4684,7 @@ void SessionManager::process_effective_hand_frame_(
     mark_newly_hand_blocked_items_(hand_box, detections, &claimed,
                                    &known_item_owner, &new_existing_track_ids);
     scan_or_update_suspects_(hand_box, detections, &claimed, known_item_owner,
+                             direct_old_owner_plan,
                              first_hand_frame);
     apply_suspect_cover_evidence_(hand_box, detections, hand_moved);
     advance_claim_grace_(new_existing_track_ids);
