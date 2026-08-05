@@ -164,6 +164,8 @@ const char* existing_resolution_name(ExistingItemResolution resolution) {
             return "STATIC_CONFIRMED";
         case ExistingItemResolution::MOVED_CONFIRMED:
             return "MOVED_CONFIRMED";
+        case ExistingItemResolution::POSITION_REBASED:
+            return "POSITION_REBASED";
         case ExistingItemResolution::OUT_CONFIRMED:
             return "OUT_CONFIRMED";
         case ExistingItemResolution::OCCLUDED_CONFIRMED:
@@ -236,6 +238,7 @@ bool existing_item_needs_settlement(const OperationTrack& track) {
     return !track.is_suspect_new && track.item_id > 0 &&
            track.needs_no_hand_settlement &&
            track.resolution != ExistingItemResolution::MOVED_CONFIRMED &&
+           track.resolution != ExistingItemResolution::POSITION_REBASED &&
            track.resolution != ExistingItemResolution::OUT_CONFIRMED &&
            track.resolution != ExistingItemResolution::OCCLUDED_CONFIRMED;
 }
@@ -243,6 +246,7 @@ bool existing_item_needs_settlement(const OperationTrack& track) {
 bool existing_item_resolved_without_current_detection(const OperationTrack* track) {
     if (!track || track->is_suspect_new) return false;
     return track->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+           track->resolution == ExistingItemResolution::POSITION_REBASED ||
            track->resolution == ExistingItemResolution::OUT_CONFIRMED ||
            track->resolution == ExistingItemResolution::OCCLUDED_CONFIRMED;
 }
@@ -250,6 +254,7 @@ bool existing_item_resolved_without_current_detection(const OperationTrack* trac
 bool existing_track_is_terminal(const OperationTrack& track) {
     return !track.is_suspect_new &&
            (track.resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+            track.resolution == ExistingItemResolution::POSITION_REBASED ||
             track.resolution == ExistingItemResolution::OUT_CONFIRMED ||
             track.resolution == ExistingItemResolution::OCCLUDED_CONFIRMED);
 }
@@ -457,6 +462,118 @@ bool has_meaningful_hand_move(const OperationTrack& track) {
         if (move_length(track.move_values[i]) >= TRACK_HAND_MOVE_EPS) return true;
     }
     return false;
+}
+
+// 细节15的 A -> B 不是“手的意图”，而是可观察到的物理前驱关系。这里只
+// 接受 A 自己的真实检测位置；手的预测轨迹只能帮助已有 HAND_* 收尾，不能
+// 单独把某个邻居的框分配成 B/C。
+bool direct_track_has_observed_motion(const OperationTrack& track,
+                                      BBox* observed_box) {
+    if (track.is_suspect_new || track.indirect_move_candidate ||
+        track.item_id <= 0 || track.original_box.area() <= 0.0f) {
+        return false;
+    }
+
+    // MOVED_CONFIRMED 本身不足以证明它是新的直接推动源：间接成员 B 也可能
+    // 因自己的位移达到正式门槛而得到该结论。这里必须保留 HAND/CONTACT 的
+    // 直接证据，避免已经确认的 B 在后续未决帧继续向外扩散一条伪推动链。
+    const bool direct_motion_evidence =
+        (track.contact_state == ContactState::CONTACT_MOVING && track.hold_and_move) ||
+        ((track.state == OperationTrackState::HAND_PARTIAL_BLOCKED ||
+          track.state == OperationTrackState::HAND_FULL_BLOCKED ||
+          track.state == OperationTrackState::PLACED) &&
+         (track.hold_and_move || has_meaningful_hand_move(track)));
+    if (!direct_motion_evidence) return false;
+
+    BBox result;
+    bool has_result = false;
+    if (track.has_placed_box) {
+        result = track.placed_box;
+        has_result = true;
+    } else if (!track.observed_track.empty()) {
+        result = track.observed_track.back();
+        has_result = true;
+    } else if (track.has_last_seen_box) {
+        result = track.last_seen_box;
+        has_result = true;
+    }
+    if (!has_result || result.area() <= 0.0f ||
+        center_distance(track.original_box, result) <= 0.0f) {
+        return false;
+    }
+    if (observed_box) *observed_box = result;
+    return true;
+}
+
+// 不引入新的像素阈值：两个操作开始时的旧物品只要框相交，或按现有
+// CONTACT 路径的尺度化“附近”语义相邻，才可能属于同一次碰撞/推挤链。
+bool boxes_are_adjacent_for_indirect_chain(const BBox& a, const BBox& b) {
+    return a.area() > 0.0f && b.area() > 0.0f &&
+           (intersection_area(a, b) > 0.0f ||
+            normalized_nearby_distance(a, b) <= FLOW3_CONTACT_PATH_CENTER_NORM);
+}
+
+bool indirect_member_matches_detection(const InventoryItem& original,
+                                       const Detection& detection) {
+    const BBox reference = original.base_box.area() > 0.0f
+        ? original.base_box : original.box;
+    if (original.cls_id != detection.cls_id || reference.area() <= 0.0f ||
+        detection.box.area() <= 0.0f) {
+        return false;
+    }
+    if (track_match_box(original.cls_id, reference, detection.cls_id, detection.box)) {
+        return true;
+    }
+    return normalized_nearby_distance(reference, detection.box) <=
+               FLOW3_REAPPEAR_CANDIDATE_CENTER_NORM &&
+           ratio_difference(reference.w(), detection.box.w()) <=
+               FLOW3_REAPPEAR_CANDIDATE_WIDTH_RATIO &&
+           ratio_difference(reference.h(), detection.box.h()) <=
+               FLOW3_REAPPEAR_CANDIDATE_HEIGHT_RATIO;
+}
+
+float suspect_d_reappearance_path_cost(const OperationTrack& track,
+                                       const Detection& observed);
+
+bool detection_conflicts_with_pending_suspect_d(
+        const Detection& detection, const std::map<int, OperationTrack>& tracks) {
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        const OperationTrack& suspect = it->second;
+        if (!suspect.is_suspect_new || suspect.cls_id != detection.cls_id) continue;
+        const BBox reference = suspect.has_placed_box ? suspect.placed_box :
+            (suspect.has_last_seen_box ? suspect.last_seen_box : estimated_box(suspect));
+        if (strict_match_box(suspect.cls_id, reference,
+                             detection.cls_id, detection.box) ||
+            partial_match_box(suspect.cls_id, reference,
+                              detection.cls_id, detection.box) ||
+            track_match_box(suspect.cls_id, reference,
+                            detection.cls_id, detection.box) ||
+            suspect_d_reappearance_path_cost(suspect, detection) <
+                std::numeric_limits<float>::infinity()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct IndirectMoveSource {
+    int item_id = -1;
+    BBox original_box;
+    BBox observed_box;
+    float axis_x = 0.0f;
+    float axis_y = 0.0f;
+};
+
+struct IndirectMoveAssignment {
+    int item_id = -1;
+    int detection_index = -1;
+    int predecessor_item_id = -1;
+    int cluster_id = -1;
+};
+
+float indirect_projection(const BBox& box, float axis_x, float axis_y) {
+    return box.cx() * axis_x + box.cy() * axis_y;
 }
 
 InventoryItem make_inventory_item(int item_id, const Detection& detection,
@@ -1475,8 +1592,14 @@ int unique_d_reappearance_detection_for_track(
 // 能合理解释 B，就不把 B 另建成 POST_HAND_REVEAL_D。
 bool detection_can_belong_to_active_track(const Detection& detection,
                                           const OperationTrack& track) {
-    if (!is_active_runtime_track(track) || track.cls_id != detection.cls_id) {
+    if ((!is_active_runtime_track(track) && !track.indirect_move_candidate) ||
+        track.cls_id != detection.cls_id) {
         return false;
+    }
+    if (track.indirect_move_candidate && track.has_indirect_candidate_box &&
+        track_match_box(track.cls_id, track.indirect_candidate_box,
+                        detection.cls_id, detection.box)) {
+        return true;
     }
     // 即便 CONTACT_* 已升级为 HAND_*，也优先尊重此前由真实检测框建立的
     // observed_track；这能避免低覆盖率推/拉后把同一个 B 又预登记成 D。
@@ -1876,6 +1999,7 @@ std::map<int, int> build_independent_no_hand_static_owner_by_detection(
         const OperationTrack* runtime = find_track_for_item(tracks, original->first);
         if (runtime && (runtime->is_suspect_new ||
                         runtime->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+                        runtime->resolution == ExistingItemResolution::POSITION_REBASED ||
                         runtime->resolution == ExistingItemResolution::OUT_CONFIRMED ||
                         runtime->resolution == ExistingItemResolution::OCCLUDED_CONFIRMED)) {
             continue;
@@ -2155,7 +2279,8 @@ void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
     const BBox expected = estimated_box(track);
     trace_(tag,
            "item=%d suspect=%d cls=%d state=%s contact=%s resolution=%s "
-           "needs_settle=%d static-near-original=%d/%d grace=%d hold=%d not_hold=%d "
+           "needs_settle=%d static-near-original=%d/%d indirect=%d/%d indirect-pre=%d "
+           "indirect-cluster=%d indirect-index=%d grace=%d hold=%d not_hold=%d "
            "missing=%d ambiguous=%d "
            "owner-kind=%s quarantine=%d alias-old=%zu alias-d=%zu alias-no-hand=%d "
            "alias-missing=%d "
@@ -2170,6 +2295,11 @@ void SessionManager::trace_track_(const char* tag, const OperationTrack& track,
            track.needs_no_hand_settlement ? 1 : 0,
            track.stable_near_original_no_hand_count,
            track.has_stable_near_original_box ? 1 : 0,
+           track.indirect_move_candidate ? 1 : 0,
+           track.indirect_no_hand_match_count,
+           track.indirect_predecessor_item_id,
+           track.indirect_cluster_id,
+           track.indirect_no_hand_detection_index,
            track.claim_grace_remaining, track.hold_evidence_count,
            track.not_hold_evidence_count, track.no_hand_missing_count,
            (track.b_claim_ambiguous || track.contact_path_ambiguous ||
@@ -2212,6 +2342,7 @@ void SessionManager::reset_operation_runtime_() {
     pending_in_ids_.clear();
     pending_out_ids_.clear();
     confirmed_moved_ids_.clear();
+    confirmed_position_update_ids_.clear();
     released_hand_candidate_ids_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
@@ -2369,6 +2500,7 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     pending_in_ids_.clear();
     pending_out_ids_.clear();
     confirmed_moved_ids_.clear();
+    confirmed_position_update_ids_.clear();
     released_hand_candidate_ids_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
@@ -2835,9 +2967,92 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     track.tentative_b_match_count = 0;
     track.tentative_b_started_touching_hand = false;
     confirmed_moved_ids_.insert(track.item_id);
+    confirmed_position_update_ids_.insert(track.item_id);
     set_live_state_(&track, LiveObservationState::PLACED, false,
                     "moved-confirmed-after-direct-evidence");
     trace_track_("STATE", track, "confirm-rearrange");
+}
+
+void SessionManager::confirm_position_rebase_(OperationTrack& track,
+                                              const BBox& release_box,
+                                              float score, int frame_id,
+                                              bool emit_moved,
+                                              const char* reason) {
+    if (track.item_id <= 0 || track.is_suspect_new || release_box.area() <= 0.0f) {
+        return;
+    }
+    std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
+    if (item == working_inventory_.end()) return;
+
+    // `emit_moved` only controls the business event threshold.  An indirect
+    // nudge below that threshold is still an INDIRECT-MOVE, not a detector
+    // STABLE-REBASE; retain that distinction in the diagnostic trace.
+    const bool indirect_move = track.indirect_move_candidate ||
+        track.indirect_predecessor_item_id > 0 || track.indirect_cluster_id > 0;
+    const int indirect_predecessor_item_id = track.indirect_predecessor_item_id;
+    const int indirect_cluster_id = track.indirect_cluster_id;
+    const bool formal_move = boxes_differ_as_move(track.original_box, release_box);
+
+    item->second.box = release_box;
+    item->second.base_box = release_box;
+    item->second.score = score;
+    item->second.updated_frame = frame_id;
+    item->second.status = ItemStatus::VISIBLE;
+    item->second.block_ids.clear();
+
+    track.placed_box = release_box;
+    track.has_placed_box = true;
+    track.drop_confirmed = emit_moved;
+    track.state = OperationTrackState::NORMAL;
+    track.contact_state = ContactState::NONE;
+    track.resolution = emit_moved
+        ? ExistingItemResolution::MOVED_CONFIRMED
+        : ExistingItemResolution::POSITION_REBASED;
+    track.release_reason = ReleaseReason::NONE;
+    track.needs_no_hand_settlement = false;
+    track.stable_near_original_no_hand_count = 0;
+    track.has_stable_near_original_box = false;
+    track.stable_near_original_box = BBox();
+    track.b_claim_ambiguous = false;
+    track.contact_path_ambiguous = false;
+    track.no_hand_candidate_ambiguous = false;
+    track.claim_grace_remaining = 0;
+    track.no_hand_missing_count = 0;
+    track.has_tentative_b_box = false;
+    track.tentative_b_match_count = 0;
+    track.tentative_b_started_touching_hand = false;
+    track.has_reappear_candidate_box = false;
+    track.reappear_candidate_match_count = 0;
+    track.reappear_candidate_started_touching_hand = false;
+    track.reappearance_pending = false;
+    track.indirect_move_candidate = false;
+    track.indirect_assignment_ambiguous = false;
+    track.indirect_no_hand_detection_index = -1;
+    track.indirect_no_hand_match_count = 0;
+    track.has_indirect_candidate_box = false;
+    track.indirect_candidate_box = BBox();
+
+    confirmed_position_update_ids_.insert(track.item_id);
+    if (emit_moved) {
+        confirmed_moved_ids_.insert(track.item_id);
+    } else {
+        confirmed_moved_ids_.erase(track.item_id);
+    }
+    set_live_state_(&track, LiveObservationState::POSSIBLE_MOVED, false,
+                    reason ? reason : "position-rebased-after-direct-evidence");
+    const char* trace_tag = indirect_move ? "INDIRECT-MOVE" : "STABLE-REBASE";
+    trace_(trace_tag,
+           "item=%d predecessor=%d cluster=%d action=%s original=(%.1f,%.1f,%.1f,%.1f) "
+           "box=(%.1f,%.1f,%.1f,%.1f) "
+           "formal-move=%d emit-moved=%d",
+           track.item_id, indirect_predecessor_item_id, indirect_cluster_id,
+           emit_moved ? "confirm-moved" : "confirm-position-only",
+           track.original_box.x1, track.original_box.y1,
+           track.original_box.x2, track.original_box.y2,
+           release_box.x1, release_box.y1, release_box.x2, release_box.y2,
+           formal_move ? 1 : 0, emit_moved ? 1 : 0);
+    trace_track_(trace_tag, track,
+                 reason ? reason : "position-rebased-after-direct-evidence");
 }
 
 void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
@@ -2903,6 +3118,14 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
     track.hand_move_values.clear();
     track.contact_started_touching_hand = false;
     track.no_hand_missing_count = 0;
+    track.indirect_move_candidate = false;
+    track.indirect_assignment_ambiguous = false;
+    track.indirect_predecessor_item_id = -1;
+    track.indirect_cluster_id = -1;
+    track.indirect_no_hand_detection_index = -1;
+    track.indirect_no_hand_match_count = 0;
+    track.has_indirect_candidate_box = false;
+    track.indirect_candidate_box = BBox();
     if (keep_reopen_anchor) {
         track.last_seen_box = reopen_anchor;
         track.has_last_seen_box = reopen_anchor.area() > 0.0f;
@@ -2992,7 +3215,7 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
     const bool direct_unique_owner = detection_index >= 0 &&
         static_owner != independent_static_owner_by_detection.end() &&
         static_owner->second == c.item_id;
-    const bool scale_aware_near_original =
+    const bool stable_identity_match =
         strict_match_box(c.cls_id, c.original_box,
                          detection.cls_id, detection.box) &&
         partial_match_box(c.cls_id, c.original_box,
@@ -3002,10 +3225,10 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
     const float normalized_center_delta =
         normalized_nearby_distance(c.original_box, detection.box);
     const bool formal_move = boxes_differ_as_move(c.original_box, detection.box);
-    // 这条路径只处理 12px CONTACT 原位门槛与既有正式 MOVED 门槛之间的
-    // 静态灰区；两端的正常分支继续沿用原有语义。
-    const bool static_gray_zone =
-        center_delta > FLOW3_CONTACT_OBJECT_MOVE_EPS && !formal_move;
+    // 细节15：这不是“位移超过正式门槛就一定 MOVED”。没有直接手持或
+    // 间接推动链的旧 C，若自己的最终框连续、唯一、尺度一致，就可以做
+    // STABLE-REBASE；它只同步位置，不产生业务 MOVED。
+    const bool stable_offset = center_delta > FLOW3_CONTACT_OBJECT_MOVE_EPS;
     const bool hand_or_contact_move_evidence =
         c.hold_and_move || has_meaningful_hand_move(c) ||
         c.contact_state != ContactState::NONE;
@@ -3032,12 +3255,10 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
         reason = "not-operation-start-provisional-static-c";
     } else if (!direct_unique_owner) {
         reason = "no-direct-unique-static-owner";
-    } else if (!scale_aware_near_original) {
-        reason = "not-scale-aware-near-original";
-    } else if (formal_move) {
-        reason = "formal-move-threshold-reached";
-    } else if (!static_gray_zone) {
-        reason = "not-contact-static-gray-zone";
+    } else if (!stable_identity_match) {
+        reason = "not-stable-identity-match";
+    } else if (!stable_offset) {
+        reason = "not-stable-offset";
     } else if (hand_or_contact_move_evidence) {
         reason = "hand-or-contact-move-evidence";
     } else if (reappearance_claim_or_path_ambiguity) {
@@ -3050,7 +3271,7 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
         reason = "not-continuous-with-previous-static-frame";
     }
     const bool eligible = provisional_static_after_hand && direct_unique_owner &&
-        scale_aware_near_original && static_gray_zone &&
+        stable_identity_match && stable_offset &&
         !hand_or_contact_move_evidence &&
         !reappearance_claim_or_path_ambiguity && working_item_is_visible &&
         prior_evidence_consistent && previous_stable_match;
@@ -3084,14 +3305,14 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
         trace_("STATIC-SETTLE",
                "item=%d phase=NO_HAND detection=%d source=%s "
                "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
-               "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=0 "
+               "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=%d "
                "has-real-move-evidence=0 unique-static-owner=1 "
                "previous-stable-present=%d previous-stable-match=%d "
                "stable-count=%d/%d action=wait-stable-near-original reason=eligible",
                c.item_id, detection_index, source ? source : "NONE",
                center_delta, normalized_center_delta, iom(c.original_box, detection.box),
                ratio_difference(c.original_box.w(), detection.box.w()),
-               ratio_difference(c.original_box.h(), detection.box.h()),
+               ratio_difference(c.original_box.h(), detection.box.h()), formal_move ? 1 : 0,
                has_prior_stable_box ? 1 : 0, previous_stable_match ? 1 : 0,
                c.stable_near_original_no_hand_count,
                FLOW3_NO_HAND_D_CONFIRM_FRAMES);
@@ -3101,24 +3322,25 @@ bool SessionManager::try_release_stable_near_original_no_hand_(
     const int stable_count_before_release = c.stable_near_original_no_hand_count;
     const bool needs_settlement_before_release = c.needs_no_hand_settlement;
     // 不把 unresolved C-D alias 当作这里的阻塞条件：正是 C 用自己的直接
-    // 证据完成 release 后，r15 才能安全判断 runtime-only D 是否应该回收。
-    update_seen(working->second, detection, trace_frame_id_);
-    release_not_held_(c, false, ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND,
-                      detection_index, &detection.box,
-                      "no-hand-stable-near-original");
+    // 证据完成位置重同步后，r15 才能安全判断 runtime-only D 是否应该回收。
+    confirm_position_rebase_(c, detection.box, detection.score, trace_frame_id_, false,
+                             "stable-rebase-after-continuous-direct-evidence");
+    // 保留 r16 的可追溯 release 原因，供 C-D alias 清理和已有回放断言区分
+    // “原位静态 release”与“连续稳定框位置重同步”。
+    c.release_reason = ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND;
     trace_("STATIC-SETTLE",
            "item=%d phase=NO_HAND detection=%d source=%s "
            "center-distance-px=%.3f normalized-center-distance=%.4f iom=%.4f "
-           "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=0 "
+               "width-ratio-diff=%.4f height-ratio-diff=%.4f formal-move=%d "
            "has-real-move-evidence=0 unique-static-owner=1 "
            "previous-stable-present=%d previous-stable-match=%d "
-           "stable-count=%d/%d action=release-stable-near-original "
-           "release-reason=STABLE_NEAR_ORIGINAL_NO_HAND needs-settle-before=%d "
+               "stable-count=%d/%d action=confirm-stable-rebase "
+               "release-reason=POSITION_REBASED needs-settle-before=%d "
            "needs-settle-after=%d inventory-update=existing-item-only event=none",
            c.item_id, detection_index, source ? source : "NONE",
            center_delta, normalized_center_delta, iom(c.original_box, detection.box),
            ratio_difference(c.original_box.w(), detection.box.w()),
-           ratio_difference(c.original_box.h(), detection.box.h()),
+           ratio_difference(c.original_box.h(), detection.box.h()), formal_move ? 1 : 0,
            has_prior_stable_box ? 1 : 0, previous_stable_match ? 1 : 0,
            stable_count_before_release, FLOW3_NO_HAND_D_CONFIRM_FRAMES,
            needs_settlement_before_release ? 1 : 0,
@@ -4157,6 +4379,29 @@ void SessionManager::process_effective_hand_frame_(
     const bool hand_moved = !first_hand_frame &&
         move_length(delta) >= TRACK_HAND_MOVE_EPS;
 
+    // 无手阶段的间接成员必须在连续直接帧里确认；手重新出现会打断这条
+    // 连续性。保留 operation-start 身份和既有直接轨迹，但不能把旧的首帧
+    // 证据拼接到下一次无手阶段。
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (track.is_suspect_new || !track.indirect_move_candidate ||
+            existing_track_is_terminal(track)) {
+            continue;
+        }
+        if (track.indirect_no_hand_match_count > 0 ||
+            track.has_indirect_candidate_box) {
+            trace_("INDIRECT-MOVE",
+                   "item=%d action=reset-no-hand-continuity reason=hand-returned",
+                   track.item_id);
+        }
+        track.indirect_no_hand_detection_index = -1;
+        track.indirect_no_hand_match_count = 0;
+        track.has_indirect_candidate_box = false;
+        track.indirect_candidate_box = BBox();
+        track.indirect_assignment_ambiguous = false;
+    }
+
     // 先更新已有 HAND_*；随后先为仍稳定可见的旧库存保留本帧自己的
     // 严格框，再处理新进入 HAND_* 的物品。这个先后顺序很关键：若旧
     // 苹果已有完整框，旁边贴手的新苹果不能先被“局部可能属于旧苹果”
@@ -4327,12 +4572,478 @@ void SessionManager::register_post_hand_reveal_suspects_(
     }
 }
 
+void SessionManager::prepare_indirect_move_candidates_(
+        const std::vector<Detection>& detections) {
+    // 这一步只在无手阶段准备可撤销的 B/C 候选。最终是否更新库存仍要等
+    // 各自连续的直接无手框，不能由 A 的手轨迹或 detection input index 决定。
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (track.is_suspect_new) continue;
+        track.indirect_no_hand_detection_index = -1;
+        if (track.indirect_move_candidate && !existing_track_is_terminal(track)) {
+            track.indirect_assignment_ambiguous = false;
+        }
+    }
+
+    std::map<int, IndirectMoveSource> sources;
+    for (std::map<int, OperationTrack>::const_iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        const OperationTrack& track = it->second;
+        BBox observed;
+        if (!direct_track_has_observed_motion(track, &observed)) continue;
+        std::map<int, InventoryItem>::const_iterator original =
+            operation_start_inventory_.find(track.item_id);
+        if (original == operation_start_inventory_.end()) continue;
+        const BBox start = original->second.base_box.area() > 0.0f
+            ? original->second.base_box : original->second.box;
+        const float dx = observed.cx() - start.cx();
+        const float dy = observed.cy() - start.cy();
+        const float length = std::sqrt(dx * dx + dy * dy);
+        if (start.area() <= 0.0f || length <= 0.0f) continue;
+
+        IndirectMoveSource source;
+        source.item_id = track.item_id;
+        source.original_box = start;
+        source.observed_box = observed;
+        source.axis_x = dx / length;
+        source.axis_y = dy / length;
+        sources[source.item_id] = source;
+    }
+    if (sources.empty()) return;
+
+    const std::map<int, int> static_owner_by_detection =
+        build_independent_no_hand_static_owner_by_detection(
+            detections, working_inventory_, operation_start_inventory_, track_buffer_);
+    std::map<int, IndirectMoveAssignment> assignments;
+    std::map<int, int> assignment_owner_by_detection;
+    std::set<int> ambiguous_item_ids;
+
+    for (std::map<int, IndirectMoveSource>::const_iterator source_it = sources.begin();
+         source_it != sources.end(); ++source_it) {
+        const IndirectMoveSource& source = source_it->second;
+        std::vector<int> cluster_item_ids(1, source.item_id);
+        std::set<int> possible_indirect_item_ids;
+
+        // 以 operation-start 的物理相邻关系扩展连通分量。随后仍要通过每个
+        // 成员自己的最终框、方向和连续无手帧确认，所以“相邻”本身不产生事件。
+        for (size_t cursor = 0; cursor < cluster_item_ids.size(); ++cursor) {
+            const int anchor_id = cluster_item_ids[cursor];
+            std::map<int, InventoryItem>::const_iterator anchor =
+                operation_start_inventory_.find(anchor_id);
+            if (anchor == operation_start_inventory_.end()) continue;
+            const BBox anchor_box = anchor->second.base_box.area() > 0.0f
+                ? anchor->second.base_box : anchor->second.box;
+            for (std::map<int, InventoryItem>::const_iterator candidate =
+                     operation_start_inventory_.begin();
+                 candidate != operation_start_inventory_.end(); ++candidate) {
+                const int item_id = candidate->first;
+                if (std::find(cluster_item_ids.begin(), cluster_item_ids.end(), item_id) !=
+                    cluster_item_ids.end()) {
+                    continue;
+                }
+                if (!working_inventory_.count(item_id) || pending_out_ids_.count(item_id)) {
+                    continue;
+                }
+                const OperationTrack* runtime = find_runtime_for_item_(item_id);
+                if (runtime && !runtime->is_suspect_new &&
+                    existing_track_is_terminal(*runtime) && item_id != source.item_id) {
+                    continue;
+                }
+                const BBox candidate_box = candidate->second.base_box.area() > 0.0f
+                    ? candidate->second.base_box : candidate->second.box;
+                if (boxes_are_adjacent_for_indirect_chain(anchor_box, candidate_box)) {
+                    cluster_item_ids.push_back(item_id);
+                }
+            }
+        }
+        if (cluster_item_ids.size() <= 1) continue;
+        trace_("CLUSTER-ASSIGN",
+               "cluster=%d axis=(%.4f,%.4f) source-start=(%.1f,%.1f,%.1f,%.1f) "
+               "source-observed=(%.1f,%.1f,%.1f,%.1f) start-members=%zu action=evaluate",
+               source.item_id, source.axis_x, source.axis_y,
+               source.original_box.x1, source.original_box.y1,
+               source.original_box.x2, source.original_box.y2,
+               source.observed_box.x1, source.observed_box.y1,
+               source.observed_box.x2, source.observed_box.y2,
+               cluster_item_ids.size());
+
+        std::map<int, std::vector<int> > item_ids_by_class;
+        for (size_t i = 0; i < cluster_item_ids.size(); ++i) {
+            const int item_id = cluster_item_ids[i];
+            std::map<int, InventoryItem>::const_iterator original =
+                operation_start_inventory_.find(item_id);
+            if (original == operation_start_inventory_.end() ||
+                !working_inventory_.count(item_id) || pending_out_ids_.count(item_id)) {
+                continue;
+            }
+            item_ids_by_class[original->second.cls_id].push_back(item_id);
+        }
+
+        // 在按 cls_id 分组前先记录整个簇中已有自身前向候选的旧成员。后续
+        // 任一类别的漏检或歧义都会使整簇无法安全分配，不能因为失败类别
+        // 恰好排在 B 前面，就让尚未遍历的 B 回落为普通静态收尾。
+        for (size_t mi = 0; mi < cluster_item_ids.size(); ++mi) {
+            const int item_id = cluster_item_ids[mi];
+            if (sources.count(item_id)) continue;
+            const InventoryItem& original =
+                operation_start_inventory_.find(item_id)->second;
+            const BBox start = original.base_box.area() > 0.0f
+                ? original.base_box : original.box;
+            for (size_t di = 0; di < detections.size(); ++di) {
+                const Detection& detection = detections[di];
+                if (detection.cls_id != original.cls_id ||
+                    detection_conflicts_with_pending_suspect_d(detection, track_buffer_)) {
+                    continue;
+                }
+                const std::map<int, int>::const_iterator static_owner =
+                    static_owner_by_detection.find(static_cast<int>(di));
+                if (static_owner != static_owner_by_detection.end() &&
+                    std::find(cluster_item_ids.begin(), cluster_item_ids.end(),
+                              static_owner->second) == cluster_item_ids.end()) {
+                    continue;
+                }
+                if (!indirect_member_matches_detection(original, detection)) continue;
+                const float dx = detection.box.cx() - start.cx();
+                const float dy = detection.box.cy() - start.cy();
+                if (center_distance(start, detection.box) > 0.0f &&
+                    dx * source.axis_x + dy * source.axis_y > 0.0f) {
+                    possible_indirect_item_ids.insert(item_id);
+                    break;
+                }
+            }
+        }
+
+        std::map<int, int> final_detection_by_item;
+        bool cluster_assignment_valid = true;
+        for (std::map<int, std::vector<int> >::const_iterator grouped =
+                 item_ids_by_class.begin(); grouped != item_ids_by_class.end(); ++grouped) {
+            const int cls_id = grouped->first;
+            std::vector<int> members = grouped->second;
+            std::vector<int> candidates;
+            for (size_t di = 0; di < detections.size(); ++di) {
+                const Detection& detection = detections[di];
+                if (detection.cls_id != cls_id ||
+                    detection_conflicts_with_pending_suspect_d(detection, track_buffer_)) {
+                    continue;
+                }
+                const std::map<int, int>::const_iterator static_owner =
+                    static_owner_by_detection.find(static_cast<int>(di));
+                if (static_owner != static_owner_by_detection.end() &&
+                    std::find(cluster_item_ids.begin(), cluster_item_ids.end(),
+                              static_owner->second) == cluster_item_ids.end()) {
+                    continue;
+                }
+
+                bool matches_cluster_member = false;
+                for (size_t mi = 0; mi < members.size(); ++mi) {
+                    const int item_id = members[mi];
+                    const std::map<int, IndirectMoveSource>::const_iterator direct =
+                        sources.find(item_id);
+                    if (direct != sources.end()) {
+                        matches_cluster_member =
+                            track_match_box(cls_id, direct->second.observed_box,
+                                            detection.cls_id, detection.box) ||
+                            strict_match_box(cls_id, direct->second.observed_box,
+                                             detection.cls_id, detection.box);
+                    } else {
+                        const std::map<int, InventoryItem>::const_iterator original =
+                            operation_start_inventory_.find(item_id);
+                        matches_cluster_member = original != operation_start_inventory_.end() &&
+                            indirect_member_matches_detection(original->second, detection);
+                    }
+                    if (matches_cluster_member) break;
+                }
+                if (matches_cluster_member) candidates.push_back(static_cast<int>(di));
+            }
+
+            std::sort(members.begin(), members.end(),
+                      [this, &source](int left, int right) {
+                          const InventoryItem& left_item =
+                              operation_start_inventory_.find(left)->second;
+                          const InventoryItem& right_item =
+                              operation_start_inventory_.find(right)->second;
+                          const BBox left_box = left_item.base_box.area() > 0.0f
+                              ? left_item.base_box : left_item.box;
+                          const BBox right_box = right_item.base_box.area() > 0.0f
+                              ? right_item.base_box : right_item.box;
+                          return indirect_projection(left_box, source.axis_x, source.axis_y) <
+                              indirect_projection(right_box, source.axis_x, source.axis_y);
+                      });
+            std::sort(candidates.begin(), candidates.end(),
+                      [&detections, &source](int left, int right) {
+                          return indirect_projection(detections[left].box,
+                                                     source.axis_x, source.axis_y) <
+                              indirect_projection(detections[right].box,
+                                                  source.axis_x, source.axis_y);
+                      });
+
+            bool has_projection_tie = false;
+            for (size_t i = 1; i < members.size(); ++i) {
+                const InventoryItem& previous =
+                    operation_start_inventory_.find(members[i - 1])->second;
+                const InventoryItem& current =
+                    operation_start_inventory_.find(members[i])->second;
+                const BBox previous_box = previous.base_box.area() > 0.0f
+                    ? previous.base_box : previous.box;
+                const BBox current_box = current.base_box.area() > 0.0f
+                    ? current.base_box : current.box;
+                if (std::fabs(indirect_projection(previous_box, source.axis_x, source.axis_y) -
+                              indirect_projection(current_box, source.axis_x, source.axis_y)) <=
+                    0.0001f) {
+                    has_projection_tie = true;
+                }
+            }
+            for (size_t i = 1; i < candidates.size(); ++i) {
+                if (std::fabs(indirect_projection(detections[candidates[i - 1]].box,
+                                                   source.axis_x, source.axis_y) -
+                              indirect_projection(detections[candidates[i]].box,
+                                                   source.axis_x, source.axis_y)) <= 0.0001f) {
+                    has_projection_tie = true;
+                }
+            }
+
+            if (candidates.size() != members.size() || has_projection_tie) {
+                cluster_assignment_valid = false;
+            } else {
+                for (size_t i = 0; i < members.size(); ++i) {
+                    const int item_id = members[i];
+                    const Detection& detection = detections[candidates[i]];
+                    bool own_identity_match = false;
+                    const std::map<int, IndirectMoveSource>::const_iterator direct =
+                        sources.find(item_id);
+                    if (direct != sources.end()) {
+                        own_identity_match = track_match_box(
+                            cls_id, direct->second.observed_box,
+                            detection.cls_id, detection.box);
+                    } else {
+                        own_identity_match = indirect_member_matches_detection(
+                            operation_start_inventory_.find(item_id)->second, detection);
+                    }
+                    if (!own_identity_match) {
+                        cluster_assignment_valid = false;
+                        break;
+                    }
+                    final_detection_by_item[item_id] = candidates[i];
+                }
+            }
+
+            if (!cluster_assignment_valid) {
+                trace_("CLUSTER-ASSIGN",
+                       "cluster=%d cls=%d axis=(%.4f,%.4f) start-members=%zu "
+                       "final-candidates=%zu projection-tie=%d action=reject-unresolved",
+                       source.item_id, cls_id, source.axis_x, source.axis_y,
+                       members.size(), candidates.size(), has_projection_tie ? 1 : 0);
+                ambiguous_item_ids.insert(possible_indirect_item_ids.begin(),
+                                          possible_indirect_item_ids.end());
+                break;
+            }
+        }
+        if (!cluster_assignment_valid) continue;
+
+        std::vector<int> ordered_cluster(cluster_item_ids);
+        std::sort(ordered_cluster.begin(), ordered_cluster.end(),
+                  [this, &source](int left, int right) {
+                      const InventoryItem& left_item =
+                          operation_start_inventory_.find(left)->second;
+                      const InventoryItem& right_item =
+                          operation_start_inventory_.find(right)->second;
+                      const BBox left_box = left_item.base_box.area() > 0.0f
+                          ? left_item.base_box : left_item.box;
+                      const BBox right_box = right_item.base_box.area() > 0.0f
+                          ? right_item.base_box : right_item.box;
+                      return indirect_projection(left_box, source.axis_x, source.axis_y) <
+                          indirect_projection(right_box, source.axis_x, source.axis_y);
+                  });
+        std::map<int, bool> member_moves_forward;
+        for (size_t i = 0; i < ordered_cluster.size(); ++i) {
+            const int item_id = ordered_cluster[i];
+            std::map<int, int>::const_iterator final = final_detection_by_item.find(item_id);
+            if (final == final_detection_by_item.end()) continue;
+            const InventoryItem& original =
+                operation_start_inventory_.find(item_id)->second;
+            const BBox start = original.base_box.area() > 0.0f
+                ? original.base_box : original.box;
+            const BBox& finish = detections[final->second].box;
+            const float dx = finish.cx() - start.cx();
+            const float dy = finish.cy() - start.cy();
+            member_moves_forward[item_id] = sources.count(item_id) ||
+                (center_distance(start, finish) > 0.0f &&
+                 dx * source.axis_x + dy * source.axis_y > 0.0f);
+        }
+
+        size_t source_position = ordered_cluster.size();
+        for (size_t i = 0; i < ordered_cluster.size(); ++i) {
+            if (ordered_cluster[i] == source.item_id) {
+                source_position = i;
+                break;
+            }
+        }
+        if (source_position == ordered_cluster.size()) continue;
+
+        for (size_t i = source_position + 1; i < ordered_cluster.size(); ++i) {
+            const int item_id = ordered_cluster[i];
+            if (sources.count(item_id) || !member_moves_forward[item_id]) continue;
+            const int predecessor = ordered_cluster[i - 1];
+            if (!member_moves_forward[predecessor]) continue;
+            // 前驱本身无法安全归属时，后续成员也不能把它当作已确认推动链
+            // 的一环。保留整条下游链未决，比跳过中间身份继续确认更安全。
+            if (ambiguous_item_ids.count(predecessor)) {
+                ambiguous_item_ids.insert(item_id);
+                continue;
+            }
+            std::map<int, int>::const_iterator final = final_detection_by_item.find(item_id);
+            if (final == final_detection_by_item.end()) continue;
+
+            const OperationTrack* runtime = find_runtime_for_item_(item_id);
+            if ((runtime && runtime->is_suspect_new) ||
+                (runtime && is_active_runtime_track(*runtime) &&
+                 !runtime->indirect_move_candidate) ||
+                (runtime && old_track_has_unresolved_alias_(*runtime))) {
+                ambiguous_item_ids.insert(item_id);
+                continue;
+            }
+
+            IndirectMoveAssignment assignment;
+            assignment.item_id = item_id;
+            assignment.detection_index = final->second;
+            assignment.predecessor_item_id = predecessor;
+            assignment.cluster_id = source.item_id;
+            std::map<int, IndirectMoveAssignment>::const_iterator existing =
+                assignments.find(item_id);
+            if (existing != assignments.end() &&
+                (existing->second.detection_index != assignment.detection_index ||
+                 existing->second.predecessor_item_id != assignment.predecessor_item_id)) {
+                ambiguous_item_ids.insert(item_id);
+                continue;
+            }
+            std::map<int, int>::const_iterator detection_owner =
+                assignment_owner_by_detection.find(assignment.detection_index);
+            if (detection_owner != assignment_owner_by_detection.end() &&
+                detection_owner->second != item_id) {
+                ambiguous_item_ids.insert(item_id);
+                ambiguous_item_ids.insert(detection_owner->second);
+                continue;
+            }
+            assignments[item_id] = assignment;
+            assignment_owner_by_detection[assignment.detection_index] = item_id;
+        }
+    }
+
+    const auto ensure_indirect_track = [this](int item_id) -> OperationTrack* {
+        OperationTrack* existing = find_runtime_for_item_(item_id);
+        if (existing) return existing;
+        std::map<int, InventoryItem>::const_iterator original =
+            operation_start_inventory_.find(item_id);
+        if (original == operation_start_inventory_.end()) return nullptr;
+        OperationTrack track;
+        track.item_id = item_id;
+        track.cls_id = original->second.cls_id;
+        track.original_box = original->second.base_box.area() > 0.0f
+            ? original->second.base_box : original->second.box;
+        track.last_seen_box = track.original_box;
+        track.has_last_seen_box = track.original_box.area() > 0.0f;
+        track.needs_no_hand_settlement = true;
+        track_buffer_[item_id] = track;
+        return &track_buffer_[item_id];
+    };
+
+    for (std::set<int>::const_iterator item = ambiguous_item_ids.begin();
+         item != ambiguous_item_ids.end(); ++item) {
+        OperationTrack* track = ensure_indirect_track(*item);
+        if (!track || track->is_suspect_new ||
+            (is_active_runtime_track(*track) && !track->indirect_move_candidate)) {
+            continue;
+        }
+        track->indirect_move_candidate = true;
+        track->indirect_assignment_ambiguous = true;
+        track->indirect_no_hand_detection_index = -1;
+        track->indirect_no_hand_match_count = 0;
+        track->needs_no_hand_settlement = true;
+        track->resolution = ExistingItemResolution::NONE;
+        trace_("UNRESOLVED",
+               "item=%d reason=indirect-cluster-assignment-ambiguous action=wait",
+               *item);
+    }
+
+    for (std::map<int, IndirectMoveAssignment>::const_iterator assigned =
+             assignments.begin(); assigned != assignments.end(); ++assigned) {
+        if (ambiguous_item_ids.count(assigned->first)) continue;
+        const IndirectMoveAssignment& assignment = assigned->second;
+        if (assignment.detection_index < 0 ||
+            static_cast<size_t>(assignment.detection_index) >= detections.size()) {
+            continue;
+        }
+        OperationTrack* track = ensure_indirect_track(assignment.item_id);
+        if (!track || track->is_suspect_new ||
+            (is_active_runtime_track(*track) && !track->indirect_move_candidate) ||
+            old_track_has_unresolved_alias_(*track)) {
+            continue;
+        }
+        const Detection& detection = detections[assignment.detection_index];
+        const bool continuous = track->has_indirect_candidate_box &&
+            track_match_box(track->cls_id, track->indirect_candidate_box,
+                            detection.cls_id, detection.box);
+        if (!continuous) {
+            track->indirect_no_hand_match_count = 1;
+        } else {
+            ++track->indirect_no_hand_match_count;
+        }
+        track->indirect_move_candidate = true;
+        track->indirect_assignment_ambiguous = false;
+        track->indirect_predecessor_item_id = assignment.predecessor_item_id;
+        track->indirect_cluster_id = assignment.cluster_id;
+        track->indirect_no_hand_detection_index = assignment.detection_index;
+        track->indirect_candidate_box = detection.box;
+        track->has_indirect_candidate_box = true;
+        track->needs_no_hand_settlement = true;
+        track->resolution = ExistingItemResolution::NONE;
+        set_live_state_(track, LiveObservationState::POSSIBLE_MOVED, true,
+                        "indirect-chain-candidate");
+        const std::map<int, IndirectMoveSource>::const_iterator source =
+            sources.find(assignment.cluster_id);
+        const float axis_x = source == sources.end() ? 0.0f : source->second.axis_x;
+        const float axis_y = source == sources.end() ? 0.0f : source->second.axis_y;
+        trace_("CLUSTER-ASSIGN",
+               "cluster=%d axis=(%.4f,%.4f) item=%d predecessor=%d detection=%d "
+               "count=%d/%d original=(%.1f,%.1f,%.1f,%.1f) "
+               "final=(%.1f,%.1f,%.1f,%.1f)",
+               assignment.cluster_id, axis_x, axis_y,
+               assignment.item_id, assignment.predecessor_item_id,
+               assignment.detection_index,
+               track->indirect_no_hand_match_count, FLOW3_NO_HAND_D_CONFIRM_FRAMES,
+               track->original_box.x1, track->original_box.y1,
+               track->original_box.x2, track->original_box.y2,
+               detection.box.x1, detection.box.y1, detection.box.x2, detection.box.y2);
+    }
+
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (track.is_suspect_new || !track.indirect_move_candidate ||
+            existing_track_is_terminal(track) ||
+            assignments.count(track.item_id) || ambiguous_item_ids.count(track.item_id)) {
+            continue;
+        }
+        track.indirect_assignment_ambiguous = true;
+        track.indirect_no_hand_detection_index = -1;
+        track.indirect_no_hand_match_count = 0;
+        trace_("UNRESOLVED",
+               "item=%d reason=indirect-candidate-lost-continuous-assignment action=wait",
+               track.item_id);
+    }
+}
+
 void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detections) {
     std::set<int> claimed;
     std::vector<int> promote_keys;
     std::set<int> discard_keys;
     std::set<int> discard_settled_old_c_duplicate_keys;
     std::set<int> discard_stale_alias_keys;
+
+    // 细节15：先完成移动簇的批量候选映射，再让既有 C/D 逐项处理。这样
+    // 普通静态预约不能按 map 遍历顺序抢走已经唯一属于移动簇成员的框。
+    prepare_indirect_move_candidates_(detections);
     const std::map<int, int> independent_static_owner_by_detection =
         build_independent_no_hand_static_owner_by_detection(
             detections, working_inventory_, operation_start_inventory_, track_buffer_);
@@ -4349,6 +5060,48 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
         }
     }
 
+    // 对已经由批量分配得到唯一最终框的间接成员，先保留自己的框并只累计
+    // 自己的连续无手直接观测。首帧不写库存；第二张连续帧才做位置更新。
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        OperationTrack& track = it->second;
+        if (track.is_suspect_new || !track.indirect_move_candidate) continue;
+        if (track.indirect_assignment_ambiguous ||
+            track.indirect_no_hand_detection_index < 0 ||
+            static_cast<size_t>(track.indirect_no_hand_detection_index) >= detections.size()) {
+            trace_("UNRESOLVED",
+                   "item=%d reason=indirect-cluster-no-unique-direct-detection action=wait",
+                   track.item_id);
+            continue;
+        }
+        const int detection_index = track.indirect_no_hand_detection_index;
+        if (claimed.count(detection_index)) {
+            track.indirect_assignment_ambiguous = true;
+            track.indirect_no_hand_match_count = 0;
+            trace_("UNRESOLVED",
+                   "item=%d detection=%d reason=indirect-cluster-detection-already-claimed action=wait",
+                   track.item_id, detection_index);
+            continue;
+        }
+        const Detection& detection = detections[detection_index];
+        claimed.insert(detection_index);
+        track.no_hand_detection_index = detection_index;
+        if (track.indirect_no_hand_match_count < FLOW3_NO_HAND_D_CONFIRM_FRAMES) {
+            trace_("INDIRECT-MOVE",
+                   "item=%d predecessor=%d cluster=%d detection=%d action=wait-direct-continuity "
+                   "count=%d/%d",
+                   track.item_id, track.indirect_predecessor_item_id,
+                   track.indirect_cluster_id, detection_index,
+                   track.indirect_no_hand_match_count,
+                   FLOW3_NO_HAND_D_CONFIRM_FRAMES);
+            continue;
+        }
+        const bool emit_moved = boxes_differ_as_move(track.original_box, detection.box);
+        confirm_position_rebase_(track, detection.box, detection.score, trace_frame_id_,
+                                 emit_moved,
+                                 "indirect-move-after-continuous-direct-evidence");
+    }
+
     // 认领顺序必须是：已有 C -> 没有手离开后新建的已有 D -> 剩余 B 的
     // POST_HAND_REVEAL_D。track_buffer_ 的负 id 是 D，若直接按 map 遍历，
     // D 会先于 C 抢框，故显式分两轮处理。
@@ -4361,6 +5114,12 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 existing_item_needs_settlement(track);
             if (track.is_suspect_new != process_suspects ||
                 (!is_active_runtime_track(track) && !existing_needs_settlement)) {
+                continue;
+            }
+
+            // 间接成员已在上面的批量阶段处理。未满连续帧时必须保持未决，
+            // 不能重新退回逐项 C->B/D 逻辑而破坏本帧顺序保持的映射。
+            if (!track.is_suspect_new && track.indirect_move_candidate) {
                 continue;
             }
 
@@ -5027,17 +5786,17 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                                       &d.box,
                                       "no-hand-original");
                 } else {
-                    // r16：普通原位 release 已因 CONTACT 的 12px 门槛被
-                    // 拒绝时，只有这个旧 C 自己连续两张唯一、尺度一致的
-                    // 无手近原位框才可完成静态结算。这里绝不改动 D 的
-                    // alias 仲裁；C 结算后，后续 phase=1 仍完全走 r15。
-                    const bool may_be_static_gray_zone_old_c =
+                    // r16：普通原位 release 未成立时，只有这个旧 C 自己
+                    // 连续两张唯一、尺度一致的无手直接框才可位置重同步。
+                    // 这里绝不改动 D 的 alias 仲裁；C 结算后，后续 phase=1
+                    // 仍完全走 r15。
+                    const bool may_be_stable_rebase_old_c =
                         track.state == OperationTrackState::NORMAL &&
                         track.contact_state == ContactState::NONE &&
                         track.resolution == ExistingItemResolution::STATIC_CONFIRMED &&
                         track.needs_no_hand_settlement &&
                         track.has_hand_estimate_anchor_box;
-                    if (may_be_static_gray_zone_old_c &&
+                    if (may_be_stable_rebase_old_c &&
                         try_release_stable_near_original_no_hand_(
                             &track, found, d,
                             independent_static_owner_by_detection,
@@ -5131,6 +5890,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             working_inventory_.erase(item_id);
             pending_in_ids_.erase(item_id);
             confirmed_moved_ids_.erase(item_id);
+            confirmed_position_update_ids_.erase(item_id);
             pending_out_ids_.erase(item_id);
         }
         track_buffer_.erase(track);
@@ -5849,6 +6609,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         }
         if (!runtime_has_ambiguous_b &&
             (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first) ||
+             confirmed_position_update_ids_.count(it->first) ||
             (!runtime_in_claim_grace && runtime && (runtime->hold_and_move ||
                          runtime->contact_state != ContactState::NONE ||
                          (has_meaningful_hand_move(*runtime) &&
@@ -5970,7 +6731,8 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         observed_ids.insert(it->first);
         InventoryItem& item = final_items[it->first];
         update_seen(item, observed[it->second], frame_id);
-        if (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first)) {
+        if (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first) ||
+            confirmed_position_update_ids_.count(it->first)) {
             item.base_box = observed[it->second].box;
         }
         item.status = ItemStatus::VISIBLE;
@@ -6191,7 +6953,7 @@ FrameProcessResult SessionManager::process_frame(
         for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
              it != track_buffer_.end(); ++it) {
             OperationTrack& track = it->second;
-            // r16 的静态近原位证据只允许来自连续无手帧。手重新出现时，
+            // r16 的稳定位置重同步证据只允许来自连续无手帧。手重新出现时，
             // 无论手是否接触该 C，都不能把前后两段无手证据拼在一起。
             if (!track.is_suspect_new) {
                 reset_stable_near_original_no_hand_evidence_(

@@ -88,6 +88,9 @@ enum class ExistingItemResolution {
     NONE,
     STATIC_CONFIRMED,
     MOVED_CONFIRMED,
+    // 本次操作内已经由自己的连续直接框确认了最终位置，但不应产生
+    // 正式 MOVED 事件。用于小幅间接位移和 STABLE-REBASE。
+    POSITION_REBASED,
     OUT_CONFIRMED,
     OCCLUDED_CONFIRMED,
 };
@@ -187,12 +190,24 @@ struct OperationTrack {
     // 旧 C 在无手阶段未被直接认领、也没有完整遮挡解释的连续次数。
     int no_hand_missing_count = 0;
 
-    // r16：仅用于 operation-start 旧 C 的无手静态灰区收尾。它不能与
+    // r16：仅用于 operation-start 旧 C 的连续无手稳定框重同步。它不能与
     // OUT 缺失、alias D 缺失或 D 的直接匹配计数混用。两张连续、唯一且
-    // 尺度一致的近原位直接框，才允许旧 C 走既有 release 语义。
+    // 尺度一致的直接框，才允许没有推动链的旧 C 更新位置而不产生 MOVED。
     int stable_near_original_no_hand_count = 0;
     bool has_stable_near_original_box = false;
     BBox stable_near_original_box;
+
+    // 细节15：B/C 没有被手直接持有，但在本次操作中有可解释的前驱物品
+    // 和自己的连续直接检测框。该状态只存在于 operation runtime，不能被
+    // 伪装成 HAND_* / CONTACT_*，也不能单帧写入库存。
+    bool indirect_move_candidate = false;
+    bool indirect_assignment_ambiguous = false;
+    int indirect_predecessor_item_id = -1;
+    int indirect_cluster_id = -1;
+    int indirect_no_hand_detection_index = -1;
+    int indirect_no_hand_match_count = 0;
+    bool has_indirect_candidate_box = false;
+    BBox indirect_candidate_box;
 
     // C-D alias 只存在于当前手操作的运行时层。被隔离的 D 仍逐帧更新，
     // 但在有手阶段不得写入 working_inventory_ 成为正式/排他所有者。
@@ -334,6 +349,10 @@ private:
 
     // 手离开后的收尾与提交
     void observe_no_hand_frame_(const std::vector<Detection>& detections);
+    // 细节15：以直接活动旧物品为源，预先为被碰撞/推挤的 operation-start
+    // 旧物品建立同类顺序保持的无手直接观测候选。这里只记录可撤销证据，
+    // 真正写库存由 observe_no_hand_frame_ 中的连续确认完成。
+    void prepare_indirect_move_candidates_(const std::vector<Detection>& detections);
     void register_post_hand_reveal_suspects_(
         const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices);
@@ -356,13 +375,19 @@ private:
                           int frame_id);
     void confirm_rearrange_(OperationTrack& track, const BBox& release_box,
                             float score, int frame_id);
+    // 已确认的最终位置与正式 MOVED 事件分离。小幅间接位移和稳定框重同步
+    // 只进入 confirmed_position_update_ids_；满足原有正式门槛的间接位移才
+    // 同时进入 confirmed_moved_ids_。
+    void confirm_position_rebase_(OperationTrack& track, const BBox& release_box,
+                                  float score, int frame_id, bool emit_moved,
+                                  const char* reason);
     void release_not_held_(OperationTrack& track, bool occluded,
                            ReleaseReason reason,
                            int evidence_detection_index = -1,
                            const BBox* evidence_box = nullptr,
                            const char* caller = nullptr);
-    // r16 的窄收尾：只处理有手后已暂时静态、但框抖动落在 CONTACT 原位
-    // 门槛与正式 MOVED 门槛之间的 operation-start 旧 C。
+    // r16 的窄收尾：只处理有手后已暂时静态、没有直接或间接移动证据、
+    // 但自己的最终直接框连续稳定的 operation-start 旧 C。
     bool try_release_stable_near_original_no_hand_(
         OperationTrack* track, int detection_index, const Detection& detection,
         const std::map<int, int>& independent_static_owner_by_detection,
@@ -394,6 +419,7 @@ private:
     std::set<int> pending_in_ids_;
     std::set<int> pending_out_ids_;
     std::set<int> confirmed_moved_ids_;
+    std::set<int> confirmed_position_update_ids_;
     std::set<int> released_hand_candidate_ids_;
     // 每张无手帧的同类“一框一物品”保留结果。key 是 detection index，
     // value 是唯一保留该框的旧 item_id；同一框绝不再同时阻止其他 C 的 OUT。

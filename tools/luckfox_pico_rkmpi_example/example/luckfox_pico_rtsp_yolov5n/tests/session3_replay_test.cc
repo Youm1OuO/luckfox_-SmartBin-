@@ -76,6 +76,35 @@ fridge::SettlementResult settle_after_hand(
     return result;
 }
 
+// 细节15测试共用的有手阶段：手只直接覆盖 A；B/C 与手保持足够距离，
+// 它们若移动只能通过 A 的碰撞/推挤链被解释，不能伪装成直接 HAND_*。
+void send_indirect_move_hand_sequence_with_hands(
+        fridge::SessionManager* session,
+        const std::vector<fridge::Detection>& initial_foods,
+        const std::vector<fridge::Detection>& moved_foods,
+        const fridge::BBox& hand0, const fridge::BBox& hand1, int* frame) {
+    send_frame(session, initial_foods,
+               std::vector<fridge::BBox>(1, hand0), frame);
+    send_frame(session, moved_foods,
+               std::vector<fridge::BBox>(1, hand1), frame);
+    // 让 A 的既有 claim grace 结束，并保留 A 自己的真实最终检测框；手
+    // 没有再接近 B/C，因此不能直接为它们建立 CONTACT_*。
+    send_frame(session, moved_foods,
+               std::vector<fridge::BBox>(1, hand1), frame);
+    send_frame(session, moved_foods,
+               std::vector<fridge::BBox>(1, hand1), frame);
+}
+
+void send_indirect_move_hand_sequence(
+        fridge::SessionManager* session,
+        const std::vector<fridge::Detection>& initial_foods,
+        const std::vector<fridge::Detection>& moved_foods, int* frame) {
+    const fridge::BBox hand0(80, 80, 250, 320);
+    const fridge::BBox hand1(130, 80, 300, 320);
+    send_indirect_move_hand_sequence_with_hands(
+        session, initial_foods, moved_foods, hand0, hand1, frame);
+}
+
 void test_move_keeps_identity() {
     fridge::SessionManager session;
     session.start_new_session();
@@ -1771,9 +1800,9 @@ void test_no_hand_occlusion_uses_cover_union() {
 }
 
 // 细节13 / r16：手边短暂出现同类低分假框时，r15 必须先保护 alias D。
-// 这里的旧苏打罐 C 有自己的无手直接框，但其中心偏移约 14.4px：超过
-// CONTACT 原位 12px、低于正式 MOVED 28px。C 需要先用两张尺度一致的
-// 无手框完成静态 release，之后 r15 才能按既有两帧缺失规则回收 fake D。
+// 这里的旧苏打罐 C 有自己的无手直接框，但最终框稳定偏移 50px，已经超过
+// 正式 MOVED 28px。没有直接或间接移动证据时，它仍只能走 STABLE-REBASE，
+// 不产生伪 MOVED；之后 r15 才能按既有两帧缺失规则回收 fake D。
 // 同一轮操作中的苹果 A 仍必须正常提交 MOVED。
 void test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup() {
     fridge::SessionManager session;
@@ -1835,11 +1864,11 @@ void test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup() {
     assert(after_hand.find(2)->second.needs_no_hand_settlement);
     assert(after_hand.find(2)->second.has_hand_estimate_anchor_box);
 
-    // 真实 C 的无手框相对 original 的中心偏移为约 14.4px，严格位于
-    // 现有 12px CONTACT 门槛与 28px 正式 MOVED 门槛之间。
+    // 真实 C 的无手框相对 original 的中心偏移为 50px，超过既有正式
+    // MOVED 门槛；本例没有推动链，验证它只会位置重同步而不会伪造 MOVED。
     std::vector<fridge::Detection> no_hand;
     no_hand.push_back(det(0, 580, 100, 680, 200));
-    no_hand.push_back(det(25, 145, 141, 392, 407));
+    no_hand.push_back(det(25, 113, 138, 351, 400));
 
     const int first_no_hand = frame++;
     fridge::FrameProcessResult first = session.process_frame(
@@ -1875,6 +1904,8 @@ void test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup() {
         session.operation_tracks();
     assert(after_second.find(2) != after_second.end());
     assert(!after_second.find(2)->second.needs_no_hand_settlement);
+    assert(after_second.find(2)->second.resolution ==
+           fridge::ExistingItemResolution::POSITION_REBASED);
     assert(after_second.find(2)->second.release_reason ==
            fridge::ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND);
     assert(after_second.find(2)->second.stable_near_original_no_hand_count == 0);
@@ -1904,6 +1935,7 @@ void test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup() {
     assert(final_c != 0);
     assert(final_c->cls_id == 25);
     assert(final_c->status == fridge::ItemStatus::VISIBLE);
+    assert(final_c->base_box.x1 == 113.0f);
     assert(has_event(third.settlement, fridge::EventKind::MOVED, 1));
     assert(!has_event(third.settlement, fridge::EventKind::MOVED, 2));
     assert(!has_event(third.settlement, fridge::EventKind::IN, 3));
@@ -2350,6 +2382,323 @@ void test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes() 
     assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
 }
 
+// 细节15-1：A 被直接移动后碰到不同类 B。B 从未被手框覆盖，但有自己
+// 连续的无手直接框；位移超过既有 28px 门槛时，B 必须保留原 item_id 并
+// 输出 MOVED，而不是卡住、OUT 或新 IN。
+void test_indirect_different_class_formal_move_keeps_identity() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 300, 300));  // directly moved A
+    initial.push_back(item(2, 1, 340, 100, 540, 300));  // indirectly moved B
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(1, 340, 100, 540, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(det(0, 220, 100, 420, 300));
+    final_boxes.push_back(det(1, 380, 100, 580, 300));
+    send_indirect_move_hand_sequence(&session, stable, final_boxes, &frame);
+
+    fridge::SettlementResult result = settle_after_hand(&session, final_boxes, &frame);
+    assert(result.committed);
+    const fridge::InventoryItem* a = session.inventory().find_by_item(1);
+    const fridge::InventoryItem* b = session.inventory().find_by_item(2);
+    assert(a != 0 && b != 0);
+    assert(b->cls_id == 1);
+    assert(b->base_box.x1 == 380.0f);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(has_event(result, fridge::EventKind::MOVED, 2));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+}
+
+// 细节15-2：意外轻碰后的 B 虽然最终位置变化，但没有达到既有正式
+// MOVED 门槛。库存位置仍要同步，且不能凭小位移制造 MOVED/IN/OUT。
+void test_indirect_different_class_small_move_rebases_without_moved() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 300, 300));
+    initial.push_back(item(2, 1, 340, 100, 540, 300));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(1, 340, 100, 540, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(det(0, 220, 100, 420, 300));
+    final_boxes.push_back(det(1, 355, 100, 555, 300));
+    send_indirect_move_hand_sequence(&session, stable, final_boxes, &frame);
+
+    fridge::SettlementResult result = settle_after_hand(&session, final_boxes, &frame);
+    assert(result.committed);
+    const fridge::InventoryItem* b = session.inventory().find_by_item(2);
+    assert(b != 0);
+    assert(b->base_box.x1 == 355.0f);
+    assert(!has_event(result, fridge::EventKind::MOVED, 2));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+}
+
+// 细节15-3：A 的碰撞链可以经过多个不同类旧物品；每个成员都只能使用
+// 自己的最终直接框，不能复制 A 的预测位置。
+void test_indirect_multiple_different_class_members_keep_own_boxes() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 300, 300));
+    initial.push_back(item(2, 1, 340, 100, 540, 300));
+    initial.push_back(item(3, 2, 580, 100, 780, 300));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(1, 340, 100, 540, 300));
+    stable.push_back(det(2, 580, 100, 780, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> final_boxes;
+    final_boxes.push_back(det(0, 220, 100, 420, 300));
+    final_boxes.push_back(det(1, 380, 100, 580, 300));
+    final_boxes.push_back(det(2, 610, 100, 810, 300));
+    send_indirect_move_hand_sequence(&session, stable, final_boxes, &frame);
+
+    fridge::SettlementResult result = settle_after_hand(&session, final_boxes, &frame);
+    assert(result.committed);
+    const fridge::InventoryItem* a = session.inventory().find_by_item(1);
+    const fridge::InventoryItem* b = session.inventory().find_by_item(2);
+    const fridge::InventoryItem* c = session.inventory().find_by_item(3);
+    assert(a != 0 && b != 0 && c != 0);
+    assert(a->base_box.x1 == 220.0f);
+    assert(b->base_box.x1 == 380.0f);
+    assert(c->base_box.x1 == 610.0f);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(has_event(result, fridge::EventKind::MOVED, 2));
+    assert(has_event(result, fridge::EventKind::MOVED, 3));
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 3));
+}
+
+// 细节15：推动簇中另一件旧物品漏检时，B 虽然看似有自己的前向框，也不能
+// 静默回落为 STATIC 并提交旧位置。身份链不完整时必须保留未决，等待后续帧。
+void test_indirect_cluster_missing_member_stays_pending() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 300, 300));
+    initial.push_back(item(2, 2, 340, 100, 540, 300));
+    initial.push_back(item(3, 1, 580, 100, 780, 300));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(2, 340, 100, 540, 300));
+    stable.push_back(det(1, 580, 100, 780, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> missing_tail;
+    missing_tail.push_back(det(0, 220, 100, 420, 300));
+    missing_tail.push_back(det(2, 380, 100, 580, 300));
+    send_indirect_move_hand_sequence(&session, stable, missing_tail, &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        missing_tail, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        missing_tail, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(!second.settlement.committed);
+    assert(session.operation_pending());
+
+    const fridge::InventoryItem* b = session.inventory().find_by_item(2);
+    assert(b != 0);
+    assert(b->base_box.x1 == 340.0f);
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    assert(tracks.find(2) != tracks.end());
+    assert(tracks.find(2)->second.indirect_move_candidate);
+    assert(tracks.find(2)->second.indirect_assignment_ambiguous);
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 2));
+}
+
+// 细节15-4/5/6：同类 A-B-C（外加一个未参与的静态 D）组成一行。无手
+// 帧故意重排 detection input index；映射必须仍按运动轴保持 A-B-C 顺序，
+// D 的唯一静态框不能被移动簇抢走。
+void test_indirect_same_class_cluster_preserves_order_across_input_reorder() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 300, 300));
+    initial.push_back(item(2, 0, 340, 100, 540, 300));
+    initial.push_back(item(3, 0, 580, 100, 780, 300));
+    initial.push_back(item(4, 0, 820, 100, 1020, 300));  // static neighbor D
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(0, 340, 100, 540, 300));
+    stable.push_back(det(0, 580, 100, 780, 300));
+    stable.push_back(det(0, 820, 100, 1020, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> hand_boxes;
+    hand_boxes.push_back(det(0, 610, 100, 810, 300));  // C first on purpose
+    hand_boxes.push_back(det(0, 220, 100, 420, 300));  // A
+    hand_boxes.push_back(det(0, 380, 100, 580, 300));  // B
+    hand_boxes.push_back(det(0, 820, 100, 1020, 300)); // static D
+    send_indirect_move_hand_sequence(&session, stable, hand_boxes, &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        hand_boxes, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+
+    std::vector<fridge::Detection> reordered_final_boxes;
+    reordered_final_boxes.push_back(det(0, 380, 100, 580, 300));  // B first now
+    reordered_final_boxes.push_back(det(0, 820, 100, 1020, 300)); // D
+    reordered_final_boxes.push_back(det(0, 610, 100, 810, 300));  // C
+    reordered_final_boxes.push_back(det(0, 220, 100, 420, 300));  // A last
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        reordered_final_boxes, std::vector<fridge::BBox>(), second_no_hand,
+        second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+
+    const fridge::InventoryItem* a = session.inventory().find_by_item(1);
+    const fridge::InventoryItem* b = session.inventory().find_by_item(2);
+    const fridge::InventoryItem* c = session.inventory().find_by_item(3);
+    const fridge::InventoryItem* d = session.inventory().find_by_item(4);
+    assert(a != 0 && b != 0 && c != 0 && d != 0);
+    assert(a->base_box.x1 == 220.0f);
+    assert(b->base_box.x1 == 380.0f);
+    assert(c->base_box.x1 == 610.0f);
+    assert(d->base_box.x1 == 820.0f);
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 2));
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 4));
+}
+
+// 细节15-5：向左推动时，排序轴随 A 的真实位移翻转。物品 id 和检测输入
+// 顺序都不能参与身份判断；右侧的静态同类 D 也不得被移动簇吸收。
+void test_indirect_same_class_cluster_preserves_reverse_order() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 580, 100, 780, 300));  // directly moved A
+    initial.push_back(item(2, 0, 340, 100, 540, 300));
+    initial.push_back(item(3, 0, 100, 100, 300, 300));
+    initial.push_back(item(4, 0, 820, 100, 1020, 300)); // static D
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(0, 580, 100, 780, 300));
+    stable.push_back(det(0, 820, 100, 1020, 300));
+    stable.push_back(det(0, 340, 100, 540, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> hand_boxes;
+    hand_boxes.push_back(det(0, 50, 100, 250, 300));   // C first
+    hand_boxes.push_back(det(0, 820, 100, 1020, 300)); // static D
+    hand_boxes.push_back(det(0, 460, 100, 660, 300));  // A
+    hand_boxes.push_back(det(0, 260, 100, 460, 300));  // B
+    const fridge::BBox hand0(580, 80, 750, 320);
+    const fridge::BBox hand1(530, 80, 700, 320);
+    send_indirect_move_hand_sequence_with_hands(
+        &session, stable, hand_boxes, hand0, hand1, &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        hand_boxes, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+
+    std::vector<fridge::Detection> reordered_final_boxes;
+    reordered_final_boxes.push_back(det(0, 260, 100, 460, 300));  // B first
+    reordered_final_boxes.push_back(det(0, 460, 100, 660, 300));  // A
+    reordered_final_boxes.push_back(det(0, 820, 100, 1020, 300)); // D
+    reordered_final_boxes.push_back(det(0, 50, 100, 250, 300));   // C last
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        reordered_final_boxes, std::vector<fridge::BBox>(), second_no_hand,
+        second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+
+    const fridge::InventoryItem* a = session.inventory().find_by_item(1);
+    const fridge::InventoryItem* b = session.inventory().find_by_item(2);
+    const fridge::InventoryItem* c = session.inventory().find_by_item(3);
+    const fridge::InventoryItem* d = session.inventory().find_by_item(4);
+    assert(a != 0 && b != 0 && c != 0 && d != 0);
+    assert(a->base_box.x1 == 460.0f);
+    assert(b->base_box.x1 == 260.0f);
+    assert(c->base_box.x1 == 50.0f);
+    assert(d->base_box.x1 == 820.0f);
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 2));
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 4));
+}
+
+// 细节15-7：同类最终框存在多个可行候选、但无法得到唯一的全局分配时，
+// 必须保持未决，不能按 item_id、检测输入顺序或最近框强行提交。
+void test_indirect_same_class_ambiguous_cluster_stays_pending() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 300, 300));
+    initial.push_back(item(2, 0, 340, 100, 540, 300));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 300, 300));
+    stable.push_back(det(0, 340, 100, 540, 300));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> moved;
+    moved.push_back(det(0, 220, 100, 420, 300));
+    moved.push_back(det(0, 380, 100, 580, 300));
+    send_indirect_move_hand_sequence(&session, stable, moved, &frame);
+
+    std::vector<fridge::Detection> ambiguous;
+    ambiguous.push_back(det(0, 220, 100, 420, 300));
+    ambiguous.push_back(det(0, 380, 100, 580, 300));
+    ambiguous.push_back(det(0, 400, 100, 600, 300));
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        ambiguous, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        ambiguous, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(!second.settlement.committed);
+    assert(session.operation_pending());
+
+    const fridge::InventoryItem* b = session.inventory().find_by_item(2);
+    assert(b != 0);
+    assert(b->base_box.x1 == 340.0f);
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    assert(tracks.find(2) != tracks.end());
+    assert(tracks.find(2)->second.indirect_move_candidate);
+    assert(tracks.find(2)->second.indirect_assignment_ambiguous);
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 2));
+    assert(!has_event(second.settlement, fridge::EventKind::IN, 2));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 2));
+}
+
 }  // namespace
 
 int main() {
@@ -2402,5 +2751,12 @@ int main() {
     test_quarantined_same_class_stale_alias_disappears_after_old_c_settles();
     test_retouch_old_c_preserves_alias_links_and_shared_resolution();
     test_quarantined_same_class_real_d_confirms_after_distinct_no_hand_boxes();
+    test_indirect_different_class_formal_move_keeps_identity();
+    test_indirect_different_class_small_move_rebases_without_moved();
+    test_indirect_multiple_different_class_members_keep_own_boxes();
+    test_indirect_cluster_missing_member_stays_pending();
+    test_indirect_same_class_cluster_preserves_order_across_input_reorder();
+    test_indirect_same_class_cluster_preserves_reverse_order();
+    test_indirect_same_class_ambiguous_cluster_stays_pending();
     return 0;
 }
