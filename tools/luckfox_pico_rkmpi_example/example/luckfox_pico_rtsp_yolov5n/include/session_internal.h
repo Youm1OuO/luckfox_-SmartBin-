@@ -1,6 +1,7 @@
 #ifndef __FRIDGE_SESSION_INTERNAL_H
 #define __FRIDGE_SESSION_INTERNAL_H
 
+#include <cstddef>
 #include <limits>
 #include <map>
 #include <set>
@@ -13,6 +14,14 @@
 namespace fridge {
 namespace session_internal {
 
+// 一次遮挡计划中的纯几何分类结果。它不携带身份或状态机结论，也不会写入库存。
+struct CoverageEvaluation {
+    bool strict_full = false;
+    bool edge_residual_full = false;
+    bool full = false;
+    std::size_t cover_box_count = 0;
+};
+
 // 只存在于一次无手结算调用的 blocker 因果计划。它不写入 InventoryItem，
 // 也不跨操作保存；正式状态/事件只能读取通过门控的字段。
 struct BlockerTransitionPlan {
@@ -21,8 +30,8 @@ struct BlockerTransitionPlan {
     std::set<int> added_blocker_ids;
     std::set<int> removed_blocker_ids;
     std::set<int> moved_blocker_ids;
-    bool coverage_before_full = false;
-    bool coverage_after_full = false;
+    CoverageEvaluation coverage_before;
+    CoverageEvaluation coverage_after;
     bool coverage_changed_by_confirmed_front = false;
     bool valid_target_observed = false;
     bool observation_conflict = false;

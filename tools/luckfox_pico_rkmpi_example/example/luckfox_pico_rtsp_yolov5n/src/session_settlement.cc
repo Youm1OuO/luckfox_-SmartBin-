@@ -12,13 +12,71 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace fridge {
 
 using namespace session_internal;
+
+namespace {
+
+CoverageEvaluation evaluate_full_coverage(const BBox& target_box,
+                                          const std::vector<BBox>& strict_cover_boxes,
+                                          const std::vector<BBox>& edge_cover_boxes,
+                                          bool allow_edge_residual) {
+    CoverageEvaluation evaluation;
+    evaluation.cover_box_count = strict_cover_boxes.size();
+    if (target_box.area() <= 0.0f) return evaluation;
+
+    evaluation.strict_full = fully_covered_by(target_box, strict_cover_boxes);
+    evaluation.edge_residual_full = !evaluation.strict_full &&
+        allow_edge_residual && edge_residual_within_target_border(
+            target_box, edge_cover_boxes,
+            FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX);
+    evaluation.full = evaluation.strict_full || evaluation.edge_residual_full;
+    return evaluation;
+}
+
+std::string blocker_id_list(const std::set<int>& item_ids) {
+    std::ostringstream stream;
+    stream << "[";
+    for (std::set<int>::const_iterator it = item_ids.begin(); it != item_ids.end(); ++it) {
+        if (it != item_ids.begin()) stream << ",";
+        stream << *it;
+    }
+    stream << "]";
+    return stream.str();
+}
+
+const char* occlusion_plan_reason(const BlockerTransitionPlan& plan) {
+    const bool confirmed_front_changed = !plan.added_blocker_ids.empty() ||
+        !plan.removed_blocker_ids.empty() || !plan.moved_blocker_ids.empty();
+    if (plan.allow_occluded_transition) {
+        return "confirmed-front-covered-hidden-target";
+    }
+    if (plan.allow_revealed_transition) {
+        return "confirmed-blocker-moved-away";
+    }
+    if (!confirmed_front_changed) return "no-confirmed-blocker-change";
+    if (plan.coverage_before.full && plan.coverage_after.full) {
+        return "coverage-remains-full";
+    }
+    if (plan.coverage_before.full && !plan.coverage_after.full &&
+        !plan.valid_target_observed) {
+        return "coverage-lost-without-legal-observation";
+    }
+    if (!plan.coverage_before.full && plan.coverage_after.full &&
+        plan.valid_target_observed) {
+        return "covered-target-has-legal-observation";
+    }
+    return "coverage-direction-not-satisfied";
+}
+
+}  // namespace
 
 void SessionManager::mark_pending_out_(int item_id) {
     pending_out_ids_.insert(item_id);
@@ -537,8 +595,13 @@ void SessionManager::refresh_confirmed_blockers_(
                 historical_cover_boxes.push_back(historical_box);
             }
         }
-        plan.coverage_before_full = relationship_target_box.area() > 0.0f &&
-            fully_covered_by(relationship_target_box, historical_cover_boxes);
+        const bool allow_historical_edge_residual =
+            original != operation_start_inventory_.end() &&
+            original->second.status == ItemStatus::OCCLUDED &&
+            !historical_block_ids.empty() && !historical_cover_boxes.empty();
+        plan.coverage_before = evaluate_full_coverage(
+            relationship_target_box, historical_cover_boxes, historical_cover_boxes,
+            allow_historical_edge_residual);
 
         for (int source = 0; source < 2; ++source) {
             const std::set<int>& candidate_ids = source == 0
@@ -629,15 +692,11 @@ void SessionManager::refresh_confirmed_blockers_(
             continue;
         }
 
-        const bool strict_fully_covered = fully_covered_by(target_box, cover_boxes);
-        const bool edge_residual_fully_covered = !strict_fully_covered &&
-            has_current_confirmed_front_cover &&
-            edge_residual_within_target_border(
-                target_box, edge_residual_cover_boxes,
-                FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX);
-        plan.coverage_after_full = strict_fully_covered || edge_residual_fully_covered;
+        plan.coverage_after = evaluate_full_coverage(
+            target_box, cover_boxes, edge_residual_cover_boxes,
+            has_current_confirmed_front_cover);
         plan.coverage_changed_by_confirmed_front =
-            plan.coverage_before_full != plan.coverage_after_full &&
+            plan.coverage_before.full != plan.coverage_after.full &&
             (!plan.added_blocker_ids.empty() ||
              !plan.removed_blocker_ids.empty() ||
              !plan.moved_blocker_ids.empty());
@@ -650,8 +709,8 @@ void SessionManager::refresh_confirmed_blockers_(
         InventoryItem retained = target_observed ? target->second : original->second;
         retained.block_ids.swap(effective_block_ids);
         if (original->second.status == ItemStatus::VISIBLE) {
-            if (!target_observed && plan.coverage_after_full &&
-                plan.coverage_changed_by_confirmed_front) {
+            if (!plan.valid_target_observed && !plan.coverage_before.full &&
+                plan.coverage_after.full && plan.coverage_changed_by_confirmed_front) {
                 retained.status = ItemStatus::OCCLUDED;
                 plan.allow_occluded_transition = true;
                 fully_occluded_item_ids->insert(target_id);
@@ -659,10 +718,11 @@ void SessionManager::refresh_confirmed_blockers_(
                 retained.status = ItemStatus::VISIBLE;
             }
         } else {
-            if (plan.coverage_after_full) {
+            if (plan.coverage_after.full) {
                 retained.status = ItemStatus::OCCLUDED;
                 fully_occluded_item_ids->insert(target_id);
-            } else if (plan.valid_target_observed &&
+            } else if (plan.valid_target_observed && plan.coverage_before.full &&
+                       !plan.coverage_after.full &&
                        plan.coverage_changed_by_confirmed_front) {
                 retained.status = ItemStatus::VISIBLE;
                 plan.allow_revealed_transition = true;
@@ -679,7 +739,7 @@ void SessionManager::refresh_confirmed_blockers_(
                 plan.observation_conflict = plan.observation_conflict || target_observed;
             }
         }
-        if (edge_residual_fully_covered && plan.allow_occluded_transition) {
+        if (plan.coverage_after.edge_residual_full && plan.allow_occluded_transition) {
             trace_("OCCLUSION",
                    "target=%d action=confirm-edge-residual-occlusion edge-px=%.1f "
                    "confirmed-front=%d covers=%zu",
@@ -688,6 +748,36 @@ void SessionManager::refresh_confirmed_blockers_(
                    edge_residual_cover_boxes.size());
         }
         target->second = retained;
+        if (!plan.historical_blocker_ids.empty() || !plan.effective_blocker_ids.empty() ||
+            original->second.status == ItemStatus::OCCLUDED ||
+            plan.allow_occluded_transition || plan.allow_revealed_transition) {
+            const std::string historical_ids = blocker_id_list(plan.historical_blocker_ids);
+            const std::string effective_ids = blocker_id_list(plan.effective_blocker_ids);
+            const std::string added_ids = blocker_id_list(plan.added_blocker_ids);
+            const std::string removed_ids = blocker_id_list(plan.removed_blocker_ids);
+            const std::string moved_ids = blocker_id_list(plan.moved_blocker_ids);
+            trace_(
+                "OCCLUSION-PLAN",
+                "target=%d observed=%d observation-conflict=%d historical=%s effective=%s "
+                "before=(strict=%d edge=%d full=%d covers=%zu) "
+                "after=(strict=%d edge=%d full=%d covers=%zu) "
+                "added=%s removed=%s moved=%s allow-occluded=%d allow-revealed=%d "
+                "reason=%s",
+                target_id, target_observed ? 1 : 0, plan.observation_conflict ? 1 : 0,
+                historical_ids.c_str(), effective_ids.c_str(),
+                plan.coverage_before.strict_full ? 1 : 0,
+                plan.coverage_before.edge_residual_full ? 1 : 0,
+                plan.coverage_before.full ? 1 : 0,
+                plan.coverage_before.cover_box_count,
+                plan.coverage_after.strict_full ? 1 : 0,
+                plan.coverage_after.edge_residual_full ? 1 : 0,
+                plan.coverage_after.full ? 1 : 0,
+                plan.coverage_after.cover_box_count,
+                added_ids.c_str(), removed_ids.c_str(), moved_ids.c_str(),
+                plan.allow_occluded_transition ? 1 : 0,
+                plan.allow_revealed_transition ? 1 : 0,
+                occlusion_plan_reason(plan));
+        }
         if (transition_plans) (*transition_plans)[target_id] = plan;
     }
 }

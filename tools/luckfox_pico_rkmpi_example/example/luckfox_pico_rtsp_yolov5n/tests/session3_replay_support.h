@@ -50,6 +50,8 @@ void test_ambiguous_hand_partial_box_does_not_create_d();
 void test_adjacent_same_class_new_item_gets_its_own_d_chain();
 void test_unbound_no_hand_box_never_auto_in();
 void test_moved_front_item_occludes_then_reveals();
+void test_edge_residual_historical_blocker_reveals_after_move();
+void test_dense_three_apple_topology_reveals_edge_residual_target();
 void test_occluded_target_observation_without_blocker_change_stays_occluded();
 void test_out_blocker_reveals_observed_target_in_causal_order();
 void test_cross_class_duplicate_original_does_not_create_d();

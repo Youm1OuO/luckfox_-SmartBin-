@@ -111,6 +111,200 @@ void test_moved_front_item_occludes_then_reveals() {
                         fridge::EventKind::REVEALED, 2);
 }
 
+// 第一事务中 A 的确认终点在 B 的左侧留下 6px 外边缘残余。当前 confirmed
+// MOVED front 可以按既有 edge-residual 规则使 B 正式 OCCLUDED；下一事务
+// A 离开后，历史 before 也必须用同一正式语义，否则 B 会残留 OCCLUDED。
+void test_edge_residual_historical_blocker_reveals_after_move() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // A: apple
+    initial.push_back(item(2, 2, 300, 100, 400, 200));  // B: orange
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> initial_foods;
+    initial_foods.push_back(det(0, 100, 100, 200, 200));
+    initial_foods.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, initial_foods, &frame);
+
+    // A 的最终框 (306,100)-(406,200) 在 B 的左侧留下 6px 残余，严格覆盖
+    // 失败但仍满足 FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 170, 100, 270, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(150, 80, 250, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 240, 100, 340, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 80, 320, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 306, 100, 406, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(286, 80, 386, 220)), &frame);
+    fridge::SettlementResult occluded = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 306, 100, 406, 200)), &frame);
+    assert(occluded.committed);
+    const fridge::InventoryItem* hidden = session.inventory().find_by_item(2);
+    assert(hidden != 0);
+    assert(hidden->status == fridge::ItemStatus::OCCLUDED);
+    assert(hidden->block_ids.size() == 1);
+    assert(hidden->block_ids.count(1));
+    assert(has_event(occluded, fridge::EventKind::MOVED, 1));
+    assert(has_event(occluded, fridge::EventKind::OCCLUDED, 2));
+    assert_event_before(occluded, fridge::EventKind::MOVED, 1,
+                        fridge::EventKind::OCCLUDED, 2);
+
+    // 下一事务 A 确认移到 B 外，B 同时有唯一且合法的直接框。旧实现的 before
+    // 只做严格覆盖，会错误得到 false -> false，因而不允许 REVEALED。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 306, 100, 406, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(286, 80, 386, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 380, 100, 480, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(360, 80, 460, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 460, 100, 560, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(440, 80, 540, 220)), &frame);
+    std::vector<fridge::Detection> final_frame;
+    final_frame.push_back(det(0, 500, 100, 600, 200));
+    final_frame.push_back(det(2, 300, 100, 400, 200));
+    send_frame(&session, final_frame,
+               std::vector<fridge::BBox>(1, fridge::BBox(480, 80, 580, 220)), &frame);
+    fridge::SettlementResult revealed = settle_after_hand(&session, final_frame, &frame);
+    assert(revealed.committed);
+    const fridge::InventoryItem* visible = session.inventory().find_by_item(2);
+    assert(visible != 0);
+    assert(visible->status == fridge::ItemStatus::VISIBLE);
+    assert(visible->block_ids.empty());
+    assert(session.inventory().size() == 2);
+    assert(has_event(revealed, fridge::EventKind::MOVED, 1));
+    assert(has_event(revealed, fridge::EventKind::REVEALED, 2));
+    assert(!has_event(revealed, fridge::EventKind::IN, 3));
+    assert_event_before(revealed, fridge::EventKind::MOVED, 1,
+                        fridge::EventKind::REVEALED, 2);
+}
+
+// 现场密集拓扑回放：三个苹果与一个橙子同时存在。item#2 先以边缘残余
+// 正式遮挡 item#4；item#1 与 item#3 始终可见，其中 item#3 靠近橙子但从未
+// 成为确认前景。item#2 随后移走时，不能因同类苹果密度而丢失其 MOVED 身份，
+// 也不能把最终三张苹果框中的任何一张误建成新的 D/IN。
+void test_dense_three_apple_topology_reveals_edge_residual_target() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 550, 300, 650, 400));  // 静态 apple
+    initial.push_back(item(2, 0, 100, 100, 200, 200));  // 历史 blocker apple
+    initial.push_back(item(3, 0, 410, 100, 510, 200));  // 静态 apple，紧邻 orange
+    initial.push_back(item(4, 2, 300, 100, 400, 200));  // 被遮挡 orange
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> initial_foods;
+    initial_foods.push_back(det(0, 550, 300, 650, 400));
+    initial_foods.push_back(det(0, 100, 100, 200, 200));
+    initial_foods.push_back(det(0, 410, 100, 510, 200));
+    initial_foods.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, initial_foods, &frame);
+
+    // 第一事务：item#2 移至 item#4 前方。最终保留 6px 左边缘残余，因此
+    // item#4 的正式遮挡只能由既有 edge-residual 语义建立；两张静态苹果框
+    // 全程可见，避免把密集货架简化为单物品路径。
+    std::vector<fridge::Detection> first_hand_frame;
+    first_hand_frame.push_back(det(0, 550, 300, 650, 400));
+    first_hand_frame.push_back(det(0, 100, 100, 200, 200));
+    first_hand_frame.push_back(det(0, 410, 100, 510, 200));
+    send_frame(&session, first_hand_frame,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+
+    std::vector<fridge::Detection> first_middle;
+    first_middle.push_back(det(0, 550, 300, 650, 400));
+    first_middle.push_back(det(0, 170, 100, 270, 200));
+    first_middle.push_back(det(0, 410, 100, 510, 200));
+    send_frame(&session, first_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(150, 80, 250, 220)), &frame);
+
+    std::vector<fridge::Detection> first_near_target;
+    first_near_target.push_back(det(0, 550, 300, 650, 400));
+    first_near_target.push_back(det(0, 240, 100, 340, 200));
+    first_near_target.push_back(det(0, 410, 100, 510, 200));
+    send_frame(&session, first_near_target,
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 80, 320, 220)), &frame);
+
+    std::vector<fridge::Detection> first_final;
+    first_final.push_back(det(0, 550, 300, 650, 400));
+    first_final.push_back(det(0, 306, 100, 406, 200));
+    first_final.push_back(det(0, 410, 100, 510, 200));
+    send_frame(&session, first_final,
+               std::vector<fridge::BBox>(1, fridge::BBox(286, 80, 386, 220)), &frame);
+    fridge::SettlementResult occluded = settle_after_hand(&session, first_final, &frame);
+    assert(occluded.committed);
+    assert(session.inventory().size() == 4);
+    const fridge::InventoryItem* hidden = session.inventory().find_by_item(4);
+    assert(hidden != 0);
+    assert(hidden->status == fridge::ItemStatus::OCCLUDED);
+    assert(hidden->block_ids.size() == 1);
+    assert(hidden->block_ids.count(2));
+    assert(has_event(occluded, fridge::EventKind::MOVED, 2));
+    assert(has_event(occluded, fridge::EventKind::OCCLUDED, 4));
+    assert_event_before(occluded, fridge::EventKind::MOVED, 2,
+                        fridge::EventKind::OCCLUDED, 4);
+
+    // 第二事务：blocker 离开 B。最终无手帧同时有三个 apple 和一个 orange，
+    // 要求维持 item#2 的真实终点身份，并由已确认 blocker 移走这一因果关系
+    // 使 item#4 REVEALED。
+    send_frame(&session, first_final,
+               std::vector<fridge::BBox>(1, fridge::BBox(286, 80, 386, 220)), &frame);
+
+    std::vector<fridge::Detection> second_middle;
+    second_middle.push_back(det(0, 550, 300, 650, 400));
+    second_middle.push_back(det(0, 250, 160, 350, 260));
+    second_middle.push_back(det(0, 410, 100, 510, 200));
+    send_frame(&session, second_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(230, 140, 370, 280)), &frame);
+
+    std::vector<fridge::Detection> second_near_destination;
+    second_near_destination.push_back(det(0, 550, 300, 650, 400));
+    second_near_destination.push_back(det(0, 180, 230, 280, 330));
+    second_near_destination.push_back(det(0, 410, 100, 510, 200));
+    send_frame(&session, second_near_destination,
+               std::vector<fridge::BBox>(1, fridge::BBox(160, 210, 300, 350)), &frame);
+
+    std::vector<fridge::Detection> final_frame;
+    final_frame.push_back(det(0, 550, 300, 650, 400));
+    final_frame.push_back(det(0, 100, 300, 200, 400));
+    final_frame.push_back(det(0, 410, 100, 510, 200));
+    final_frame.push_back(det(2, 300, 100, 400, 200));
+    send_frame(&session, final_frame,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 280, 220, 420)), &frame);
+    fridge::SettlementResult revealed = settle_after_hand(&session, final_frame, &frame);
+    assert(revealed.committed);
+    assert(session.inventory().size() == 4);
+    assert(revealed.events.size() == 2);
+
+    const fridge::InventoryItem* static_first = session.inventory().find_by_item(1);
+    const fridge::InventoryItem* moved = session.inventory().find_by_item(2);
+    const fridge::InventoryItem* static_near_target = session.inventory().find_by_item(3);
+    const fridge::InventoryItem* visible = session.inventory().find_by_item(4);
+    assert(static_first != 0 && moved != 0 && static_near_target != 0 && visible != 0);
+    assert(static_first->status == fridge::ItemStatus::VISIBLE);
+    assert(moved->status == fridge::ItemStatus::VISIBLE);
+    assert(static_near_target->status == fridge::ItemStatus::VISIBLE);
+    assert(visible->status == fridge::ItemStatus::VISIBLE);
+    assert(static_first->base_box.x1 == 550.0f && static_first->base_box.y1 == 300.0f);
+    assert(static_first->base_box.x2 == 650.0f && static_first->base_box.y2 == 400.0f);
+    assert(moved->base_box.x1 == 100.0f && moved->base_box.y1 == 300.0f);
+    assert(moved->base_box.x2 == 200.0f && moved->base_box.y2 == 400.0f);
+    assert(static_near_target->base_box.x1 == 410.0f &&
+           static_near_target->base_box.y1 == 100.0f);
+    assert(static_near_target->base_box.x2 == 510.0f &&
+           static_near_target->base_box.y2 == 200.0f);
+    assert(visible->base_box.x1 == 300.0f && visible->base_box.y1 == 100.0f);
+    assert(visible->base_box.x2 == 400.0f && visible->base_box.y2 == 200.0f);
+    assert(static_first->block_ids.empty());
+    assert(moved->block_ids.empty());
+    assert(static_near_target->block_ids.empty());
+    assert(visible->block_ids.empty());
+    assert(has_event(revealed, fridge::EventKind::MOVED, 2));
+    assert(has_event(revealed, fridge::EventKind::REVEALED, 4));
+    for (size_t event = 0; event < revealed.events.size(); ++event) {
+        assert(revealed.events[event].kind != fridge::EventKind::IN);
+    }
+    assert_event_before(revealed, fridge::EventKind::MOVED, 2,
+                        fridge::EventKind::REVEALED, 4);
+}
+
 // 目标 C 已经正式 OCCLUDED，但历史 blocker 在本轮没有任何确认移动或
 // OUT。当前检测器再次给出 C 的直接框只能是临时 observation，不能凭它
 // 直接把正式状态改成 VISIBLE 或生成 REVEALED。
