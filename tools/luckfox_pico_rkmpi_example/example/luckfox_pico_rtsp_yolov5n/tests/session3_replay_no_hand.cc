@@ -56,6 +56,19 @@ void test_moved_front_item_occludes_then_reveals() {
         &session, std::vector<fridge::Detection>(1, det(0, 300, 100, 400, 200)), &frame);
     assert(first.committed);
     assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::OCCLUDED);
+    assert(session.inventory().find_by_item(2)->block_ids.count(1));
+
+    // 下一次操作中 A 仍停在 B 前方，且本轮没有新的 MOVED / IN。历史前景关系
+    // 不能因为当前帧没有新的 confirmed_front_ids 而被清空，也不能重复产生事件。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 300, 100, 400, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 80, 380, 220)), &frame);
+    fridge::SettlementResult still_blocked = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 300, 100, 400, 200)), &frame);
+    assert(still_blocked.committed);
+    assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::OCCLUDED);
+    assert(session.inventory().find_by_item(2)->block_ids.count(1));
+    assert(!has_event(still_blocked, fridge::EventKind::OCCLUDED, 2));
+    assert(!has_event(still_blocked, fridge::EventKind::REVEALED, 2));
 
     // 再把 A 移开；A 和 B 同时可见，B 必须恢复 item#2 而不是新入库。
     send_frame(&session, std::vector<fridge::Detection>(1, det(0, 300, 100, 400, 200)),
@@ -74,6 +87,189 @@ void test_moved_front_item_occludes_then_reveals() {
     assert(session.inventory().size() == 2);
     assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::VISIBLE);
     assert(has_event(second, fridge::EventKind::REVEALED, 2));
+}
+
+// 历史 blocker 正式 OUT 后，原先被完整遮挡的 C 不能立即 REVEALED，也不能
+// 带着遮挡期间的缺失帧直接 OUT。C 从 blocker 失效后的第一张无手帧重新开始
+// 计数，在既有阈值达到前持续阻止提交。
+void test_historical_blocker_out_starts_new_missing_chain() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 300, 100, 400, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> initial_foods;
+    initial_foods.push_back(det(0, 100, 100, 200, 200));
+    initial_foods.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, initial_foods, &frame);
+
+    // 先用正式流程建立 item#1 -> item#2 的历史完整遮挡关系。
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 170, 100, 270, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(150, 80, 250, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 240, 100, 340, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 80, 320, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 300, 100, 400, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 80, 380, 220)), &frame);
+    fridge::SettlementResult occluded = settle_after_hand(
+        &session, std::vector<fridge::Detection>(1, det(0, 300, 100, 400, 200)), &frame);
+    assert(occluded.committed);
+    assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::OCCLUDED);
+    assert(session.inventory().find_by_item(2)->block_ids.count(1));
+
+    // 再取走前景 item#1。item#2 已是 OCCLUDED，因此不会被新的 HAND 轨迹
+    // 误当作直接可见物品；它只能在 blocker 正式 OUT 后走新的缺失链。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 80, 420, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(420, 80, 560, 220)), &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+        first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+
+    // item#1 在这一帧完成既有 OUT；item#2 才开始自己的“遮挡解释失效”第 1 帧。
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+        second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(!second.settlement.committed);
+    assert(session.operation_pending());
+    assert(!has_event(second.settlement, fridge::EventKind::REVEALED, 2));
+
+    const int third_no_hand = frame++;
+    fridge::FrameProcessResult third = session.process_frame(
+        std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+        third_no_hand, third_no_hand);
+    assert(third.no_hand_frame_processed);
+    assert(third.settlement.committed);
+    assert(session.inventory().find_by_item(1) == 0);
+    assert(session.inventory().find_by_item(2) == 0);
+    assert(has_event(third.settlement, fridge::EventKind::OUT, 1));
+    assert(has_event(third.settlement, fridge::EventKind::OUT, 2));
+    assert(!has_event(third.settlement, fridge::EventKind::REVEALED, 2));
+}
+
+// VISIBLE + block_ids 只代表局部前景关系，不是完整遮挡。当前景 A 随后 OUT、
+// B 又恰好漏检时，B 不能走“历史完整遮挡失效”的专用 OUT 链，更不能被 A
+// 的 OUT 连带删除；没有 B 自己的旧 C 证据时应保留正式库存。
+void test_partial_front_relation_does_not_start_occlusion_loss_out_chain() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 260, 100, 360, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> initial_foods;
+    initial_foods.push_back(det(0, 100, 100, 200, 200));
+    initial_foods.push_back(det(2, 260, 100, 360, 200));
+    initial_no_hand_frame(&session, initial_foods, &frame);
+
+    // A 确认移动到 B 的左侧，只与 B 有部分重叠；B 仍被直接看见，因此
+    // 提交后必须是 VISIBLE，但保存 A 的前景关系。
+    send_frame(&session, initial_foods,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    std::vector<fridge::Detection> move_1;
+    move_1.push_back(det(0, 130, 100, 230, 200));
+    move_1.push_back(det(2, 260, 100, 360, 200));
+    send_frame(&session, move_1,
+               std::vector<fridge::BBox>(1, fridge::BBox(110, 80, 170, 220)), &frame);
+    std::vector<fridge::Detection> move_2;
+    move_2.push_back(det(0, 160, 100, 260, 200));
+    move_2.push_back(det(2, 260, 100, 360, 200));
+    send_frame(&session, move_2,
+               std::vector<fridge::BBox>(1, fridge::BBox(140, 80, 200, 220)), &frame);
+    std::vector<fridge::Detection> partial_front;
+    partial_front.push_back(det(0, 180, 100, 280, 200));
+    partial_front.push_back(det(2, 260, 100, 360, 200));
+    send_frame(&session, partial_front,
+               std::vector<fridge::BBox>(1, fridge::BBox(160, 80, 220, 220)), &frame);
+    fridge::SettlementResult first = settle_after_hand(&session, partial_front, &frame);
+    assert(first.committed);
+    assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::VISIBLE);
+    assert(session.inventory().find_by_item(2)->block_ids.count(1));
+
+    // 只操作 A，B 没有自己的 HAND/CONTACT 轨迹。A 消失并完成正常 OUT 后，
+    // B 的短暂漏检不得被误当作“完整遮挡失效后的连续缺失”。
+    send_frame(&session, partial_front,
+               std::vector<fridge::BBox>(1, fridge::BBox(170, 80, 230, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 150, 100, 250, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(140, 80, 200, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 120, 100, 220, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(110, 80, 170, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 90, 100, 190, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 140, 220)), &frame);
+    fridge::SettlementResult second = settle_after_hand(
+        &session, std::vector<fridge::Detection>(), &frame);
+    assert(second.committed);
+    assert(session.inventory().find_by_item(1) == 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::VISIBLE);
+    assert(!has_event(second, fridge::EventKind::OUT, 2));
+}
+
+// 多 blocker 的覆盖关系必须按最终位置一起重算。A 移开并不等于 C 露出：
+// 只要历史 B 仍完整覆盖 C，C 必须继续 OCCLUDED，且关系中只移除 A。
+void test_remaining_historical_blocker_keeps_c_occluded_after_other_moves() {
+    fridge::SessionManager session;
+    session.start_new_session();
+
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 300, 100, 400, 200));
+    initial.push_back(item(2, 0, 300, 100, 400, 200));
+    initial.push_back(item(3, 1, 300, 100, 400, 200));
+    session.init_from_backend(initial, true);
+
+    // init_from_backend() 有意将后端快照标准化为 VISIBLE 并清空 blocker。
+    // 这里模拟的是前一轮已经由本地事务提交的遮挡关系，因此在加载完成后
+    // 恢复该持久状态，避免把“后端初始化边界”误测成 blocker 生命周期。
+    fridge::InventoryItem* hidden = session.inventory().find_by_item(1);
+    assert(hidden != 0);
+    hidden->status = fridge::ItemStatus::OCCLUDED;
+    hidden->block_ids.insert(2);
+    hidden->block_ids.insert(3);
+    int frame = 1;
+
+    std::vector<fridge::Detection> original_fronts;
+    original_fronts.push_back(det(0, 300, 100, 400, 200));
+    original_fronts.push_back(det(1, 300, 100, 400, 200));
+    send_frame(&session, original_fronts,
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 80, 380, 220)), &frame);
+
+    std::vector<fridge::Detection> move_1;
+    move_1.push_back(det(0, 230, 100, 330, 200));
+    move_1.push_back(det(1, 300, 100, 400, 200));
+    send_frame(&session, move_1,
+               std::vector<fridge::BBox>(1, fridge::BBox(210, 80, 310, 220)), &frame);
+    std::vector<fridge::Detection> move_2;
+    move_2.push_back(det(0, 160, 100, 260, 200));
+    move_2.push_back(det(1, 300, 100, 400, 200));
+    send_frame(&session, move_2,
+               std::vector<fridge::BBox>(1, fridge::BBox(140, 80, 240, 220)), &frame);
+    std::vector<fridge::Detection> final_fronts;
+    final_fronts.push_back(det(0, 100, 100, 200, 200));
+    final_fronts.push_back(det(1, 300, 100, 400, 200));
+    send_frame(&session, final_fronts,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+
+    fridge::SettlementResult result = settle_after_hand(&session, final_fronts, &frame);
+    assert(result.committed);
+    const fridge::InventoryItem* still_hidden = session.inventory().find_by_item(1);
+    assert(still_hidden != 0);
+    assert(still_hidden->status == fridge::ItemStatus::OCCLUDED);
+    assert(!still_hidden->block_ids.count(2));
+    assert(still_hidden->block_ids.count(3));
+    assert(has_event(result, fridge::EventKind::MOVED, 2));
+    assert(!has_event(result, fridge::EventKind::REVEALED, 1));
 }
 
 // POST_HAND_REVEAL_D 的第一张无手直接帧只能创建候选；第二张能连续匹配

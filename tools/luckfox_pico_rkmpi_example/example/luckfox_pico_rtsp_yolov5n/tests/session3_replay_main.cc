@@ -29,6 +29,9 @@ int main() {
     test_adjacent_same_class_new_item_gets_its_own_d_chain();
     test_unbound_no_hand_box_never_auto_in();
     test_moved_front_item_occludes_then_reveals();
+    test_historical_blocker_out_starts_new_missing_chain();
+    test_partial_front_relation_does_not_start_occlusion_loss_out_chain();
+    test_remaining_historical_blocker_keeps_c_occluded_after_other_moves();
     test_low_coverage_contact_move_keeps_identity();
     test_low_coverage_contact_without_endpoint_stays_pending();
     test_low_coverage_contact_candidate_releases_at_original();
@@ -58,5 +61,6 @@ int main() {
     test_same_class_old_owner_blocks_path_match_before_identity_swap();
     test_direct_original_evidence_rolls_back_provisional_moved();
     test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
+    test_same_class_candidate_context_includes_unowned_viable_old_c();
     return 0;
 }

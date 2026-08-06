@@ -398,7 +398,18 @@ private:
     void reset_stable_near_original_no_hand_evidence_(OperationTrack* track,
                                                        const char* reason);
     void mark_pending_out_(int item_id);
-    void refresh_confirmed_blockers_(const std::set<int>& observed_working_ids);
+    void refresh_confirmed_blockers_(std::map<int, InventoryItem>* final_items,
+                                     const std::set<int>& observed_working_ids,
+                                     const std::set<int>& confirmed_front_ids,
+                                     std::set<int>* fully_occluded_item_ids);
+    bool advance_occlusion_loss_out_evidence_(
+        const std::map<int, InventoryItem>& final_items,
+        const std::set<int>& observed_working_ids,
+        const std::set<int>& fully_occluded_item_ids);
+    void link_suspect_to_conflicting_old_items_(int runtime_key,
+                                                const std::set<int>& old_item_ids,
+                                                const char* phase,
+                                                int detection_index);
     void set_live_state_(OperationTrack* track, LiveObservationState state,
                          bool provisional, const char* reason);
     void update_hand_live_states_();
@@ -435,6 +446,9 @@ private:
     // 上一张直接无手帧中各保留实例的真实框。只有框仍连续时，才能沿用
     // 对应的 survivor / OUT 缺失计数，避免一次框跳变被误当作连续缺失。
     std::map<int, std::map<int, BBox> > visible_count_prior_survivor_boxes_by_cls_;
+    // 历史完整遮挡解释失效后，且旧 C 本轮没有自己的运行时轨迹时使用的
+    // 连续缺失计数。它只存在于当前事务，不能复用 D 或可见数量计数。
+    std::map<int, int> occlusion_loss_missing_counts_;
     std::vector<BBox> hand_track_;
     BBox old_hand_box_;
     bool has_old_hand_box_ = false;

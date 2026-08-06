@@ -12,13 +12,39 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace fridge {
 
 using namespace session_internal;
+
+namespace {
+
+std::string no_hand_candidate_context_ids(const std::set<int>& item_ids) {
+    std::ostringstream stream;
+    stream << "[";
+    for (std::set<int>::const_iterator it = item_ids.begin(); it != item_ids.end(); ++it) {
+        if (it != item_ids.begin()) stream << ",";
+        stream << *it;
+    }
+    stream << "]";
+    return stream.str();
+}
+
+const char* no_hand_candidate_context_decision(const SameClassCandidateContext& context) {
+    if (context.viable_unresolved_old_item_ids.empty()) {
+        return "independent-d-candidate";
+    }
+    return context.viable_unresolved_old_item_ids.size() == 1
+        ? "unique-unresolved-old-c"
+        : "multiple-unresolved-old-c";
+}
+
+}  // namespace
 
 void SessionManager::register_post_hand_reveal_suspects_(
         const std::vector<Detection>& detections,
@@ -176,6 +202,37 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             it->second.no_hand_candidate_ambiguous = false;
         } else if (it->second.pending_d_quarantined_by_old_c) {
             it->second.alias_no_hand_matched_this_frame = false;
+        }
+    }
+
+    // 临时 D 在有手阶段可能早于某个旧 C 的完整路径证据出现。无手阶段再次
+    // 看到同一个候选框时，先补全 D -> old C 的冲突边，再让旧 C 优先处理；
+    // 绝不能让一个“不认识 A”的 pending D 排除 A 的最终检测框。
+    const std::map<int, int> no_known_item_owner;
+    for (size_t di = 0; di < detections.size(); ++di) {
+        const SameClassCandidateContext context = build_same_class_candidate_context(
+            detections[di], static_cast<int>(di), working_inventory_,
+            operation_start_inventory_, pending_in_ids_, track_buffer_,
+            no_known_item_owner);
+        const std::string direct_old_ids =
+            no_hand_candidate_context_ids(context.direct_old_item_ids);
+        const std::string viable_old_ids =
+            no_hand_candidate_context_ids(context.viable_unresolved_old_item_ids);
+        const std::string matching_suspect_ids =
+            no_hand_candidate_context_ids(context.matching_suspect_runtime_keys);
+        trace_("CANDIDATE-CONTEXT",
+               "candidate=%zu cls=%d direct-old=%s viable-unresolved-old=%s "
+               "matching-suspect=%s decision=%s allow-d-promote=%d phase=NO_HAND",
+               di, detections[di].cls_id, direct_old_ids.c_str(), viable_old_ids.c_str(),
+               matching_suspect_ids.c_str(), no_hand_candidate_context_decision(context),
+               context.viable_unresolved_old_item_ids.empty() ? 1 : 0);
+        if (context.viable_unresolved_old_item_ids.empty()) continue;
+        for (std::set<int>::const_iterator suspect =
+                 context.matching_suspect_runtime_keys.begin();
+             suspect != context.matching_suspect_runtime_keys.end(); ++suspect) {
+            link_suspect_to_conflicting_old_items_(
+                *suspect, context.viable_unresolved_old_item_ids,
+                "NO_HAND", static_cast<int>(di));
         }
     }
 

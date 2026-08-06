@@ -1,5 +1,6 @@
 // Host-side SessionManager replay scenarios: ownership.
 #include "session3_replay_support.h"
+#include "session_internal.h"
 
 #include <algorithm>
 #include <assert.h>
@@ -1336,6 +1337,78 @@ void test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance()
          it != tracks.end(); ++it) {
         assert(!it->second.is_suspect_new);
     }
+}
+
+// 细节18-4：同类候选 d 即使先因 item#1 有另一直接框而进入 C-D alias，
+// 只要 item#5 没有直接框、但自己的路径仍能到达 d，就必须同时写入 alias。
+// 否则 pending D 会先把 d 当作排他候选，反过来阻止 item#5 的无手 reappear。
+void test_same_class_candidate_context_includes_unowned_viable_old_c() {
+    using namespace fridge::session_internal;
+
+    std::map<int, fridge::InventoryItem> operation_start;
+    operation_start[1] = item(1, 0, 100, 100, 200, 200);
+    operation_start[4] = item(4, 0, 500, 100, 600, 200);
+    operation_start[5] = item(5, 0, 700, 100, 800, 200);
+    std::map<int, fridge::InventoryItem> working = operation_start;
+
+    fridge::OperationTrack old_1;
+    old_1.item_id = 1;
+    old_1.cls_id = 0;
+    old_1.original_box = operation_start[1].base_box;
+    old_1.state = fridge::OperationTrackState::HAND_PARTIAL_BLOCKED;
+    old_1.needs_no_hand_settlement = true;
+    old_1.track.push_back(old_1.original_box);
+
+    fridge::OperationTrack old_5;
+    old_5.item_id = 5;
+    old_5.cls_id = 0;
+    old_5.original_box = operation_start[5].base_box;
+    old_5.state = fridge::OperationTrackState::HAND_FULL_BLOCKED;
+    old_5.needs_no_hand_settlement = true;
+    old_5.reappearance_pending = true;
+    old_5.track.push_back(old_5.original_box);
+    old_5.track.push_back(fridge::BBox(300, 100, 400, 200));
+
+    fridge::OperationTrack alias_d;
+    alias_d.suspect_id = -1;
+    alias_d.is_suspect_new = true;
+    alias_d.pending_d_quarantined_by_old_c = true;
+    alias_d.cls_id = 0;
+    alias_d.state = fridge::OperationTrackState::HAND_PARTIAL_BLOCKED;
+    alias_d.last_seen_box = fridge::BBox(300, 100, 400, 200);
+    alias_d.has_last_seen_box = true;
+    alias_d.track.push_back(alias_d.last_seen_box);
+    // 这正是修复前的不完整关系：只有已有另一直接框的 item#1。
+    alias_d.conflicting_old_item_ids.insert(1);
+
+    std::map<int, fridge::OperationTrack> tracks;
+    tracks[1] = old_1;
+    tracks[5] = old_5;
+    tracks[-1] = alias_d;
+
+    std::map<int, int> known_item_owner;
+    known_item_owner[1] = 0;  // detection 0 已独立保留给 item#1。
+    const fridge::Detection candidate = det(0, 300, 100, 400, 200);
+    const SameClassCandidateContext context = build_same_class_candidate_context(
+        candidate, 1, working, operation_start, std::set<int>(), tracks,
+        known_item_owner);
+    assert(!context.viable_unresolved_old_item_ids.count(1));
+    assert(context.viable_unresolved_old_item_ids.count(5));
+    assert(context.matching_suspect_runtime_keys.count(-1));
+
+    const std::vector<fridge::Detection> detections = {
+        det(0, 100, 100, 200, 200), candidate};
+    // 缺少 item#5 的冲突边时，D 会错误排除 item#5 的唯一无手候选。
+    assert(unique_no_hand_reappear_detection_for_track(
+               detections, std::set<int>(), 5, tracks[5], working,
+               operation_start, std::set<int>(), tracks) == -1);
+
+    // 真实实现通过 link_suspect_to_conflicting_old_items_ 写入同样的双向关系。
+    tracks[-1].conflicting_old_item_ids.insert(5);
+    tracks[5].conflicting_suspect_keys.insert(-1);
+    assert(unique_no_hand_reappear_detection_for_track(
+               detections, std::set<int>(), 5, tracks[5], working,
+               operation_start, std::set<int>(), tracks) == 1);
 }
 
 }  // namespace session3_replay

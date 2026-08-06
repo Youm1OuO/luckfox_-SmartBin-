@@ -345,6 +345,55 @@ bool strict_owner_is_quarantined_alias_of_old_c(
            suspect->second.conflicting_old_item_ids.count(old_item_id) > 0;
 }
 
+SameClassCandidateContext build_same_class_candidate_context(
+        const Detection& detection, int detection_index,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner) {
+    SameClassCandidateContext context;
+
+    // 直接 owner 只是本帧的高优先级事实。它不能让同类、仍未结案的旧 C
+    // 从另一个候选框的竞争关系中消失，因此下面会独立收集 viable old C。
+    for (std::map<int, int>::const_iterator owner = known_item_owner.begin();
+         owner != known_item_owner.end(); ++owner) {
+        if (owner->second == detection_index && operation_start.count(owner->first)) {
+            context.direct_old_item_ids.insert(owner->first);
+        }
+    }
+
+    for (std::map<int, InventoryItem>::const_iterator old = operation_start.begin();
+         old != operation_start.end(); ++old) {
+        if (old->second.cls_id != detection.cls_id ||
+            !working.count(old->first) || pending_in_ids.count(old->first)) {
+            continue;
+        }
+        std::map<int, OperationTrack>::const_iterator runtime = tracks.find(old->first);
+        if (runtime == tracks.end() ||
+            !is_unresolved_operation_start_old_track(runtime->second) ||
+            !is_active_runtime_track(runtime->second)) {
+            continue;
+        }
+        if (detection_can_belong_to_active_track(detection, runtime->second)) {
+            context.viable_unresolved_old_item_ids.insert(old->first);
+        }
+    }
+
+    for (std::map<int, OperationTrack>::const_iterator track = tracks.begin();
+         track != tracks.end(); ++track) {
+        if (!track->second.is_suspect_new ||
+            !is_active_runtime_track(track->second) ||
+            track->second.cls_id != detection.cls_id) {
+            continue;
+        }
+        if (detection_can_belong_to_active_track(detection, track->second)) {
+            context.matching_suspect_runtime_keys.insert(track->first);
+        }
+    }
+    return context;
+}
+
 // CONTACT_* 只使用物品自己的真实观测路径。手框位移不能替代这里的 BBox
 // 位移，因为手腕不动时手指仍可能推动物品。
 float contact_reference_cost(const OperationTrack& track,

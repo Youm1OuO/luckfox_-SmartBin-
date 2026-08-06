@@ -483,9 +483,128 @@ void SessionManager::prepare_visible_count_settlement_(
     }
 }
 
-void SessionManager::refresh_confirmed_blockers_(const std::set<int>& /*observed_working_ids*/) {
-    // 最终无手直接帧中统一重算。手还在时不按任意框交集写 block_ids，
-    // 避免旧 2.0 版本那种 blocker 不断膨胀的问题。
+void SessionManager::refresh_confirmed_blockers_(
+        std::map<int, InventoryItem>* final_items,
+        const std::set<int>& observed_working_ids,
+        const std::set<int>& confirmed_front_ids,
+        std::set<int>* fully_occluded_item_ids) {
+    if (!final_items || !fully_occluded_item_ids) return;
+    fully_occluded_item_ids->clear();
+
+    // 所有身份、最终可靠框和 pending IN / MOVED 都已经在调用前准备完毕。
+    // 这里统一读取上一轮已提交关系和本轮已确认前景，绝不把 hand/suspect D
+    // 的临时框直接写成正式 blocker。
+    for (std::map<int, InventoryItem>::iterator target = final_items->begin();
+         target != final_items->end(); ++target) {
+        const int target_id = target->first;
+        const std::map<int, InventoryItem>::const_iterator original =
+            operation_start_inventory_.find(target_id);
+        const InventoryItem& relationship_source =
+            original == operation_start_inventory_.end() ? target->second : original->second;
+        // 已确认 MOVED / IN 的 target 已在 final_items 中刷新为本轮可靠最终框；
+        // 未观察到的旧 C 则仍保留操作开始时的完整参考框。
+        const BBox target_box = target->second.base_box.area() > 0.0f
+            ? target->second.base_box : target->second.box;
+
+        std::set<int> effective_block_ids;
+        std::vector<BBox> cover_boxes;
+        const std::set<int> historical_block_ids = relationship_source.block_ids;
+
+        for (int source = 0; source < 2; ++source) {
+            const std::set<int>& candidate_ids = source == 0
+                ? historical_block_ids : confirmed_front_ids;
+            for (std::set<int>::const_iterator blocker = candidate_ids.begin();
+                 blocker != candidate_ids.end(); ++blocker) {
+                if (*blocker == target_id || pending_out_ids_.count(*blocker)) continue;
+                std::map<int, InventoryItem>::const_iterator front =
+                    final_items->find(*blocker);
+                if (front == final_items->end()) continue;
+                const BBox front_box = front->second.base_box.area() > 0.0f
+                    ? front->second.base_box : front->second.box;
+                if (target_box.area() <= 0.0f || front_box.area() <= 0.0f ||
+                    intersection_area(target_box, front_box) <= BLOCK_OVERLAP_AREA_EPS) {
+                    continue;
+                }
+                if (effective_block_ids.insert(*blocker).second) {
+                    cover_boxes.push_back(front_box);
+                }
+            }
+        }
+
+        if (observed_working_ids.count(target_id)) {
+            // 直接看见 C 时状态必须为 VISIBLE；仍相交的 blocker 是前景关系，
+            // 不是“继续完全遮挡”的状态，因此不能被无条件清空。
+            target->second.status = ItemStatus::VISIBLE;
+            target->second.block_ids.swap(effective_block_ids);
+            continue;
+        }
+
+        if (original == operation_start_inventory_.end()) {
+            // 本轮新 D 没有直接无手身份时不会成为正式库存目标，更不能凭几何
+            // 推导出新的遮挡关系。
+            target->second.block_ids.swap(effective_block_ids);
+            continue;
+        }
+
+        // 未直接观察到的旧 C 继续使用操作开始时的可靠身份和 base_box，丢弃
+        // 有手阶段可能留下的临时 status / block_ids，只保留有效历史和新前景。
+        InventoryItem retained = original->second;
+        retained.block_ids.swap(effective_block_ids);
+        if (fully_covered_by(target_box, cover_boxes)) {
+            retained.status = ItemStatus::OCCLUDED;
+            fully_occluded_item_ids->insert(target_id);
+        }
+        // 覆盖并集不完整时不得因“没看到”直接改为 VISIBLE 或 REVEALED；保留
+        // 上一轮状态并让既有 OUT 证据或下面的遮挡失效计数继续处理。
+        target->second = retained;
+    }
+}
+
+bool SessionManager::advance_occlusion_loss_out_evidence_(
+        const std::map<int, InventoryItem>& final_items,
+        const std::set<int>& observed_working_ids,
+        const std::set<int>& fully_occluded_item_ids) {
+    bool unresolved = false;
+    for (std::map<int, InventoryItem>::const_iterator original =
+             operation_start_inventory_.begin();
+         original != operation_start_inventory_.end(); ++original) {
+        const int item_id = original->first;
+        // 专用的“遮挡解释失效”缺失链只适用于上一轮已经确认完全遮挡的 C。
+        // VISIBLE + block_ids 仅表示局部前景关系，不能凭它绕过旧 C 自己的
+        // OUT 证据而把一次漏检当成出库。
+        if (original->second.status != ItemStatus::OCCLUDED) {
+            occlusion_loss_missing_counts_.erase(item_id);
+            continue;
+        }
+        if (!final_items.count(item_id) || pending_out_ids_.count(item_id) ||
+            observed_working_ids.count(item_id) || fully_occluded_item_ids.count(item_id)) {
+            occlusion_loss_missing_counts_.erase(item_id);
+            continue;
+        }
+
+        // 有活动旧 C 轨迹时，既有无手路径负责缺失计数；这里只补“历史被遮挡、
+        // 本轮没有自己的 runtime”的空洞，避免与原有 OUT 证据重复计数。
+        const OperationTrack* runtime = find_runtime_for_item_(item_id);
+        if (runtime && !runtime->is_suspect_new && existing_item_needs_settlement(*runtime)) {
+            occlusion_loss_missing_counts_.erase(item_id);
+            continue;
+        }
+
+        const int previous = occlusion_loss_missing_counts_[item_id];
+        const int next = previous + 1;
+        occlusion_loss_missing_counts_[item_id] = next;
+        trace_("OCCLUSION",
+               "item=%d action=coverage-lost-direct-missing old=%d new=%d threshold=%d",
+               item_id, previous, next, FLOW3_NO_HAND_OUT_MISSING_FRAMES);
+        if (next >= FLOW3_NO_HAND_OUT_MISSING_FRAMES) {
+            mark_pending_out_(item_id);
+            occlusion_loss_missing_counts_.erase(item_id);
+            trace_("OCCLUSION", "item=%d action=confirm-out-after-coverage-loss", item_id);
+        } else {
+            unresolved = true;
+        }
+    }
+    return unresolved;
 }
 
 SettlementResult SessionManager::settle_no_hand_frame_(
@@ -661,7 +780,6 @@ SettlementResult SessionManager::settle_no_hand_frame_(
             item.base_box = observed[it->second].box;
         }
         item.status = ItemStatus::VISIBLE;
-        item.block_ids.clear();
     }
 
     // 仅“本轮确认移动/确认入库，且在当前无手帧直接出现”的物品可成为前景遮挡物。
@@ -673,47 +791,29 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     }
 
     std::set<int> fully_occluded_ids;
-    for (std::map<int, InventoryItem>::iterator it = final_items.begin();
-         it != final_items.end(); ++it) {
-        if (observed_ids.count(it->first)) continue;
-        std::map<int, InventoryItem>::const_iterator original =
-            operation_start_inventory_.find(it->first);
-        if (original == operation_start_inventory_.end()) continue;
+    refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
+                                &fully_occluded_ids);
 
-        std::vector<int> blockers;
-        std::vector<BBox> cover_boxes;
-        for (std::set<int>::const_iterator front_id = confirmed_front_ids.begin();
-             front_id != confirmed_front_ids.end(); ++front_id) {
-            if (*front_id == it->first) continue;
-            std::map<int, InventoryItem>::const_iterator front = final_items.find(*front_id);
-            if (front == final_items.end()) continue;
-            const BBox front_box = front->second.base_box.area() > 0.0f
-                ? front->second.base_box : front->second.box;
-            if (intersection_area(original->second.base_box, front_box) <=
-                BLOCK_OVERLAP_AREA_EPS) {
-                continue;
-            }
-            // 先收集所有已确认前景框，再由矩形差集计算它们的覆盖并集。
-            // 单个新 D 的部分覆盖不能把缺失 C 直接定为 OCCLUDED。
-            blockers.push_back(*front_id);
-            cover_boxes.push_back(front_box);
-        }
-        if (fully_covered_by(original->second.base_box, cover_boxes)) {
-            it->second = original->second;
-            it->second.status = ItemStatus::OCCLUDED;
-            it->second.block_ids.clear();
-            it->second.block_ids.insert(blockers.begin(), blockers.end());
-            fully_occluded_ids.insert(it->first);
-            continue;
-        }
-
-        // 不完整遮挡和本帧缺失都不是最终状态。旧 C 是否可 OUT 由下面的
-        // 连续直接无手缺失证据统一处理；在此之前保留原库存身份。
-        it->second = original->second;
+    // OUT 判定会在本帧把 blocker 加入 pending_out_ids_。若这改变了 blocker
+    // 集合，必须在删除 final_items 前重算一次，不能让已正式 OUT 的 A 继续
+    // 遮挡 C，也不能把 C 直接伪造为 REVEALED。
+    const std::set<int> pending_out_before_no_hand = pending_out_ids_;
+    bool has_unresolved_state = has_unresolved_no_hand_state_(
+        observed_ids, fully_occluded_ids);
+    if (pending_out_before_no_hand != pending_out_ids_) {
+        refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
+                                    &fully_occluded_ids);
     }
 
-    const bool has_unresolved_state = has_unresolved_no_hand_state_(
-        observed_ids, fully_occluded_ids);
+    const std::set<int> pending_out_before_occlusion_loss = pending_out_ids_;
+    if (advance_occlusion_loss_out_evidence_(final_items, observed_ids,
+                                             fully_occluded_ids)) {
+        has_unresolved_state = true;
+    }
+    if (pending_out_before_occlusion_loss != pending_out_ids_) {
+        refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
+                                    &fully_occluded_ids);
+    }
 
     for (std::set<int>::const_iterator out = pending_out_ids_.begin();
          out != pending_out_ids_.end(); ++out) {
@@ -726,27 +826,6 @@ SettlementResult SessionManager::settle_no_hand_frame_(
                final_items.size(), track_buffer_.size(), pending_in_ids_.size(),
                pending_out_ids_.size());
         return result;
-    }
-
-    // blocker 只保留存在且真正覆盖的已确认前景物品。
-    for (std::map<int, InventoryItem>::iterator it = final_items.begin();
-         it != final_items.end(); ++it) {
-        for (std::set<int>::iterator blocker = it->second.block_ids.begin();
-             blocker != it->second.block_ids.end();) {
-            std::map<int, InventoryItem>::const_iterator front = final_items.find(*blocker);
-            if (front == final_items.end() || *blocker == it->first ||
-                !confirmed_front_ids.count(*blocker) ||
-                intersection_area(it->second.base_box, front->second.base_box) <=
-                    BLOCK_OVERLAP_AREA_EPS) {
-                blocker = it->second.block_ids.erase(blocker);
-            } else {
-                ++blocker;
-            }
-        }
-        if (it->second.status == ItemStatus::OCCLUDED && it->second.block_ids.empty() &&
-            observed_ids.count(it->first)) {
-            it->second.status = ItemStatus::VISIBLE;
-        }
     }
 
     // 最后才生成正式事件；整个过程中没有任何“未绑定无手框自动 IN”。

@@ -127,6 +127,14 @@ struct StrictDetectionOwner {
     int runtime_key = 0;
 };
 
+// 同类候选框在当前事务内的身份竞争关系。它不写正式库存，也不替代已有的
+// 严格 owner；仅用于确保临时 D 不会遗漏一个仍可合理拥有该框的旧 C。
+struct SameClassCandidateContext {
+    std::set<int> direct_old_item_ids;
+    std::set<int> viable_unresolved_old_item_ids;
+    std::set<int> matching_suspect_runtime_keys;
+};
+
 const char* strict_owner_kind_name(StrictOwnerKind kind);
 const OperationTrack* runtime_for_working_item(
         int item_id, const std::map<int, OperationTrack>& tracks,
@@ -141,6 +149,13 @@ bool strict_owner_blocks_old_c(StrictOwnerKind kind);
 bool strict_owner_is_quarantined_alias_of_old_c(
         const StrictDetectionOwner& owner, int old_item_id,
         const std::map<int, OperationTrack>& tracks);
+SameClassCandidateContext build_same_class_candidate_context(
+        const Detection& detection, int detection_index,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner);
 
 float contact_reference_cost(const OperationTrack& track,
                              const BBox& reference,

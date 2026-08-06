@@ -50,6 +50,9 @@ void test_ambiguous_hand_partial_box_does_not_create_d();
 void test_adjacent_same_class_new_item_gets_its_own_d_chain();
 void test_unbound_no_hand_box_never_auto_in();
 void test_moved_front_item_occludes_then_reveals();
+void test_historical_blocker_out_starts_new_missing_chain();
+void test_partial_front_relation_does_not_start_occlusion_loss_out_chain();
+void test_remaining_historical_blocker_keeps_c_occluded_after_other_moves();
 void test_low_coverage_contact_move_keeps_identity();
 void test_low_coverage_contact_without_endpoint_stays_pending();
 void test_low_coverage_contact_candidate_releases_at_original();
@@ -79,6 +82,7 @@ void test_hand_affected_old_c_does_not_block_static_owner_reservation();
 void test_same_class_old_owner_blocks_path_match_before_identity_swap();
 void test_direct_original_evidence_rolls_back_provisional_moved();
 void test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
+void test_same_class_candidate_context_includes_unowned_viable_old_c();
 
 }  // namespace session3_replay
 

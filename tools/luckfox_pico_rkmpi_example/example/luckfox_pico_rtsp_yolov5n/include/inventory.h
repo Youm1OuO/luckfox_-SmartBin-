@@ -7,7 +7,8 @@
 //    - 出库只存在于本轮 working_inventory；成功结算后才删除正式物品
 //    - item_id 只属于库存；Track 只提供整理/出库的必要证据
 //    - box 是最近一次确认看见的框；base_box 是该物品可靠的完整位置
-//    - block_ids 是位于该物品前方、且覆盖其 base_box 的多个物品 ID
+//    - block_ids 是已确认位于该物品前方、且仍与其 base_box 相交的物品 ID；
+//      是否完全遮挡由这些前景框的覆盖并集单独判断
 //    - InventoryDB 用 std::map 保存物品，按 item_id 查找且对象地址稳定
 // ============================================================================
 #ifndef __FRIDGE_INVENTORY_H

@@ -12,13 +12,39 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace fridge {
 
 using namespace session_internal;
+
+namespace {
+
+std::string candidate_context_ids(const std::set<int>& item_ids) {
+    std::ostringstream stream;
+    stream << "[";
+    for (std::set<int>::const_iterator it = item_ids.begin(); it != item_ids.end(); ++it) {
+        if (it != item_ids.begin()) stream << ",";
+        stream << *it;
+    }
+    stream << "]";
+    return stream.str();
+}
+
+const char* candidate_context_decision(const SameClassCandidateContext& context) {
+    if (context.viable_unresolved_old_item_ids.empty()) {
+        return "independent-d-candidate";
+    }
+    return context.viable_unresolved_old_item_ids.size() == 1
+        ? "unique-unresolved-old-c"
+        : "multiple-unresolved-old-c";
+}
+
+}  // namespace
 
 void SessionManager::begin_working_operation_(const BBox& hand_box,
                                                const std::vector<Detection>& detections) {
@@ -38,6 +64,7 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     visible_count_confirmed_out_ids_.clear();
     visible_count_prior_survivors_by_cls_.clear();
     visible_count_prior_survivor_boxes_by_cls_.clear();
+    occlusion_loss_missing_counts_.clear();
     hand_track_.clear();
     hand_track_.push_back(hand_box);
     old_hand_box_ = hand_box;
@@ -48,6 +75,65 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
            working_inventory_.size(), detections.size(), hand_box.x1, hand_box.y1,
            hand_box.x2, hand_box.y2);
     process_effective_hand_frame_(hand_box, detections, true);
+}
+
+void SessionManager::link_suspect_to_conflicting_old_items_(
+        int runtime_key, const std::set<int>& old_item_ids,
+        const char* phase, int detection_index) {
+    if (old_item_ids.empty()) return;
+    std::map<int, OperationTrack>::iterator suspect = track_buffer_.find(runtime_key);
+    if (suspect == track_buffer_.end() || !suspect->second.is_suspect_new) {
+        return;
+    }
+
+    // 先过滤掉本帧已经结案的 old C。只有实际会写入的冲突边才能让一个
+    // 已暂存的 D 降回 runtime-only alias，避免无效候选意外撤销 D 证据链。
+    std::set<int> valid_old_item_ids;
+    for (std::set<int>::const_iterator old_id = old_item_ids.begin();
+         old_id != old_item_ids.end(); ++old_id) {
+        std::map<int, OperationTrack>::iterator old = track_buffer_.find(*old_id);
+        if (old == track_buffer_.end() || old->second.is_suspect_new ||
+            !is_unresolved_operation_start_old_track(old->second)) {
+            continue;
+        }
+        valid_old_item_ids.insert(*old_id);
+    }
+    if (valid_old_item_ids.empty()) return;
+
+    OperationTrack& d = suspect->second;
+    // 某个旧 C 的可行路径可能在 D 连续自匹配后才显露。此时 D 虽然已经
+    // 暂存进 working_inventory_，仍只是未提交候选；必须回收该 staged item
+    // 并降回 C-D alias，不能让一个“不认识 A”的 pending D 保留排他资格、
+    // 参与 blocker 或先于 A 提交 IN。
+    if (d.promoted_to_working_inventory && d.item_id > 0) {
+        const int staged_item_id = d.item_id;
+        working_inventory_.erase(staged_item_id);
+        pending_in_ids_.erase(staged_item_id);
+        pending_out_ids_.erase(staged_item_id);
+        confirmed_moved_ids_.erase(staged_item_id);
+        d.item_id = 0;
+        d.promoted_to_working_inventory = false;
+        d.drop_confirmed = false;
+        d.no_hand_detection_index = -1;
+        trace_("C-D-ALIAS",
+               "suspect=%d staged-item=%d detection=%d phase=%s "
+               "action=retract-pending-d-to-complete-conflict-graph",
+               d.suspect_id, staged_item_id, detection_index,
+               phase ? phase : "UNKNOWN");
+    }
+    d.pending_d_quarantined_by_old_c = true;
+    for (std::set<int>::const_iterator old_id = valid_old_item_ids.begin();
+         old_id != valid_old_item_ids.end(); ++old_id) {
+        std::map<int, OperationTrack>::iterator old = track_buffer_.find(*old_id);
+        const bool inserted = d.conflicting_old_item_ids.insert(*old_id).second;
+        old->second.conflicting_suspect_keys.insert(runtime_key);
+        if (inserted) {
+            trace_("C-D-ALIAS",
+                   "old-item=%d suspect=%d detection=%d phase=%s relation=viable-old-c "
+                   "action=link-complete-candidate-context",
+                   *old_id, d.suspect_id, detection_index, phase ? phase : "UNKNOWN");
+        }
+    }
 }
 
 void SessionManager::append_move_to_existing_hand_tracks_(const MoveValue& delta) {
@@ -1533,11 +1619,30 @@ void SessionManager::scan_or_update_suspects_(
         }
         if (belongs_to_contact_track) continue;
 
-        // 细节11：旧 C 即使本帧已经临时认领了另一个同类框，也不等于
-        // 它已经结算。此时第二个未认领框必须实时建成 D 轨迹，但只要 C
-        // 仍是活动的操作开始旧库存，就将 D 隔离为 C-D alias，禁止它在
-        // 有手阶段取得 working_inventory_ 的排他身份。
-        std::set<int> alias_old_item_ids;
+        // 先完成当前候选框的同类冲突图，再决定它是否能进入 D 链路。旧 C
+        // 即使已经临时拥有另一检测框，也不能让“没有直接框、但路径可到达
+        // 当前 d”的旧 A 漏出 alias；否则临时 D 会反过来排除 A 的最终框。
+        const SameClassCandidateContext candidate_context =
+            build_same_class_candidate_context(
+                d, detection_index, working_inventory_, operation_start_inventory_,
+                pending_in_ids_, track_buffer_, effective_known_item_owner);
+        const std::string direct_old_ids =
+            candidate_context_ids(candidate_context.direct_old_item_ids);
+        const std::string viable_old_ids =
+            candidate_context_ids(candidate_context.viable_unresolved_old_item_ids);
+        const std::string matching_suspect_ids =
+            candidate_context_ids(candidate_context.matching_suspect_runtime_keys);
+        trace_("CANDIDATE-CONTEXT",
+               "candidate=%d cls=%d direct-old=%s viable-unresolved-old=%s "
+               "matching-suspect=%s decision=%s allow-d-promote=%d",
+               detection_index, d.cls_id, direct_old_ids.c_str(), viable_old_ids.c_str(),
+               matching_suspect_ids.c_str(), candidate_context_decision(candidate_context),
+               candidate_context.viable_unresolved_old_item_ids.empty() ? 1 : 0);
+
+        // 保留已验证的“旧 C 另有直接框时也要建立 alias”逻辑，并补上上面
+        // 收集到的无直接框可行旧 C。两类关系都只存在于当前操作运行时。
+        std::set<int> alias_old_item_ids =
+            candidate_context.viable_unresolved_old_item_ids;
         for (std::map<int, InventoryItem>::const_iterator old =
                  operation_start_inventory_.begin();
              old != operation_start_inventory_.end(); ++old) {
@@ -1555,9 +1660,8 @@ void SessionManager::scan_or_update_suspects_(
             }
             std::map<int, int>::const_iterator owner =
                 effective_known_item_owner.find(old->first);
-            // 仅覆盖本次实机漏洞的窄分支：C 已经临时拥有另一个检测框，
-            // 当前 d 仍未认领。没有任何 owner 的 C 继续沿既有保护/未决
-            // 逻辑处理，避免改变已验证的同类相邻和 CONTACT_* 路径。
+            // 已经拥有另一直接框的未决 C 仍保留原有 alias 语义；这不是
+            // 对它的第二次身份认领，而是 D 独立性检查需要的冲突边。
             if (owner == effective_known_item_owner.end() ||
                 owner->second == static_cast<int>(di)) {
                 continue;
@@ -1569,8 +1673,6 @@ void SessionManager::scan_or_update_suspects_(
             const int key = new_suspect_id_();
             track.suspect_id = key;
             track.is_suspect_new = true;
-            track.pending_d_quarantined_by_old_c = true;
-            track.conflicting_old_item_ids = alias_old_item_ids;
             track.suspect_source = replacement_owner >= 0
                 ? SuspectSource::C_POSITION_REPLACEMENT_D
                 : SuspectSource::HAND_VISIBLE_D;
@@ -1590,22 +1692,12 @@ void SessionManager::scan_or_update_suspects_(
             track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
             track.track.push_back(d.box);
             track_buffer_[key] = track;
-            for (std::set<int>::const_iterator old_id = alias_old_item_ids.begin();
-                 old_id != alias_old_item_ids.end(); ++old_id) {
-                std::map<int, OperationTrack>::iterator old = track_buffer_.find(*old_id);
-                if (old != track_buffer_.end()) {
-                    old->second.conflicting_suspect_keys.insert(key);
-                    trace_("C-D-ALIAS",
-                           "old-item=%d suspect=%d detection=%zu phase=HAND "
-                           "relation=shared-or-unresolved action=create "
-                           "reason=same-class-unsettled-old-even-if-current-owner-exists",
-                           *old_id, key, di);
-                }
-            }
+            link_suspect_to_conflicting_old_items_(key, alias_old_item_ids,
+                                                    "HAND", detection_index);
             claimed_detection_indices->insert(static_cast<int>(di));
             trace_("D-GUARD",
                    "candidate=%zu cls=%d action=quarantine-pending-d suspect=%d "
-                   "conflicting-old-count=%zu reason=unresolved-same-class-old-even-if-current-owner-exists "
+                   "conflicting-old-count=%zu reason=complete-same-class-candidate-context "
                    "hand-touching=%d formal-owner-authority=0",
                    di, d.cls_id, key, alias_old_item_ids.size(),
                    hand_visible_d ? 1 : 0);

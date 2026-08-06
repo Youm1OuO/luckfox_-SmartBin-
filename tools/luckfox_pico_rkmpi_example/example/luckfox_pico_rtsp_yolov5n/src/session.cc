@@ -203,6 +203,7 @@ void SessionManager::reset_operation_runtime_() {
     visible_count_confirmed_out_ids_.clear();
     visible_count_prior_survivors_by_cls_.clear();
     visible_count_prior_survivor_boxes_by_cls_.clear();
+    occlusion_loss_missing_counts_.clear();
     hand_track_.clear();
     has_old_hand_box_ = false;
     next_suspect_id_ = -1;
