@@ -49,6 +49,9 @@ int main() {
     test_adjacent_same_class_deficit_requires_continuous_survivor_box();
     test_out_requires_two_direct_missing_frames();
     test_no_hand_occlusion_uses_cover_union();
+    test_unconfirmed_moving_front_defers_out_until_occlusion();
+    test_unconfirmed_moving_front_failure_restores_out_chain();
+    test_confirmed_occlusion_edge_residual_geometry();
     test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup();
     test_static_gray_zone_evidence_resets_when_hand_returns();
     test_quarantined_same_class_duplicate_merges_back_to_old_c();
@@ -62,5 +65,6 @@ int main() {
     test_direct_original_evidence_rolls_back_provisional_moved();
     test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
     test_same_class_candidate_context_includes_unowned_viable_old_c();
+    test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie();
     return 0;
 }

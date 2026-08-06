@@ -70,6 +70,9 @@ void test_adjacent_same_class_single_frame_deficit_recovers_without_out();
 void test_adjacent_same_class_deficit_requires_continuous_survivor_box();
 void test_out_requires_two_direct_missing_frames();
 void test_no_hand_occlusion_uses_cover_union();
+void test_unconfirmed_moving_front_defers_out_until_occlusion();
+void test_unconfirmed_moving_front_failure_restores_out_chain();
+void test_confirmed_occlusion_edge_residual_geometry();
 void test_static_gray_zone_old_c_settles_before_r15_stale_alias_cleanup();
 void test_static_gray_zone_evidence_resets_when_hand_returns();
 void test_quarantined_same_class_duplicate_merges_back_to_old_c();
@@ -83,6 +86,7 @@ void test_same_class_old_owner_blocks_path_match_before_identity_swap();
 void test_direct_original_evidence_rolls_back_provisional_moved();
 void test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
 void test_same_class_candidate_context_includes_unowned_viable_old_c();
+void test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie();
 
 }  // namespace session3_replay
 

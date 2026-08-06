@@ -508,6 +508,8 @@ void SessionManager::refresh_confirmed_blockers_(
 
         std::set<int> effective_block_ids;
         std::vector<BBox> cover_boxes;
+        std::vector<BBox> edge_residual_cover_boxes;
+        bool has_current_confirmed_front_cover = false;
         const std::set<int> historical_block_ids = relationship_source.block_ids;
 
         for (int source = 0; source < 2; ++source) {
@@ -527,6 +529,31 @@ void SessionManager::refresh_confirmed_blockers_(
                 }
                 if (effective_block_ids.insert(*blocker).second) {
                     cover_boxes.push_back(front_box);
+                    if (source == 0) {
+                        // 已提交的 historical blocker 只能提供可靠 base_box；
+                        // 它本身不足以启用窄边缘容差，但可与当前 confirmed
+                        // front 一起参与残余差集。
+                        edge_residual_cover_boxes.push_back(front_box);
+                    } else {
+                        const OperationTrack* runtime =
+                            find_runtime_for_item_(*blocker);
+                        const bool confirmed_moved_front =
+                            confirmed_moved_ids_.count(*blocker) > 0;
+                        const bool confirmed_in_front =
+                            pending_in_ids_.count(*blocker) > 0 && runtime &&
+                            runtime->is_suspect_new &&
+                            runtime->promoted_to_working_inventory &&
+                            !runtime->pending_d_quarantined_by_old_c &&
+                            runtime->no_hand_self_match_count >=
+                                FLOW3_NO_HAND_D_CONFIRM_FRAMES;
+                        // 未达到已有 D 无手直接确认门槛的 pending D 绝不能
+                        // 借边缘容差成为 blocker；它仍可走原有严格覆盖/未决
+                        // 流程，但不会在本 helper 中留下正式遮挡结论。
+                        if (confirmed_moved_front || confirmed_in_front) {
+                            edge_residual_cover_boxes.push_back(front_box);
+                            has_current_confirmed_front_cover = true;
+                        }
+                    }
                 }
             }
         }
@@ -550,9 +577,23 @@ void SessionManager::refresh_confirmed_blockers_(
         // 有手阶段可能留下的临时 status / block_ids，只保留有效历史和新前景。
         InventoryItem retained = original->second;
         retained.block_ids.swap(effective_block_ids);
-        if (fully_covered_by(target_box, cover_boxes)) {
+        const bool strict_fully_covered = fully_covered_by(target_box, cover_boxes);
+        const bool edge_residual_fully_covered = !strict_fully_covered &&
+            has_current_confirmed_front_cover &&
+            edge_residual_within_target_border(
+                target_box, edge_residual_cover_boxes,
+                FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX);
+        if (strict_fully_covered || edge_residual_fully_covered) {
             retained.status = ItemStatus::OCCLUDED;
             fully_occluded_item_ids->insert(target_id);
+            if (edge_residual_fully_covered) {
+                trace_("OCCLUSION",
+                       "target=%d action=confirm-edge-residual-occlusion edge-px=%.1f "
+                       "confirmed-front=%d covers=%zu",
+                       target_id, FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX,
+                       has_current_confirmed_front_cover ? 1 : 0,
+                       edge_residual_cover_boxes.size());
+            }
         }
         // 覆盖并集不完整时不得因“没看到”直接改为 VISIBLE 或 REVEALED；保留
         // 上一轮状态并让既有 OUT 证据或下面的遮挡失效计数继续处理。
@@ -742,6 +783,26 @@ SettlementResult SessionManager::settle_no_hand_frame_(
             !is_active_runtime_track(*runtime) || is_claim_protected(*runtime)) {
             continue;
         }
+        // 同类 C-D alias 尚未完成直接无手仲裁时，当前框仍可能只是
+        // alias 的共享解释。它可以继续参与普通观察绑定，但不能在这里
+        // 被整条 track path 提前升级为 confirmed MOVED，更不能先成为
+        // 另一个旧 C 的正式 blocker。达到既有 alias 连续确认门槛的本帧
+        // 允许继续下面的原有确认流程；不改变 MOVED 的确认帧数。
+        const bool unresolved_alias_before_confirmation =
+            old_track_has_unresolved_alias_(*runtime) &&
+            runtime->alias_no_hand_match_count < FLOW3_NO_HAND_D_CONFIRM_FRAMES;
+        const bool unresolved_no_hand_identity =
+            runtime->no_hand_candidate_ambiguous ||
+            runtime->no_hand_candidate_reserved_by_stronger_owner;
+        if (unresolved_alias_before_confirmation || unresolved_no_hand_identity) {
+            trace_("SETTLE",
+                   "item=%d skip-path-moved-confirmation alias-wait=%d "
+                   "candidate-ambiguous=%d reserved=%d",
+                   it->first, unresolved_alias_before_confirmation ? 1 : 0,
+                   runtime->no_hand_candidate_ambiguous ? 1 : 0,
+                   runtime->no_hand_candidate_reserved_by_stronger_owner ? 1 : 0);
+            continue;
+        }
         // CONTACT_CANDIDATE 必须先凑够两次有效 B 才能确认整理；仅有一条
         // observed_move_values 不能绕过 CONTACT_MOVING 门槛。普通 HAND_*
         // 仍保留原有的 move_values/hold_and_move 收尾规则。
@@ -799,7 +860,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     // 遮挡 C，也不能把 C 直接伪造为 REVEALED。
     const std::set<int> pending_out_before_no_hand = pending_out_ids_;
     bool has_unresolved_state = has_unresolved_no_hand_state_(
-        observed_ids, fully_occluded_ids);
+        detections, observed_ids, fully_occluded_ids);
     if (pending_out_before_no_hand != pending_out_ids_) {
         refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
                                     &fully_occluded_ids);

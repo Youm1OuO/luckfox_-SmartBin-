@@ -1,5 +1,6 @@
 // Host-side SessionManager replay scenarios: no_hand.
 #include "session3_replay_support.h"
+#include "session_internal.h"
 
 #include <algorithm>
 #include <assert.h>
@@ -592,6 +593,157 @@ void test_no_hand_occlusion_uses_cover_union() {
         assert(hidden->block_ids.size() == 2);
         assert(has_event(second.settlement, fridge::EventKind::OCCLUDED, 1));
     }
+}
+
+// A 在无手阶段已有真实移动路径，但同类 C-D alias 尚未完成连续性确认。
+// 目标 C 已经连续两帧没有直接框时，不能在 A 的 alias/身份确认完成前先写
+// OUT；只有 A 按既有门槛确认 MOVED 后，才允许建立 blocker/OCCLUDED。
+void test_unconfirmed_moving_front_defers_out_until_occlusion() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 0, 700, 100, 800, 200));
+    initial.push_back(item(3, 2, 430, 95, 550, 205));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(0, 700, 100, 800, 200));
+    stable.push_back(det(2, 430, 95, 550, 205));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    // A 的同类完整终点与一个窄 decoy 同时出现，构成真实 C-D alias；
+    // 在 alias 尚未完成两帧无手仲裁前，A 不能仅凭宽路径提前确认 MOVED。
+    const fridge::BBox old_hand(80, 80, 220, 220);
+    const fridge::BBox moved_hand(370, 80, 610, 220);
+    const fridge::Detection decoy = det(0, 440, 100, 540, 200);
+    const fridge::Detection complete_a = det(0, 430, 95, 550, 205);
+    const fridge::Detection static_b = det(0, 700, 100, 800, 200);
+    send_frame(&session,
+               std::vector<fridge::Detection>{static_b, stable[2]},
+               std::vector<fridge::BBox>(1, old_hand), &frame);
+    std::vector<fridge::Detection> conflicting_hand_frame;
+    conflicting_hand_frame.push_back(decoy);
+    conflicting_hand_frame.push_back(complete_a);
+    conflicting_hand_frame.push_back(static_b);
+    send_frame(&session, conflicting_hand_frame,
+               std::vector<fridge::BBox>(1, moved_hand), &frame);
+    send_frame(&session, conflicting_hand_frame,
+               std::vector<fridge::BBox>(1, moved_hand), &frame);
+    send_frame(&session, conflicting_hand_frame,
+               std::vector<fridge::BBox>(1, moved_hand), &frame);
+
+    const std::vector<fridge::Detection> first_candidate(1, complete_a);
+    const std::vector<fridge::Detection> final_cover(1, complete_a);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        first_candidate, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+
+    // 这里正好是旧代码 C 的第二张 direct-missing。A 的 alias 在本帧才
+    // 达到既有连续确认门槛；A 的 MOVED 与 C 的 OCCLUDED 必须在同一提交
+    // 中完成，不能让 C 先变成 OUT。
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        final_cover, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    const fridge::InventoryItem* hidden = session.inventory().find_by_item(3);
+    assert(hidden != 0);
+    assert(hidden->status == fridge::ItemStatus::OCCLUDED);
+    assert(hidden->block_ids.count(1));
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 1));
+    assert(has_event(second.settlement, fridge::EventKind::OCCLUDED, 3));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 3));
+}
+
+// 和上一回放只差最后 A 候选消失。保护必须在这一帧自动失效，使 C 从
+// threshold-1 接回正常 direct-missing OUT，而不是留下 blocker 或永久 defer。
+void test_unconfirmed_moving_front_failure_restores_out_chain() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 300, 100, 400, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 220, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 80, 360, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(340, 80, 480, 220)), &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        std::vector<fridge::Detection>(1, det(0, 250, 100, 350, 200)),
+        std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        std::vector<fridge::Detection>(1, det(0, 390, 180, 450, 260)),
+        std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(!second.settlement.committed);
+
+    const int third_no_hand = frame++;
+    fridge::FrameProcessResult third = session.process_frame(
+        std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+        third_no_hand, third_no_hand);
+    assert(third.no_hand_frame_processed);
+    // C 已从 threshold-1 接回普通 OUT 链；A 自己也需要两张连续
+    // direct-missing，故本帧只允许暂存 C 的 OUT，不能永久冻结事务。
+    assert(!third.settlement.committed);
+    assert(session.operation_pending());
+
+    const int fourth_no_hand = frame++;
+    fridge::FrameProcessResult fourth = session.process_frame(
+        std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+        fourth_no_hand, fourth_no_hand);
+    assert(fourth.no_hand_frame_processed);
+    assert(fourth.settlement.committed);
+    assert(session.inventory().find_by_item(1) == 0);
+    assert(session.inventory().find_by_item(2) == 0);
+    assert(has_event(fourth.settlement, fridge::EventKind::OUT, 1));
+    assert(has_event(fourth.settlement, fridge::EventKind::OUT, 2));
+}
+
+// 纯几何层只允许真正接触目标外边界的窄残余；内部细缝和中间空洞即使很窄
+// 也必须保持严格失败。业务调用层另行保证 covers 都来自确认 blocker。
+void test_confirmed_occlusion_edge_residual_geometry() {
+    using namespace fridge::session_internal;
+    const fridge::BBox target(100, 100, 200, 200);
+
+    std::vector<fridge::BBox> left_edge;
+    left_edge.push_back(fridge::BBox(106, 100, 200, 200));
+    assert(!fully_covered_by(target, left_edge));
+    assert(edge_residual_within_target_border(
+        target, left_edge,
+        fridge::FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX));
+
+    std::vector<fridge::BBox> internal_gap;
+    internal_gap.push_back(fridge::BBox(100, 100, 145, 200));
+    internal_gap.push_back(fridge::BBox(155, 100, 200, 200));
+    assert(!fully_covered_by(target, internal_gap));
+    assert(!edge_residual_within_target_border(
+        target, internal_gap,
+        fridge::FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX));
+
+    std::vector<fridge::BBox> deep_edge_gap;
+    deep_edge_gap.push_back(fridge::BBox(112, 100, 200, 200));
+    assert(!edge_residual_within_target_border(
+        target, deep_edge_gap,
+        fridge::FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX));
 }
 
 // 细节13 / r16：手边短暂出现同类低分假框时，r15 必须先保护 alias D。

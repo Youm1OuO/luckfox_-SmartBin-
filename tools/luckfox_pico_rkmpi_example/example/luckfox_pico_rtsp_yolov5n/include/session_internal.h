@@ -78,6 +78,11 @@ InventoryEvent make_event(EventKind kind, const InventoryItem& item,
 void subtract_cover(const BBox& piece, const BBox& cover,
                     std::vector<BBox>* output);
 bool fully_covered_by(const BBox& target, const std::vector<BBox>& covers);
+// 严格差集失败后的窄边缘残余检查。调用方必须先完成身份、confirmed
+// blocker 和“target 未直接可见”的业务门控；本 helper 只判断残余几何。
+bool edge_residual_within_target_border(const BBox& target,
+                                        const std::vector<BBox>& covers,
+                                        float edge_px);
 
 int unique_detection_for_box(const std::vector<Detection>& detections,
                              const std::set<int>& claimed, int cls_id,
@@ -180,6 +185,10 @@ bool has_contact_path_candidate(
 int unique_c_reappear_owner_for_detection(
         const Detection& detection, const std::map<int, OperationTrack>& tracks,
         const std::map<int, int>& known_item_owner);
+// 当前同类 detection 对一个成熟旧 C 的临时仲裁强度。仅用于同帧预约，
+// 不改变既有路径匹配、确认门槛或正式库存。
+int reappear_owner_evidence_strength(const OperationTrack& track,
+                                     const Detection& detection);
 void mark_mature_hand_b_ambiguity(
         const Detection& detection, std::map<int, OperationTrack>* tracks,
         const std::map<int, int>& known_item_owner);
@@ -199,7 +208,8 @@ bool has_ambiguous_no_hand_reappear_candidate(
         const std::map<int, InventoryItem>& operation_start,
         const std::set<int>& pending_in_ids,
         const std::map<int, OperationTrack>& tracks,
-        const std::map<int, int>& independent_static_owner_by_detection);
+        const std::map<int, int>& independent_static_owner_by_detection,
+        bool* reserved_by_stronger_owner = 0);
 bool confirmed_blocker_covers_old_c(
         const OperationTrack& c, const std::vector<Detection>& detections,
         const std::map<int, int>& known_item_owner,

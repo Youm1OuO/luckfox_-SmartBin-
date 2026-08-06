@@ -229,6 +229,9 @@ struct OperationTrack {
     // 当前直接无手帧里存在一条可接上本 C 路径、但无法唯一归属的同类框。
     // 它是逐帧证据，下一张无手帧重新计算；有它时不能累计 OUT。
     bool no_hand_candidate_ambiguous = false;
+    // 当前候选被证据更强的另一个旧 C 暂时预约。它不等于直接观察到本 C，
+    // 也不允许立刻开始 OUT；在本帧没有自己的可靠终点时仍保持未决。
+    bool no_hand_candidate_reserved_by_stronger_owner = false;
 };
 
 // 一张有手帧中，operation-start 旧 C 对检测框的直接原位归属计划。它仅描述
@@ -365,8 +368,16 @@ private:
         std::set<int>* claimed_detection_indices);
     SettlementResult settle_no_hand_frame_(const std::vector<Detection>& detections,
                                            int frame_id);
-    bool has_unresolved_no_hand_state_(const std::set<int>& observed_item_ids,
-                                       const std::set<int>& fully_occluded_item_ids);
+    bool has_unresolved_no_hand_state_(
+        const std::vector<Detection>& detections,
+        const std::set<int>& observed_item_ids,
+        const std::set<int>& fully_occluded_item_ids);
+    // 普通 direct-missing OUT 即将达到门槛时的窄事务保护：只有另一个
+    // operation-start 旧物已有真实移动证据，且本帧自己的候选框确实压在
+    // 目标可靠 base_box 上，才暂缓这一轮 OUT。它不写 blocker/事件。
+    bool defer_direct_missing_out_for_possible_occlusion_(
+        int target_item_id, const std::vector<Detection>& detections,
+        int* blocker_item_id, int* detection_index) const;
     // 单摄像头下同类旧物品的最终可见实例结算。它只在连续无手帧中、
     // 同类可见框数量持续少于旧库存时启用；有手阶段和 D 证据链不使用它。
     void prepare_visible_count_settlement_(const std::vector<Detection>& detections);

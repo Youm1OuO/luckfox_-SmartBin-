@@ -564,39 +564,127 @@ bool has_contact_path_candidate(
     return false;
 }
 
-// 一张未认领的同类贴手 B，只能在“恰好一个没有自己检测框的 HAND_* C”
-// 的完整候选轨迹附近时，先暂存为该 C 的重新出现候选。返回 -2 表示多个 C
-// 都同样合理；调用方必须保持未决，不能把 B 改登记为 D。
+namespace {
+
+// 同类 reappear 仲裁只比较当前帧的证据强弱，不改变任何全局几何阈值或
+// MOVED/IN/OUT 的确认帧数。宽路径仍会留在 D guard / alias 图中；它只是
+// 不能再否决已经连续确认或有直接动态终点的旧 C。
+enum ReappearOwnerEvidence {
+    REAPPEAR_OWNER_NONE = 0,
+    REAPPEAR_OWNER_WIDE_PATH = 1,
+    REAPPEAR_OWNER_DIRECT_PATH = 2,
+    REAPPEAR_OWNER_CONFIRMED_CANDIDATE = 3,
+};
+
+}  // namespace
+
+int reappear_owner_evidence_strength(const OperationTrack& track,
+                                     const Detection& detection) {
+    if (!is_active_existing_hand_track(track) || !is_claim_mature(track) ||
+        track.cls_id != detection.cls_id ||
+        !reappear_candidate_path_matches(track, detection)) {
+        return REAPPEAR_OWNER_NONE;
+    }
+
+    int strength = REAPPEAR_OWNER_WIDE_PATH;
+
+    // 已连续自匹配的 reappear candidate 是当前最强的旧 C 证据。它仍只
+    // 是本帧预约资格，实际 MOVED 继续沿既有无手连续确认路径完成。
+    if (track.has_reappear_candidate_box &&
+        track_match_box(track.cls_id, track.reappear_candidate_box,
+                        detection.cls_id, detection.box)) {
+        strength = reappear_candidate_is_confirmed(track)
+            ? REAPPEAR_OWNER_CONFIRMED_CANDIDATE
+            : REAPPEAR_OWNER_DIRECT_PATH;
+    }
+
+    // 原位恢复、上一帧真实观察和动态终点都比“路径大致可达”强，但两个
+    // 同级 direct path 仍保持歧义，绝不按 item_id 或检测顺序强选。
+    if ((track.original_box.area() > 0.0f &&
+         (strict_match_box(track.cls_id, track.original_box,
+                           detection.cls_id, detection.box) ||
+          partial_match_box(track.cls_id, track.original_box,
+                            detection.cls_id, detection.box))) ||
+        (track.has_last_seen_box &&
+         track_match_box(track.cls_id, track.last_seen_box,
+                         detection.cls_id, detection.box)) ||
+        (track.has_last_hand_block_box &&
+         track_match_box(track.cls_id, track.last_hand_block_box,
+                         detection.cls_id, detection.box))) {
+        strength = std::max(strength, static_cast<int>(REAPPEAR_OWNER_DIRECT_PATH));
+    }
+
+    const bool has_real_dynamic_context = track.hold_and_move ||
+        has_meaningful_hand_move(track) ||
+        (track.contact_state == ContactState::CONTACT_MOVING &&
+         !track.observed_move_values.empty());
+    const BBox endpoint = track.has_placed_box ? track.placed_box : estimated_box(track);
+    if (has_real_dynamic_context && endpoint.area() > 0.0f &&
+        track_match_box(track.cls_id, endpoint,
+                        detection.cls_id, detection.box)) {
+        strength = std::max(strength, static_cast<int>(REAPPEAR_OWNER_DIRECT_PATH));
+    }
+    return strength;
+}
+
+namespace {
+
+bool is_mature_reappear_owner_candidate(
+        const OperationTrack& track, const Detection& detection,
+        const std::map<int, int>& known_item_owner) {
+    return is_active_existing_hand_track(track) && is_claim_mature(track) &&
+        track.cls_id == detection.cls_id &&
+        !known_item_owner.count(track.item_id) &&
+        reappear_owner_evidence_strength(track, detection) > REAPPEAR_OWNER_NONE;
+}
+
+}  // namespace
+
+// 一张未认领的同类贴手 B，只能在“最高等级证据恰好唯一”的 HAND_* C
+// 完整候选轨迹附近时，先暂存为该 C 的重新出现候选。返回 -2 表示最高等级
+// 仍有多个 C 并列；调用方必须保持未决，不能把 B 改登记为 D。
 int unique_c_reappear_owner_for_detection(
         const Detection& detection,
         const std::map<int, OperationTrack>& tracks,
         const std::map<int, int>& known_item_owner) {
     int owner = -1;
+    int best_strength = REAPPEAR_OWNER_NONE;
+    bool tied_best_strength = false;
     for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
          it != tracks.end(); ++it) {
         const OperationTrack& c = it->second;
-        if (!is_active_existing_hand_track(c) || !is_claim_mature(c) ||
-            c.cls_id != detection.cls_id ||
-            known_item_owner.count(c.item_id) ||
-            !reappear_candidate_path_matches(c, detection)) {
-            continue;
+        if (!is_mature_reappear_owner_candidate(c, detection, known_item_owner)) continue;
+        const int strength = reappear_owner_evidence_strength(c, detection);
+        if (strength > best_strength) {
+            owner = it->first;
+            best_strength = strength;
+            tied_best_strength = false;
+        } else if (strength == best_strength) {
+            tied_best_strength = true;
         }
-        if (owner >= 0) return -2;
-        owner = it->first;
     }
-    return owner;
+    return tied_best_strength ? -2 : owner;
 }
 
 void mark_mature_hand_b_ambiguity(
         const Detection& detection, std::map<int, OperationTrack>* tracks,
         const std::map<int, int>& known_item_owner) {
     if (!tracks) return;
+    int best_strength = REAPPEAR_OWNER_NONE;
+    for (std::map<int, OperationTrack>::const_iterator it = tracks->begin();
+         it != tracks->end(); ++it) {
+        if (!is_mature_reappear_owner_candidate(it->second, detection,
+                                                known_item_owner)) {
+            continue;
+        }
+        best_strength = std::max(best_strength,
+                                 reappear_owner_evidence_strength(it->second, detection));
+    }
     for (std::map<int, OperationTrack>::iterator it = tracks->begin();
          it != tracks->end(); ++it) {
         OperationTrack& c = it->second;
-        if (!is_active_existing_hand_track(c) || !is_claim_mature(c) ||
-            c.cls_id != detection.cls_id || known_item_owner.count(c.item_id) ||
-            !reappear_candidate_path_matches(c, detection)) {
+        if (!is_mature_reappear_owner_candidate(c, detection, known_item_owner) ||
+            reappear_owner_evidence_strength(c, detection) != best_strength) {
             continue;
         }
         c.b_claim_ambiguous = true;
@@ -677,7 +765,9 @@ bool has_ambiguous_no_hand_reappear_candidate(
         const std::map<int, InventoryItem>& operation_start,
         const std::set<int>& pending_in_ids,
         const std::map<int, OperationTrack>& tracks,
-        const std::map<int, int>& independent_static_owner_by_detection) {
+        const std::map<int, int>& independent_static_owner_by_detection,
+        bool* reserved_by_stronger_owner) {
+    if (reserved_by_stronger_owner) *reserved_by_stronger_owner = false;
     if (!is_claim_mature(track)) return false;
     const std::map<int, int> no_known_owner;
     int viable_count = 0;
@@ -692,6 +782,10 @@ bool has_ambiguous_no_hand_reappear_candidate(
             independent_static_owner_by_detection.find(static_cast<int>(i));
         if (static_owner != independent_static_owner_by_detection.end() &&
             static_owner->second != track.item_id) {
+            // 该检测框已被本帧双方唯一的严格静态 owner 预约。它不能再
+            // 反过来构成当前 C 的同级歧义，但“被别人预约”也不等于当前 C
+            // 已经缺失，因此让调用方继续保持未决而不是累计 OUT。
+            if (reserved_by_stronger_owner) *reserved_by_stronger_owner = true;
             continue;
         }
         const StrictDetectionOwner strict_owner = strict_owner_for_detection(
@@ -709,7 +803,22 @@ bool has_ambiguous_no_hand_reappear_candidate(
         const int owner = unique_c_reappear_owner_for_detection(
             detections[i], tracks, no_known_owner);
         if (owner != runtime_key) {
-            if (owner >= 0 || owner == -2) return true;
+            if (owner == -2) return true;
+            if (owner >= 0) {
+                std::map<int, OperationTrack>::const_iterator stronger = tracks.find(owner);
+                const int this_strength =
+                    reappear_owner_evidence_strength(track, detections[i]);
+                const int owner_strength = stronger == tracks.end()
+                    ? REAPPEAR_OWNER_NONE
+                    : reappear_owner_evidence_strength(stronger->second, detections[i]);
+                if (owner_strength > this_strength) {
+                    if (reserved_by_stronger_owner) {
+                        *reserved_by_stronger_owner = true;
+                    }
+                    continue;
+                }
+                return true;
+            }
             continue;
         }
         ++viable_count;

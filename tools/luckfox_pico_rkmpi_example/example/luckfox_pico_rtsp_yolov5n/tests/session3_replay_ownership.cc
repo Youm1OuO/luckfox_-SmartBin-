@@ -1411,4 +1411,61 @@ void test_same_class_candidate_context_includes_unowned_viable_old_c() {
                operation_start, std::set<int>(), tracks) == 1);
 }
 
+// 连续确认的 reappear candidate 必须压过另一个旧 C 仅靠历史宽路径的
+// 命中；但若最高等级也真实并列，仍必须返回 -2，不按 item_id 强选。
+void test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie() {
+    using namespace fridge::session_internal;
+
+    const fridge::Detection candidate = det(0, 300, 100, 400, 200);
+    fridge::OperationTrack strong;
+    strong.item_id = 1;
+    strong.cls_id = 0;
+    strong.original_box = fridge::BBox(100, 100, 200, 200);
+    strong.state = fridge::OperationTrackState::HAND_PARTIAL_BLOCKED;
+    strong.needs_no_hand_settlement = true;
+    strong.reappearance_pending = true;
+    strong.reappear_candidate_box = candidate.box;
+    strong.has_reappear_candidate_box = true;
+    strong.reappear_candidate_match_count =
+        fridge::FLOW3_REAPPEAR_CANDIDATE_CONFIRM_FRAMES;
+    strong.track.push_back(candidate.box);
+
+    fridge::OperationTrack weak;
+    weak.item_id = 2;
+    weak.cls_id = 0;
+    weak.original_box = fridge::BBox(500, 100, 600, 200);
+    weak.state = fridge::OperationTrackState::HAND_PARTIAL_BLOCKED;
+    weak.needs_no_hand_settlement = true;
+    weak.reappearance_pending = true;
+    // 只有旧路径碰到 candidate，没有 candidate 自匹配、直接框或动态终点。
+    weak.track.push_back(candidate.box);
+
+    std::map<int, fridge::OperationTrack> tracks;
+    tracks[1] = strong;
+    tracks[2] = weak;
+    const std::map<int, int> no_known_owner;
+    assert(reappear_owner_evidence_strength(tracks[1], candidate) >
+           reappear_owner_evidence_strength(tracks[2], candidate));
+    assert(unique_c_reappear_owner_for_detection(
+               candidate, tracks, no_known_owner) == 1);
+
+    std::map<int, fridge::InventoryItem> operation_start;
+    operation_start[1] = item(1, 0, 100, 100, 200, 200);
+    operation_start[2] = item(2, 0, 500, 100, 600, 200);
+    std::map<int, fridge::InventoryItem> working = operation_start;
+    bool reserved_by_stronger_owner = false;
+    assert(!has_ambiguous_no_hand_reappear_candidate(
+        std::vector<fridge::Detection>(1, candidate), std::set<int>(), 2,
+        tracks[2], working, operation_start, std::set<int>(), tracks,
+        std::map<int, int>(), &reserved_by_stronger_owner));
+    assert(reserved_by_stronger_owner);
+
+    fridge::OperationTrack tied = strong;
+    tied.item_id = 3;
+    tied.original_box = fridge::BBox(700, 100, 800, 200);
+    tracks[3] = tied;
+    assert(unique_c_reappear_owner_for_detection(
+               candidate, tracks, no_known_owner) == -2);
+}
+
 }  // namespace session3_replay

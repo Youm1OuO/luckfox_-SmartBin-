@@ -530,5 +530,48 @@ bool fully_covered_by(const BBox& target, const std::vector<BBox>& covers) {
     return area <= COVER_REMAINING_AREA_EPS;
 }
 
+// 这不是全局覆盖容差。调用方只会在严格差集已经失败、target 是未直接
+// 观察到的 operation-start 旧 C，且至少一个当前 confirmed IN/MOVED
+// blocker 参与时调用。这里仍复用严格差集的并集语义；区别仅是每一块
+// 残余都必须完整落在 target 的四条窄边缘带之一。
+bool edge_residual_within_target_border(const BBox& target,
+                                        const std::vector<BBox>& covers,
+                                        float edge_px) {
+    if (target.area() <= 0.0f || edge_px <= 0.0f) return false;
+
+    std::vector<BBox> remaining(1, target);
+    for (size_t ci = 0; ci < covers.size(); ++ci) {
+        std::vector<BBox> next;
+        for (size_t ri = 0; ri < remaining.size(); ++ri) {
+            subtract_cover(remaining[ri], covers[ci], &next);
+        }
+        remaining.swap(next);
+    }
+
+    bool has_residual = false;
+    for (size_t i = 0; i < remaining.size(); ++i) {
+        const BBox& piece = remaining[i];
+        if (piece.area() <= 0.0f) continue;
+        has_residual = true;
+        // 只落在边缘带还不够：两个 cover 之间的内部细缝也可能恰好离
+        // 左/右边缘不足 edge_px。真正的边缘残余还必须接触 target 的外边，
+        // 才能说明是检测框把边界短了一条，而不是内部覆盖并集有空洞。
+        const float boundary_epsilon = 0.001f;
+        const bool in_left_border = piece.x1 <= target.x1 + boundary_epsilon &&
+            piece.x2 <= target.x1 + edge_px;
+        const bool in_right_border = piece.x2 >= target.x2 - boundary_epsilon &&
+            piece.x1 >= target.x2 - edge_px;
+        const bool in_top_border = piece.y1 <= target.y1 + boundary_epsilon &&
+            piece.y2 <= target.y1 + edge_px;
+        const bool in_bottom_border = piece.y2 >= target.y2 - boundary_epsilon &&
+            piece.y1 >= target.y2 - edge_px;
+        if (!in_left_border && !in_right_border &&
+            !in_top_border && !in_bottom_border) {
+            return false;
+        }
+    }
+    return has_residual;
+}
+
 }  // namespace session_internal
 }  // namespace fridge
