@@ -196,6 +196,7 @@ void SessionManager::reset_operation_runtime_() {
     pending_out_ids_.clear();
     confirmed_moved_ids_.clear();
     released_hand_candidate_ids_.clear();
+    cross_class_duplicate_identity_exclusions_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
     visible_count_out_candidate_ids_.clear();

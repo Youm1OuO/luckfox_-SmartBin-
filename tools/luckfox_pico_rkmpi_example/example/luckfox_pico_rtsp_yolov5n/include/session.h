@@ -18,6 +18,10 @@
 
 namespace fridge {
 
+namespace session_internal {
+struct BlockerTransitionPlan;
+}
+
 enum class EventKind { IN, OUT, MOVED, OCCLUDED, REVEALED };
 
 struct InventoryEvent {
@@ -412,7 +416,9 @@ private:
     void refresh_confirmed_blockers_(std::map<int, InventoryItem>* final_items,
                                      const std::set<int>& observed_working_ids,
                                      const std::set<int>& confirmed_front_ids,
-                                     std::set<int>* fully_occluded_item_ids);
+                                     std::set<int>* fully_occluded_item_ids,
+                                     std::map<int, session_internal::BlockerTransitionPlan>*
+                                         transition_plans);
     bool advance_occlusion_loss_out_evidence_(
         const std::map<int, InventoryItem>& final_items,
         const std::set<int>& observed_working_ids,
@@ -445,6 +451,10 @@ private:
     std::set<int> pending_out_ids_;
     std::set<int> confirmed_moved_ids_;
     std::set<int> released_hand_candidate_ids_;
+    // 当前无手帧的身份计划：key 为旧 item_id，value 为本帧仅在该旧物
+    // 原位仲裁中暂时排除的跨类别低分重复 detection index。它不跨帧、
+    // 不写入 InventoryItem，也不影响 OSD/原始 detection。
+    std::map<int, std::set<int> > cross_class_duplicate_identity_exclusions_;
     // 每张无手帧的同类“一框一物品”保留结果。key 是 detection index，
     // value 是唯一保留该框的旧 item_id；同一框绝不再同时阻止其他 C 的 OUT。
     std::map<int, int> visible_count_detection_owner_;

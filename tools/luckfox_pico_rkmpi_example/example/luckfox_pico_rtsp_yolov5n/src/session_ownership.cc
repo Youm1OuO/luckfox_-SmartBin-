@@ -19,6 +19,74 @@
 namespace fridge {
 namespace session_internal {
 
+CrossClassDuplicateHint find_cross_class_duplicate_hint(
+        const std::vector<Detection>& detections, int detection_index) {
+    CrossClassDuplicateHint result;
+    if (detection_index < 0 ||
+        static_cast<size_t>(detection_index) >= detections.size()) {
+        return result;
+    }
+
+    const Detection& suspicious = detections[static_cast<size_t>(detection_index)];
+    if (!is_food(suspicious.cls_id) || suspicious.box.area() <= 0.0f ||
+        suspicious.score > FLOW3_CROSS_CLASS_DUPLICATE_LOW_SCORE_MAX) {
+        return result;
+    }
+
+    // 只读地寻找分数最高的异类近同框。检测数组顺序不参与选择；若有多个
+    // 竞争框，最终使用最高分者作为诊断依据。
+    int best_index = -1;
+    float best_score = suspicious.score;
+    float best_iom = 0.0f;
+    float best_iou = 0.0f;
+    float best_center = 0.0f;
+    float best_width = 0.0f;
+    float best_height = 0.0f;
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (static_cast<int>(i) == detection_index) continue;
+        const Detection& competing = detections[i];
+        if (!is_food(competing.cls_id) || competing.cls_id == suspicious.cls_id ||
+            competing.box.area() <= 0.0f ||
+            competing.score - suspicious.score <
+                FLOW3_CROSS_CLASS_DUPLICATE_SCORE_GAP_MIN) {
+            continue;
+        }
+        const float iom_value = iom(suspicious.box, competing.box);
+        const float iou_value = iou(suspicious.box, competing.box);
+        const float center_norm = normalized_nearby_distance(
+            suspicious.box, competing.box);
+        const float width_ratio = ratio_difference(
+            suspicious.box.w(), competing.box.w());
+        const float height_ratio = ratio_difference(
+            suspicious.box.h(), competing.box.h());
+        if (iom_value < FLOW3_CROSS_CLASS_DUPLICATE_IOM_MIN ||
+            center_norm > FLOW3_CROSS_CLASS_DUPLICATE_CENTER_NORM_MAX ||
+            width_ratio > FLOW3_CROSS_CLASS_DUPLICATE_SIZE_RATIO_MAX ||
+            height_ratio > FLOW3_CROSS_CLASS_DUPLICATE_SIZE_RATIO_MAX) {
+            continue;
+        }
+        if (best_index >= 0 && competing.score <= best_score) continue;
+        best_index = static_cast<int>(i);
+        best_score = competing.score;
+        best_iom = iom_value;
+        best_iou = iou_value;
+        best_center = center_norm;
+        best_width = width_ratio;
+        best_height = height_ratio;
+    }
+    if (best_index < 0) return result;
+    result.detection_index = detection_index;
+    result.competing_index = best_index;
+    result.score = suspicious.score;
+    result.competing_score = best_score;
+    result.iom_value = best_iom;
+    result.iou_value = best_iou;
+    result.center_norm = best_center;
+    result.width_ratio = best_width;
+    result.height_ratio = best_height;
+    return result;
+}
+
 int unique_detection_for_box(const std::vector<Detection>& detections,
                              const std::set<int>& claimed,
                              int cls_id, const BBox& reference,
@@ -1546,7 +1614,8 @@ void bind_mutually_unique(const std::map<int, InventoryItem>& items,
                           std::map<int, BBox>* references,
                           std::map<int, int>* item_to_observation,
                           std::vector<int>* observation_owner,
-                          bool track_mode, bool partial_mode) {
+                          bool track_mode, bool partial_mode,
+                          const std::map<int, std::set<int> >* excluded_by_item) {
     bool made_progress = true;
     while (made_progress) {
         made_progress = false;
@@ -1559,7 +1628,14 @@ void bind_mutually_unique(const std::map<int, InventoryItem>& items,
             if (item_it == items.end()) continue;
             const BBox reference = references->count(*id) ? (*references)[*id] :
                 item_it->second.box;
+            const std::map<int, std::set<int> >::const_iterator excluded_it =
+                excluded_by_item ? excluded_by_item->find(*id)
+                                 : std::map<int, std::set<int> >::const_iterator();
             for (size_t si = 0; si < observed.size(); ++si) {
+                if (excluded_by_item && excluded_it != excluded_by_item->end() &&
+                    excluded_it->second.count(static_cast<int>(si))) {
+                    continue;
+                }
                 if ((*observation_owner)[si] >= 0 || observed[si].cls_id != item_it->second.cls_id) {
                     continue;
                 }
@@ -1701,7 +1777,8 @@ void bind_mutually_unique_track_paths(
         const std::vector<Detection>& observed,
         const std::map<int, OperationTrack>& tracks,
         std::map<int, int>* item_to_observation,
-        std::vector<int>* observation_owner) {
+        std::vector<int>* observation_owner,
+        const std::map<int, std::set<int> >* excluded_by_item) {
     bool made_progress = true;
     while (made_progress) {
         made_progress = false;
@@ -1720,6 +1797,13 @@ void bind_mutually_unique_track_paths(
             int best_observation = -1;
             bool tied = false;
             for (size_t si = 0; si < observed.size(); ++si) {
+                const std::map<int, std::set<int> >::const_iterator excluded_it =
+                    excluded_by_item ? excluded_by_item->find(*id)
+                                     : std::map<int, std::set<int> >::const_iterator();
+                if (excluded_by_item && excluded_it != excluded_by_item->end() &&
+                    excluded_it->second.count(static_cast<int>(si))) {
+                    continue;
+                }
                 if ((*observation_owner)[si] >= 0) continue;
                 const float cost = track_path_match_cost(item->second, *track, observed[si]);
                 if (!(cost < std::numeric_limits<float>::infinity())) continue;

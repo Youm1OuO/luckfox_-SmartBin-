@@ -487,13 +487,16 @@ void SessionManager::refresh_confirmed_blockers_(
         std::map<int, InventoryItem>* final_items,
         const std::set<int>& observed_working_ids,
         const std::set<int>& confirmed_front_ids,
-        std::set<int>* fully_occluded_item_ids) {
+        std::set<int>* fully_occluded_item_ids,
+        std::map<int, BlockerTransitionPlan>* transition_plans) {
     if (!final_items || !fully_occluded_item_ids) return;
     fully_occluded_item_ids->clear();
+    if (transition_plans) transition_plans->clear();
 
     // 所有身份、最终可靠框和 pending IN / MOVED 都已经在调用前准备完毕。
     // 这里统一读取上一轮已提交关系和本轮已确认前景，绝不把 hand/suspect D
-    // 的临时框直接写成正式 blocker。
+    // 的临时框直接写成正式 blocker。正式 VISIBLE/OCCLUDED 状态也只在下面
+    // 的 blocker 因果计划通过门控后改变，不能由 observed_working_ids 直接改写。
     for (std::map<int, InventoryItem>::iterator target = final_items->begin();
          target != final_items->end(); ++target) {
         const int target_id = target->first;
@@ -506,11 +509,36 @@ void SessionManager::refresh_confirmed_blockers_(
         const BBox target_box = target->second.base_box.area() > 0.0f
             ? target->second.base_box : target->second.box;
 
+        BlockerTransitionPlan plan;
         std::set<int> effective_block_ids;
         std::vector<BBox> cover_boxes;
         std::vector<BBox> edge_residual_cover_boxes;
         bool has_current_confirmed_front_cover = false;
         const std::set<int> historical_block_ids = relationship_source.block_ids;
+        plan.historical_blocker_ids = historical_block_ids;
+
+        // “before” 必须使用事务开始时已提交的可靠位置，而不是把本轮移动
+        // 后的框倒灌回去。它只用于判断本轮覆盖是否真的发生了完整/不完整
+        // 变化，不会直接改变任何状态。
+        const BBox relationship_target_box = relationship_source.base_box.area() > 0.0f
+            ? relationship_source.base_box : relationship_source.box;
+        std::vector<BBox> historical_cover_boxes;
+        for (std::set<int>::const_iterator blocker = historical_block_ids.begin();
+             blocker != historical_block_ids.end(); ++blocker) {
+            if (*blocker == target_id) continue;
+            std::map<int, InventoryItem>::const_iterator historical_front =
+                operation_start_inventory_.find(*blocker);
+            if (historical_front == operation_start_inventory_.end()) continue;
+            const BBox historical_box = historical_front->second.base_box.area() > 0.0f
+                ? historical_front->second.base_box : historical_front->second.box;
+            if (relationship_target_box.area() > 0.0f && historical_box.area() > 0.0f &&
+                intersection_area(relationship_target_box, historical_box) >
+                    BLOCK_OVERLAP_AREA_EPS) {
+                historical_cover_boxes.push_back(historical_box);
+            }
+        }
+        plan.coverage_before_full = relationship_target_box.area() > 0.0f &&
+            fully_covered_by(relationship_target_box, historical_cover_boxes);
 
         for (int source = 0; source < 2; ++source) {
             const std::set<int>& candidate_ids = source == 0
@@ -558,46 +586,109 @@ void SessionManager::refresh_confirmed_blockers_(
             }
         }
 
-        if (observed_working_ids.count(target_id)) {
-            // 直接看见 C 时状态必须为 VISIBLE；仍相交的 blocker 是前景关系，
-            // 不是“继续完全遮挡”的状态，因此不能被无条件清空。
-            target->second.status = ItemStatus::VISIBLE;
-            target->second.block_ids.swap(effective_block_ids);
-            continue;
+        // 差分单独计算，允许保留部分相交的历史 blocker，同时把确认移动到
+        // 不相交位置或正式 OUT 的 blocker 从有效关系中移除。未确认漏检不在
+        // 这里删除历史关系。
+        for (std::set<int>::const_iterator blocker = historical_block_ids.begin();
+             blocker != historical_block_ids.end(); ++blocker) {
+            if (pending_out_ids_.count(*blocker)) {
+                plan.removed_blocker_ids.insert(*blocker);
+            }
+            if (confirmed_moved_ids_.count(*blocker)) {
+                plan.moved_blocker_ids.insert(*blocker);
+                if (!effective_block_ids.count(*blocker)) {
+                    plan.removed_blocker_ids.insert(*blocker);
+                }
+            }
         }
+        for (std::set<int>::const_iterator blocker = confirmed_front_ids.begin();
+             blocker != confirmed_front_ids.end(); ++blocker) {
+            if (*blocker == target_id || !effective_block_ids.count(*blocker)) continue;
+            if (!historical_block_ids.count(*blocker)) {
+                plan.added_blocker_ids.insert(*blocker);
+            } else if (confirmed_moved_ids_.count(*blocker)) {
+                plan.moved_blocker_ids.insert(*blocker);
+            }
+        }
+        plan.effective_blocker_ids = effective_block_ids;
+
+        const OperationTrack* target_runtime = find_runtime_for_item_(target_id);
+        const bool target_observed = observed_working_ids.count(target_id) > 0;
+        const bool target_observation_conflict = target_runtime &&
+            (target_runtime->no_hand_candidate_ambiguous ||
+             target_runtime->no_hand_candidate_reserved_by_stronger_owner ||
+             old_track_has_unresolved_alias_(*target_runtime));
+        plan.valid_target_observed = target_observed && !target_observation_conflict;
+        plan.observation_conflict = target_observed && target_observation_conflict;
 
         if (original == operation_start_inventory_.end()) {
             // 本轮新 D 没有直接无手身份时不会成为正式库存目标，更不能凭几何
             // 推导出新的遮挡关系。
             target->second.block_ids.swap(effective_block_ids);
+            if (transition_plans) (*transition_plans)[target_id] = plan;
             continue;
         }
 
-        // 未直接观察到的旧 C 继续使用操作开始时的可靠身份和 base_box，丢弃
-        // 有手阶段可能留下的临时 status / block_ids，只保留有效历史和新前景。
-        InventoryItem retained = original->second;
-        retained.block_ids.swap(effective_block_ids);
         const bool strict_fully_covered = fully_covered_by(target_box, cover_boxes);
         const bool edge_residual_fully_covered = !strict_fully_covered &&
             has_current_confirmed_front_cover &&
             edge_residual_within_target_border(
                 target_box, edge_residual_cover_boxes,
                 FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX);
-        if (strict_fully_covered || edge_residual_fully_covered) {
-            retained.status = ItemStatus::OCCLUDED;
-            fully_occluded_item_ids->insert(target_id);
-            if (edge_residual_fully_covered) {
-                trace_("OCCLUSION",
-                       "target=%d action=confirm-edge-residual-occlusion edge-px=%.1f "
-                       "confirmed-front=%d covers=%zu",
-                       target_id, FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX,
-                       has_current_confirmed_front_cover ? 1 : 0,
-                       edge_residual_cover_boxes.size());
+        plan.coverage_after_full = strict_fully_covered || edge_residual_fully_covered;
+        plan.coverage_changed_by_confirmed_front =
+            plan.coverage_before_full != plan.coverage_after_full &&
+            (!plan.added_blocker_ids.empty() ||
+             !plan.removed_blocker_ids.empty() ||
+             !plan.moved_blocker_ids.empty());
+
+        // 未直接观察到的旧 C 继续使用操作开始时的可靠身份和 base_box，丢弃
+        // 有手阶段可能留下的临时 status / block_ids，只保留有效历史和新前景。
+        // 对本轮已合法确认的直接观察保留最终框（尤其是 MOVED）；但若
+        // 目标仍正式 OCCLUDED 且没有 blocker 解除原因，后面会恢复成
+        // operation-start 的正式几何，把当前框仅当作临时 observation。
+        InventoryItem retained = target_observed ? target->second : original->second;
+        retained.block_ids.swap(effective_block_ids);
+        if (original->second.status == ItemStatus::VISIBLE) {
+            if (!target_observed && plan.coverage_after_full &&
+                plan.coverage_changed_by_confirmed_front) {
+                retained.status = ItemStatus::OCCLUDED;
+                plan.allow_occluded_transition = true;
+                fully_occluded_item_ids->insert(target_id);
+            } else {
+                retained.status = ItemStatus::VISIBLE;
+            }
+        } else {
+            if (plan.coverage_after_full) {
+                retained.status = ItemStatus::OCCLUDED;
+                fully_occluded_item_ids->insert(target_id);
+            } else if (plan.valid_target_observed &&
+                       plan.coverage_changed_by_confirmed_front) {
+                retained.status = ItemStatus::VISIBLE;
+                plan.allow_revealed_transition = true;
+            } else {
+                // 目标框再次出现但 blocker 没有确认变化时，只是临时
+                // observation。正式状态与历史关系必须保持 OCCLUDED。
+                if (target_observed) {
+                    retained.box = original->second.box;
+                    retained.base_box = original->second.base_box;
+                    retained.score = original->second.score;
+                    retained.updated_frame = original->second.updated_frame;
+                }
+                retained.status = ItemStatus::OCCLUDED;
+                plan.observation_conflict = plan.observation_conflict || target_observed;
             }
         }
-        // 覆盖并集不完整时不得因“没看到”直接改为 VISIBLE 或 REVEALED；保留
-        // 上一轮状态并让既有 OUT 证据或下面的遮挡失效计数继续处理。
+        if (edge_residual_fully_covered && plan.allow_occluded_transition) {
+            trace_("OCCLUSION",
+                   "target=%d action=confirm-edge-residual-occlusion edge-px=%.1f "
+                   "confirmed-front=%d covers=%zu",
+                   target_id, FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX,
+                   has_current_confirmed_front_cover ? 1 : 0,
+                   edge_residual_cover_boxes.size());
+        }
         target->second = retained;
+        if (transition_plans) (*transition_plans)[target_id] = plan;
     }
 }
 
@@ -753,23 +844,27 @@ SettlementResult SessionManager::settle_no_hand_frame_(
 
     // 绑定顺序：已确认移动/新 D 的终点 -> 普通严格匹配 -> 局部匹配。
     bind_mutually_unique(final_items, track_priority_ids, observed,
-                         &references, &item_to_observation, &observation_owner, true, false);
+                         &references, &item_to_observation, &observation_owner,
+                         true, false, &cross_class_duplicate_identity_exclusions_);
     bind_mutually_unique(final_items, all_ids, observed,
-                         &references, &item_to_observation, &observation_owner, false, false);
+                         &references, &item_to_observation, &observation_owner,
+                         false, false, &cross_class_duplicate_identity_exclusions_);
     // 若物品在手尚未离开时已经掉队并停在候选路径中段，终点框不会命中；
     // 在原位置回查前再做一次整条 path 的唯一最近绑定，避免这类物品被 OUT。
     bind_mutually_unique_track_paths(final_items, track_priority_ids, observed,
-                                     track_buffer_, &item_to_observation, &observation_owner);
+                                     track_buffer_, &item_to_observation, &observation_owner,
+                                     &cross_class_duplicate_identity_exclusions_);
     // 再回查旧位置。这样 hold_and_move 尚未凑满、或只被手短暂擦过的
     // 物品，只要在原位重新出现，就不会因为轨迹参考框漂移而被误判出库。
     bind_mutually_unique(final_items, original_position_ids, observed,
                          &original_references, &item_to_observation, &observation_owner,
-                         false, false);
+                         false, false, &cross_class_duplicate_identity_exclusions_);
     bind_mutually_unique(final_items, original_position_ids, observed,
                          &original_references, &item_to_observation, &observation_owner,
-                         false, true);
+                         false, true, &cross_class_duplicate_identity_exclusions_);
     bind_mutually_unique(final_items, all_ids, observed,
-                         &references, &item_to_observation, &observation_owner, false, true);
+                         &references, &item_to_observation, &observation_owner,
+                         false, true, &cross_class_duplicate_identity_exclusions_);
 
     // 文档允许 HAND_* 下尚未来得及凑满两次证据的物品，在手离开后的直接
     // 无手帧中由自己的候选轨迹补确认整理。这里仍要求它命中了自己的轨迹参考框，
@@ -852,8 +947,9 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     }
 
     std::set<int> fully_occluded_ids;
+    std::map<int, BlockerTransitionPlan> transition_plans;
     refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
-                                &fully_occluded_ids);
+                                &fully_occluded_ids, &transition_plans);
 
     // OUT 判定会在本帧把 blocker 加入 pending_out_ids_。若这改变了 blocker
     // 集合，必须在删除 final_items 前重算一次，不能让已正式 OUT 的 A 继续
@@ -863,7 +959,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         detections, observed_ids, fully_occluded_ids);
     if (pending_out_before_no_hand != pending_out_ids_) {
         refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
-                                    &fully_occluded_ids);
+                                    &fully_occluded_ids, &transition_plans);
     }
 
     const std::set<int> pending_out_before_occlusion_loss = pending_out_ids_;
@@ -873,7 +969,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     }
     if (pending_out_before_occlusion_loss != pending_out_ids_) {
         refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
-                                    &fully_occluded_ids);
+                                    &fully_occluded_ids, &transition_plans);
     }
 
     for (std::set<int>::const_iterator out = pending_out_ids_.begin();
@@ -891,6 +987,8 @@ SettlementResult SessionManager::settle_no_hand_frame_(
 
     // 最后才生成正式事件；整个过程中没有任何“未绑定无手框自动 IN”。
     std::vector<InventoryEvent> events;
+    // 第一组只发布前景物品自身的结算结果。遮挡/揭示事件统一放到后面，
+    // 这样事件顺序天然满足 MOVED/OUT/IN -> visibility 的因果依赖。
     for (std::map<int, InventoryItem>::const_iterator old = operation_start_inventory_.begin();
          old != operation_start_inventory_.end(); ++old) {
         std::map<int, InventoryItem>::const_iterator now = final_items.find(old->first);
@@ -905,20 +1003,31 @@ SettlementResult SessionManager::settle_no_hand_frame_(
             events.push_back(make_event(EventKind::MOVED, now->second,
                                         old->second.base_box, now->second.base_box));
         }
-        if (old->second.status != now->second.status) {
-            if (now->second.status == ItemStatus::OCCLUDED) {
-                events.push_back(make_event(EventKind::OCCLUDED, now->second));
-            } else if (old->second.status == ItemStatus::OCCLUDED &&
-                       now->second.status == ItemStatus::VISIBLE) {
-                events.push_back(make_event(EventKind::REVEALED, now->second));
-            }
-        }
     }
     for (std::set<int>::const_iterator in = pending_in_ids_.begin();
          in != pending_in_ids_.end(); ++in) {
         std::map<int, InventoryItem>::const_iterator item = final_items.find(*in);
         if (item != final_items.end() && observed_ids.count(*in)) {
             events.push_back(make_event(EventKind::IN, item->second));
+        }
+    }
+
+    // 状态差只能作为候选；正式遮挡事件必须有当前事务的 blocker 因果计划。
+    for (std::map<int, InventoryItem>::const_iterator old = operation_start_inventory_.begin();
+         old != operation_start_inventory_.end(); ++old) {
+        std::map<int, InventoryItem>::const_iterator now = final_items.find(old->first);
+        if (now == final_items.end()) continue;
+        const std::map<int, BlockerTransitionPlan>::const_iterator plan =
+            transition_plans.find(old->first);
+        if (plan == transition_plans.end()) continue;
+        if (plan->second.allow_occluded_transition &&
+            old->second.status == ItemStatus::VISIBLE &&
+            now->second.status == ItemStatus::OCCLUDED) {
+            events.push_back(make_event(EventKind::OCCLUDED, now->second));
+        } else if (plan->second.allow_revealed_transition &&
+                   old->second.status == ItemStatus::OCCLUDED &&
+                   now->second.status == ItemStatus::VISIBLE) {
+            events.push_back(make_event(EventKind::REVEALED, now->second));
         }
     }
 

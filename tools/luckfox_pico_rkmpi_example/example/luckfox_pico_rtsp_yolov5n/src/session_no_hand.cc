@@ -44,6 +44,120 @@ const char* no_hand_candidate_context_decision(const SameClassCandidateContext& 
         : "multiple-unresolved-old-c";
 }
 
+bool cross_class_track_has_move_evidence(const OperationTrack& track) {
+    return track.hold_and_move || has_meaningful_hand_move(track) ||
+        (track.contact_state == ContactState::CONTACT_MOVING &&
+         !track.observed_move_values.empty()) ||
+        (track.has_reappear_candidate_box &&
+         reappear_candidate_is_confirmed(track));
+}
+
+bool cross_class_endpoint_has_higher_owner(
+        int detection_index, int current_item_id,
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks) {
+    if (detection_index < 0 ||
+        static_cast<size_t>(detection_index) >= detections.size()) {
+        return true;
+    }
+    const Detection& detection = detections[static_cast<size_t>(detection_index)];
+    const StrictDetectionOwner strict_owner = strict_owner_for_detection(
+        detection, current_item_id, working, operation_start, pending_in_ids, tracks);
+    // 对替代终点采取保守规则：任何已经有严格/运行时 owner 的框都不作为
+    // “A 的另一条可靠路径”，避免用身份提示抢走更高等级的旧 C 或 D。
+    if (strict_owner.kind != StrictOwnerKind::NONE) return true;
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        const OperationTrack& other = it->second;
+        if (other.is_suspect_new && is_active_runtime_track(other) &&
+            detection_can_belong_to_active_track(detection, other)) {
+            return true;
+        }
+    }
+    const std::map<int, int> no_known_owner;
+    const int mature_owner = unique_c_reappear_owner_for_detection(
+        detection, tracks, no_known_owner);
+    return mature_owner >= 0 && mature_owner != current_item_id;
+}
+
+bool cross_class_endpoint_matches_track(const OperationTrack& track,
+                                        const InventoryItem& original,
+                                        const Detection& detection) {
+    if (track.cls_id != detection.cls_id ||
+        !boxes_differ_as_move(original.base_box.area() > 0.0f
+                                  ? original.base_box : original.box,
+                              detection.box)) {
+        return false;
+    }
+    if (track.has_reappear_candidate_box &&
+        track_match_box(track.cls_id, track.reappear_candidate_box,
+                        detection.cls_id, detection.box)) {
+        return true;
+    }
+    if (track.has_placed_box &&
+        track_match_box(track.cls_id, track.placed_box,
+                        detection.cls_id, detection.box)) {
+        return true;
+    }
+    if (track_path_match_cost(original, track, detection) <
+        std::numeric_limits<float>::infinity()) {
+        return true;
+    }
+    return reappear_candidate_path_matches(track, detection);
+}
+
+int find_cross_class_alternative_endpoint(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        const OperationTrack& track, const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks, int excluded_detection) {
+    if (track.is_suspect_new || track.item_id <= 0 ||
+        !cross_class_track_has_move_evidence(track)) {
+        return -1;
+    }
+    const std::map<int, InventoryItem>::const_iterator original =
+        operation_start.find(track.item_id);
+    if (original == operation_start.end()) return -1;
+
+    std::set<int> candidate_claimed = claimed;
+    candidate_claimed.insert(excluded_detection);
+    std::vector<int> candidates;
+    if (track.has_reappear_candidate_box) {
+        const int candidate = unique_detection_for_box(
+            detections, candidate_claimed, track.cls_id,
+            track.reappear_candidate_box, true, true);
+        if (candidate >= 0) candidates.push_back(candidate);
+    }
+    const BBox reference = track.has_placed_box ? track.placed_box : estimated_box(track);
+    const int reference_candidate = unique_detection_for_box(
+        detections, candidate_claimed, track.cls_id, reference, true, true);
+    if (reference_candidate >= 0) candidates.push_back(reference_candidate);
+    const int path_candidate = unique_no_hand_reappear_detection_for_track(
+        detections, candidate_claimed, track.item_id, track,
+        working, operation_start, pending_in_ids, tracks);
+    if (path_candidate >= 0) candidates.push_back(path_candidate);
+
+    int result = -1;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const int candidate = candidates[i];
+        if (candidate == excluded_detection ||
+            !cross_class_endpoint_matches_track(track, original->second,
+                                                detections[candidate]) ||
+            cross_class_endpoint_has_higher_owner(
+                candidate, track.item_id, detections, working,
+                operation_start, pending_in_ids, tracks)) {
+            continue;
+        }
+        if (result >= 0 && result != candidate) return -1;
+        result = candidate;
+    }
+    return result;
+}
+
 }  // namespace
 
 void SessionManager::register_post_hand_reveal_suspects_(
@@ -189,6 +303,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
     std::set<int> discard_keys;
     std::set<int> discard_settled_old_c_duplicate_keys;
     std::set<int> discard_stale_alias_keys;
+    // 每张无手帧重新建立身份计划；它不能把上一帧的临时排除带入下一帧。
+    cross_class_duplicate_identity_exclusions_.clear();
     const std::map<int, int> independent_static_owner_by_detection =
         build_independent_no_hand_static_owner_by_detection(
             detections, working_inventory_, operation_start_inventory_, track_buffer_);
@@ -351,6 +467,7 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             const char* found_source = "NONE";
             bool stale_reappear_candidate_cleared = false;
             bool stale_tentative_b_cleared = false;
+            int cross_class_excluded_detection = -1;
 
             // 细节10：已有 reappear candidate 仍然优先，但若它被本帧唯一严格
             // 原位框明确证伪为静止邻居 B，就只能说明“不是 A”。跳过该框后要在
@@ -382,6 +499,51 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         }
                     }
                     if (found >= 0) {
+                        const bool original_position_candidate =
+                            !track.has_hand_estimate_anchor_box ||
+                            contact_detection_is_at_original(track, detections[found]);
+                        found_at_original_position = original_position_candidate;
+                        // 两阶段身份仲裁：原位框先只作为候选收集。只有低分
+                        // 跨类别近同框同时满足真实移动证据和可靠替代终点时，
+                        // 才在本帧暂时降低它对 A 原位身份的权威；其他场景
+                        // 完全沿用原有 ORIGINAL 路径。
+                        if (!track.is_suspect_new && found_at_original_position &&
+                            cross_class_excluded_detection < 0) {
+                            const CrossClassDuplicateHint duplicate_hint =
+                                find_cross_class_duplicate_hint(detections, found);
+                            const int alternative_endpoint = duplicate_hint.valid()
+                                ? find_cross_class_alternative_endpoint(
+                                      detections, candidate_claimed, track,
+                                      working_inventory_, operation_start_inventory_,
+                                      pending_in_ids_, track_buffer_, found)
+                                : -1;
+                            trace_(
+                                "IDENTITY",
+                                "item=%d detection=%d source=ORIGINAL duplicate-valid=%d competitor=%d "
+                                "score=%.3f competitor-score=%.3f alternative=%d",
+                                track.item_id, found, duplicate_hint.valid() ? 1 : 0,
+                                duplicate_hint.competing_index, duplicate_hint.score,
+                                duplicate_hint.competing_score, alternative_endpoint);
+                            if (duplicate_hint.valid() && alternative_endpoint >= 0) {
+                                cross_class_excluded_detection = found;
+                                cross_class_duplicate_identity_exclusions_[track.item_id].insert(
+                                    found);
+                                excluded_static_neighbor_detections.insert(found);
+                                trace_(
+                                    "IDENTITY",
+                                    "item=%d detection=%d source=ORIGINAL action=temporary-exclude-cross-class-duplicate "
+                                    "competitor=%d score=%.3f competitor-score=%.3f iom=%.3f iou=%.3f "
+                                    "center-norm=%.3f alternative=%d reason=cross-class-duplicate-identity-only",
+                                    track.item_id, found, duplicate_hint.competing_index,
+                                    duplicate_hint.score, duplicate_hint.competing_score,
+                                    duplicate_hint.iom_value, duplicate_hint.iou_value,
+                                    duplicate_hint.center_norm, alternative_endpoint);
+                                trace_track_(
+                                    "IDENTITY", track,
+                                    "temporary-exclude-cross-class-duplicate-and-continue-path");
+                                continue;
+                            }
+                        }
                         // 对 HAND/CONTACT 恢复中的 C，严格/局部原框匹配先只
                         // 确定身份。超过 CONTACT 12px 时它不再是“立即原位”
                         // 证据，却仍必须保留给静态灰区或正式移动判断；此前在
@@ -393,9 +555,6 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                         // 原位门槛时才需要进入灰区连续结算；真正回到原位的
                         // 框继续沿原有 ORIGINAL 立即释放路径处理，避免手
                         // 随后重新进入时把一张无手静态帧误当成未完成恢复。
-                        found_at_original_position = !track.has_hand_estimate_anchor_box ||
-                            contact_detection_is_at_original(
-                                track, detections[found]);
                         found_source = found_at_original_position
                             ? "ORIGINAL" : "ORIGINAL_RECOVERY_CANDIDATE";
                     }
@@ -686,6 +845,21 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                 track.b_claim_ambiguous = false;
             }
             if (found < 0) {
+                // 替代路径若在本帧最终没有留下可用终点，临时排除自动
+                // 失效，并回退到原有原位/缺失规则，不能永久 defer。
+                if (cross_class_excluded_detection >= 0) {
+                    cross_class_duplicate_identity_exclusions_[track.item_id].erase(
+                        cross_class_excluded_detection);
+                    if (cross_class_duplicate_identity_exclusions_[track.item_id].empty()) {
+                        cross_class_duplicate_identity_exclusions_.erase(track.item_id);
+                    }
+                    excluded_static_neighbor_detections.erase(
+                        cross_class_excluded_detection);
+                    cross_class_excluded_detection = -1;
+                    trace_track_("IDENTITY", track,
+                                 "cross-class-duplicate-alternative-failed-fallback-original");
+                    continue;
+                }
                 if (!track.is_suspect_new) {
                     reset_stable_near_original_no_hand_evidence_(
                         &track, "no-direct-unique-owner");

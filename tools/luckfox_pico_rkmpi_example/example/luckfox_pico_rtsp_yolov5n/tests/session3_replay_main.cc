@@ -29,6 +29,9 @@ int main() {
     test_adjacent_same_class_new_item_gets_its_own_d_chain();
     test_unbound_no_hand_box_never_auto_in();
     test_moved_front_item_occludes_then_reveals();
+    test_occluded_target_observation_without_blocker_change_stays_occluded();
+    test_out_blocker_reveals_observed_target_in_causal_order();
+    test_cross_class_duplicate_original_does_not_create_d();
     test_historical_blocker_out_starts_new_missing_chain();
     test_partial_front_relation_does_not_start_occlusion_loss_out_chain();
     test_remaining_historical_blocker_keeps_c_occluded_after_other_moves();

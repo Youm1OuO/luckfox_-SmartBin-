@@ -13,6 +13,23 @@
 namespace fridge {
 namespace session_internal {
 
+// 只存在于一次无手结算调用的 blocker 因果计划。它不写入 InventoryItem，
+// 也不跨操作保存；正式状态/事件只能读取通过门控的字段。
+struct BlockerTransitionPlan {
+    std::set<int> historical_blocker_ids;
+    std::set<int> effective_blocker_ids;
+    std::set<int> added_blocker_ids;
+    std::set<int> removed_blocker_ids;
+    std::set<int> moved_blocker_ids;
+    bool coverage_before_full = false;
+    bool coverage_after_full = false;
+    bool coverage_changed_by_confirmed_front = false;
+    bool valid_target_observed = false;
+    bool observation_conflict = false;
+    bool allow_occluded_transition = false;
+    bool allow_revealed_transition = false;
+};
+
 float ratio_difference(float a, float b);
 float box_edge_distance(const BBox& a, const BBox& b);
 bool strict_match_box(int cls_id, const BBox& reference,
@@ -139,6 +156,25 @@ struct SameClassCandidateContext {
     std::set<int> viable_unresolved_old_item_ids;
     std::set<int> matching_suspect_runtime_keys;
 };
+
+// 当前帧跨类别重复检测的只读诊断。它只降低可疑框在身份仲裁中的权威，
+// 不删除 detection，也不直接改变库存、block_ids 或事件。
+struct CrossClassDuplicateHint {
+    int detection_index = -1;
+    int competing_index = -1;
+    float score = 0.0f;
+    float competing_score = 0.0f;
+    float iom_value = 0.0f;
+    float iou_value = 0.0f;
+    float center_norm = 0.0f;
+    float width_ratio = 0.0f;
+    float height_ratio = 0.0f;
+
+    bool valid() const { return detection_index >= 0 && competing_index >= 0; }
+};
+
+CrossClassDuplicateHint find_cross_class_duplicate_hint(
+        const std::vector<Detection>& detections, int detection_index);
 
 const char* strict_owner_kind_name(StrictOwnerKind kind);
 const OperationTrack* runtime_for_working_item(
@@ -310,7 +346,8 @@ void bind_mutually_unique(const std::map<int, InventoryItem>& items,
                           std::map<int, BBox>* references,
                           std::map<int, int>* item_to_observation,
                           std::vector<int>* observation_owner,
-                          bool track_mode, bool partial_mode);
+                          bool track_mode, bool partial_mode,
+                          const std::map<int, std::set<int> >* excluded_by_item = 0);
 const OperationTrack* find_track_for_item(
         const std::map<int, OperationTrack>& tracks, int item_id);
 std::map<int, int> build_independent_no_hand_static_owner_by_detection(
@@ -326,7 +363,8 @@ void bind_mutually_unique_track_paths(
         const std::vector<Detection>& observed,
         const std::map<int, OperationTrack>& tracks,
         std::map<int, int>* item_to_observation,
-        std::vector<int>* observation_owner);
+        std::vector<int>* observation_owner,
+        const std::map<int, std::set<int> >* excluded_by_item = 0);
 
 }  // namespace session_internal
 }  // namespace fridge

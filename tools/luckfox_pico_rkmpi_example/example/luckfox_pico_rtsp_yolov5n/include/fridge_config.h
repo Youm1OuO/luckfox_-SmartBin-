@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r19";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r20";
 
 // =========================================================================
 //  类别 ID 配置
@@ -231,6 +231,15 @@ constexpr float FLOW3_REAPPEAR_CANDIDATE_CENTER_NORM = 1.25f;
 constexpr float FLOW3_REAPPEAR_CANDIDATE_WIDTH_RATIO = 0.85f;
 constexpr float FLOW3_REAPPEAR_CANDIDATE_HEIGHT_RATIO = 0.85f;
 constexpr float FLOW3_OLD_POSITION_OVERLAP_AREA = 16.0f;
+
+// 仅用于当前帧身份仲裁的跨类别重复提示。它不是全局检测过滤：只有低分框
+// 与明显更高分的异类框几乎同框、且旧物已有可靠移动终点时，才暂时降低该
+// 低分框对旧物原位身份的权威。普通异类重叠不会触发。
+constexpr float FLOW3_CROSS_CLASS_DUPLICATE_LOW_SCORE_MAX = 0.45f;
+constexpr float FLOW3_CROSS_CLASS_DUPLICATE_SCORE_GAP_MIN = 0.20f;
+constexpr float FLOW3_CROSS_CLASS_DUPLICATE_IOM_MIN = 0.85f;
+constexpr float FLOW3_CROSS_CLASS_DUPLICATE_CENTER_NORM_MAX = 0.16f;
+constexpr float FLOW3_CROSS_CLASS_DUPLICATE_SIZE_RATIO_MAX = 0.20f;
 
 // 物品刚被手挡住时，YOLO 输出的是完整框的一部分，不能继续用库存/快照的
 // 高 IoM 阈值直接否定它。以下仅用于“当前手确实影响该框”的已有物品优先认领，
