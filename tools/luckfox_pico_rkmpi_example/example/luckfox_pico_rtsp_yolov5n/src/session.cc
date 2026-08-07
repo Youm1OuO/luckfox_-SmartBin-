@@ -215,7 +215,12 @@ void SessionManager::reset_operation_runtime_() {
     pending_occlusion_witness_ids_.clear();
     pending_occlusion_witness_boxes_.clear();
     hand_track_.clear();
-    has_old_hand_box_ = false;
+    old_hands_.clear();
+    current_hand_boxes_.clear();
+    current_hand_id_by_detection_.clear();
+    current_hand_delta_by_id_.clear();
+    current_reliable_hand_delta_ids_.clear();
+    next_hand_id_ = 1;
     next_suspect_id_ = -1;
     no_hand_streak_ = 0;
     active_operation_id_ = 0;
@@ -286,7 +291,13 @@ void SessionManager::finish_session(long long time_ms) {
 }
 
 void SessionManager::begin_closing_guard() {
-    has_old_hand_box_ = false;
+    // Closing 可能在两张有手帧之间插入。不能让恢复后的当前手框同 closing
+    // 前的手框拼成一段虚假的 hand delta。
+    old_hands_.clear();
+    current_hand_boxes_.clear();
+    current_hand_id_by_detection_.clear();
+    current_hand_delta_by_id_.clear();
+    current_reliable_hand_delta_ids_.clear();
 }
 
 void SessionManager::resume_after_false_closing() {
@@ -467,10 +478,16 @@ FrameProcessResult SessionManager::process_frame(
         finalize_initial_check_before_hand_();
         no_hand_streak_ = 0;
         if (!has_local_inventory_) return output;
-        const BBox hand = choose_primary_hand(hand_boxes);
         if (!working_inventory_active_) {
-            begin_working_operation_(hand, food_detections);
+            begin_working_operation_(hand_boxes, food_detections);
             return output;
+        }
+        // old_hands_ 是上一张可靠有手帧的内部身份表。无手阶段、closing 或
+        // 本次操作第一张有手帧都没有可拼接的 hand delta，只建立新轨迹。
+        if (old_hands_.empty()) {
+            initialize_hand_tracks_(hand_boxes);
+        } else {
+            update_hand_tracks_(hand_boxes);
         }
         // 手框不动时只有在没有任何未决 HAND_* / CONTACT_* 轨迹的情况下
         // 才能整帧跳过。手指可能在手腕不动时推动物品，所以活动轨迹必须
@@ -483,15 +500,26 @@ FrameProcessResult SessionManager::process_frame(
                 break;
             }
         }
-        if (!has_active_runtime && has_old_hand_box_ &&
-            hand_boxes_effectively_same(old_hand_box_, hand)) {
+        if (!has_active_runtime && !any_current_hand_moved_()) {
             trace_("FRAME", "skip-stationary-hand-no-active-track");
             return output;
         }
-        process_effective_hand_frame_(hand, food_detections, false);
-        old_hand_box_ = hand;
-        has_old_hand_box_ = true;
+        process_effective_hand_frame_(hand_boxes, food_detections, false);
         return output;
+    }
+
+    // 任何无手帧都终止“上一帧手框 -> 当前手框”的连续性。若手稍后返回，
+    // 只能从新的 hand_id / 新关联开始，不能把无手间隔两端的位移写进物品。
+    old_hands_.clear();
+    current_hand_boxes_.clear();
+    current_hand_id_by_detection_.clear();
+    current_hand_delta_by_id_.clear();
+    current_reliable_hand_delta_ids_.clear();
+    for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        it->second.carrier_hand_id = -1;
+        it->second.carrier_hand_ambiguous = false;
+        it->second.hand_track_start_index = -1;
     }
 
     ++no_hand_streak_;
@@ -500,7 +528,6 @@ FrameProcessResult SessionManager::process_frame(
         // 手刚离开的每一帧都直接供 D/C 候选完成认领、连续自匹配和缺失证据。
         // 不缓存、不平均框，也不做多数投票。
         observe_no_hand_frame_(food_detections);
-        has_old_hand_box_ = false;
         output.settlement = settle_no_hand_frame_(food_detections, frame_id);
         return output;
     }

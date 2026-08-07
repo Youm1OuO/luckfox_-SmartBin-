@@ -1870,9 +1870,21 @@ void bind_mutually_unique_track_paths(
 
 using namespace session_internal;
 
+namespace {
+
+bool any_hand_affects_reference(const std::vector<BBox>& hand_boxes,
+                                const BBox& reference) {
+    for (size_t i = 0; i < hand_boxes.size(); ++i) {
+        if (hand_affects(hand_boxes[i], reference)) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 std::map<int, int>
 SessionManager::build_mutually_unique_hand_static_owner_by_detection_(
-        const BBox& hand_box,
+        const std::vector<BBox>& hand_boxes,
         const std::vector<Detection>& detections,
         const std::set<int>& claimed_seed,
         const std::map<int, int>& known_item_owner_seed) const {
@@ -1904,7 +1916,7 @@ SessionManager::build_mutually_unique_hand_static_owner_by_detection_(
             // 细节15：静态预约只允许真正静态的旧 C 参加竞争。若先把被手
             // 影响的 C 写进 candidates_for_detection，即使它随后不能获得
             // 自己的预约，也会以更低成本挡住另一件静态旧 C。
-            if (hand_affects(hand_box, reference)) continue;
+            if (any_hand_affects_reference(hand_boxes, reference)) continue;
             float best_cost = std::numeric_limits<float>::infinity();
             int best_detection = -1;
             bool tied = false;
@@ -2182,13 +2194,13 @@ SessionManager::build_mutually_unique_hand_direct_old_owner_by_detection_(
 }
 
 void SessionManager::reserve_visible_known_detections_(
-        const BBox& hand_box,
+        const std::vector<BBox>& hand_boxes,
         const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner) {
     const std::map<int, int> owner_by_detection =
         build_mutually_unique_hand_static_owner_by_detection_(
-            hand_box, detections, *claimed_detection_indices, *known_item_owner);
+            hand_boxes, detections, *claimed_detection_indices, *known_item_owner);
 
     for (std::map<int, int>::const_iterator owner = owner_by_detection.begin();
          owner != owner_by_detection.end(); ++owner) {

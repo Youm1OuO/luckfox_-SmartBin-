@@ -126,6 +126,28 @@ struct MoveValue {
     float dy = 0.0f;
 };
 
+// 手的跨帧身份由业务层维护，不能使用当前 YOLO hand_boxes 的数组下标。
+// 手框短暂合并、漏检或对应关系不唯一时，相关物品暂停使用手位移，避免把
+// 另一只手的 delta 写入自己的 move_values。
+enum class HandTrackState {
+    OBSERVED,
+    TEMP_LOST,
+    MERGED_OR_AMBIGUOUS,
+};
+
+struct HandTrack {
+    int hand_id = -1;
+    BBox last_box;
+    BBox previous_box;
+    bool has_previous_box = false;
+    MoveValue last_delta;
+    bool has_last_delta = false;
+    std::vector<BBox> history;
+    int last_seen_frame = -1;
+    int missing_frame_count = 0;
+    HandTrackState state = HandTrackState::OBSERVED;
+};
+
 // 一条运行时记录既可代表已有库存物品，也可代表 suspect_id < 0 的疑似 D。
 // item_id 为正式工作库存 id；未提升的 D 只有 suspect_id。
 struct OperationTrack {
@@ -182,7 +204,13 @@ struct OperationTrack {
     // 正好落在预计轨迹上，也先走重新出现候选的二次确认。
     bool reappearance_pending = false;
     bool reappear_candidate_started_touching_hand = false;
+    // 该物品在 carrier_hand_id 自己的 HandTrack::history 中的起始位置。
+    // 它不再引用整个操作共用的 hand_boxes 输出序列。
     int hand_track_start_index = -1;
+    // HAND_* 的位置推算只能使用这一条内部手轨迹。-1 表示当前没有可靠
+    // 手来源；ambiguous 时保留已有路径但不追加任意手的 delta。
+    int carrier_hand_id = -1;
+    bool carrier_hand_ambiguous = false;
     // 仅 POST_HAND_REVEAL_D 使用：它在第几张无手帧首次出现。
     // 后续一张有效无手帧若不能自匹配，就丢弃该候选而不产生事件。
     int post_hand_reveal_no_hand_streak = -1;
@@ -327,7 +355,7 @@ private:
     // 会话/初始化
     void rebuild_persistent_item_index_();
     void reset_operation_runtime_();
-    void begin_working_operation_(const BBox& hand_box,
+    void begin_working_operation_(const std::vector<BBox>& hand_boxes,
                                   const std::vector<Detection>& detections);
     void finalize_initial_check_before_hand_();
     void validate_initial_no_hand_frame_(const std::vector<Detection>& detections) const;
@@ -335,36 +363,50 @@ private:
                                                   int frame_id);
 
     // 有手逐帧处理
-    void process_effective_hand_frame_(const BBox& hand_box,
+    void process_effective_hand_frame_(const std::vector<BBox>& hand_boxes,
                                        const std::vector<Detection>& detections,
                                        bool first_hand_frame);
-    void append_move_to_existing_hand_tracks_(const MoveValue& delta);
+    void initialize_hand_tracks_(const std::vector<BBox>& hand_boxes);
+    void update_hand_tracks_(const std::vector<BBox>& hand_boxes);
+    int unique_current_hand_id_for_box_(const BBox& box,
+                                        bool require_cover) const;
+    void associate_track_with_hand_(OperationTrack* track, int hand_id,
+                                    bool ambiguous);
+    bool current_hand_box_for_id_(int hand_id, BBox* hand_box) const;
+    bool current_hand_delta_for_id_(int hand_id, MoveValue* delta) const;
+    bool current_hand_box_for_track_(const OperationTrack& track,
+                                     BBox* hand_box) const;
+    bool current_hand_delta_for_track_(const OperationTrack& track,
+                                       MoveValue* delta) const;
+    int hand_history_size_(int hand_id) const;
+    bool any_current_hand_moved_() const;
+    void append_move_to_existing_hand_tracks_();
     void update_existing_contact_tracks_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
+        const std::vector<BBox>& hand_boxes,
+        const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner,
         const HandDirectOldOwnerPlan& direct_old_owner_plan);
     void mark_new_contact_candidates_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
+        const std::vector<BBox>& hand_boxes,
+        const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner,
         std::set<int>* new_existing_track_ids);
-    void update_existing_hand_tracks_(const BBox& hand_box,
+    void update_existing_hand_tracks_(const std::vector<BBox>& hand_boxes,
                                       const std::vector<Detection>& detections,
-                                      const MoveValue& delta,
                                       std::set<int>* claimed_detection_indices,
                                       std::map<int, int>* known_item_owner,
                                       const HandDirectOldOwnerPlan& direct_old_owner_plan);
-    void reopen_released_static_tracks_(const BBox& hand_box,
-                                        const std::vector<Detection>& detections,
-                                        const MoveValue& delta);
-    void scan_or_update_suspects_(const BBox& hand_box,
+    void reopen_released_static_tracks_(const std::vector<BBox>& hand_boxes,
+                                        const std::vector<Detection>& detections);
+    void scan_or_update_suspects_(const std::vector<BBox>& hand_boxes,
                                   const std::vector<Detection>& detections,
                                   std::set<int>* claimed_detection_indices,
                                   const std::map<int, int>& known_item_owner,
                                   const HandDirectOldOwnerPlan& direct_old_owner_plan,
                                   bool first_hand_frame);
-    void mark_newly_hand_blocked_items_(const BBox& hand_box,
+    void mark_newly_hand_blocked_items_(const std::vector<BBox>& hand_boxes,
                                         const std::vector<Detection>& detections,
                                         std::set<int>* claimed_detection_indices,
                                         std::map<int, int>* known_item_owner,
@@ -373,14 +415,14 @@ private:
     // 严格匹配框。这样同类新 D 即使贴着旧物品出现，也不会被旧物品的
     // “局部可能匹配”吞掉。
     void reserve_visible_known_detections_(
-        const BBox& hand_box,
+        const std::vector<BBox>& hand_boxes,
         const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner);
     // 使用 reserve_visible_known_detections_ 的相同语义，在副本上计算本帧
     // 可由普通静态库存唯一认领的 detection -> item 映射，不写入任何状态。
     std::map<int, int> build_mutually_unique_hand_static_owner_by_detection_(
-        const BBox& hand_box,
+        const std::vector<BBox>& hand_boxes,
         const std::vector<Detection>& detections,
         const std::set<int>& claimed_seed,
         const std::map<int, int>& known_item_owner_seed) const;
@@ -388,9 +430,9 @@ private:
         const std::vector<Detection>& detections,
         const std::set<int>& claimed_seed,
         const std::map<int, int>& known_item_owner_seed) const;
-    void apply_suspect_cover_evidence_(const BBox& hand_box,
+    void apply_suspect_cover_evidence_(const std::vector<BBox>& hand_boxes,
                                        const std::vector<Detection>& detections,
-                                       bool hand_moved);
+                                       bool any_hand_moved);
     void record_pending_front_evidence_(int target_item_id,
                                         int candidate_front_runtime_key,
                                         int candidate_front_item_id,
@@ -541,9 +583,16 @@ private:
     // 同一 witness 身份还必须保持可比的无手直接框；不能把前后位置明显
     // 不连续的前景检测误拼成一份“连续消失支持”证据。
     std::map<int, std::map<int, BBox> > pending_occlusion_witness_boxes_;
+    // 所有手框的扁平历史只用于“任意手是否曾接触过 D”这类上下文；它不再
+    // 承担某件物品的 move_value 来源。
     std::vector<BBox> hand_track_;
-    BBox old_hand_box_;
-    bool has_old_hand_box_ = false;
+    // key 为稳定内部 hand_id。current_hand_* 只描述正在处理的一张有手帧。
+    std::map<int, HandTrack> old_hands_;
+    std::vector<BBox> current_hand_boxes_;
+    std::map<int, int> current_hand_id_by_detection_;
+    std::map<int, MoveValue> current_hand_delta_by_id_;
+    std::set<int> current_reliable_hand_delta_ids_;
+    int next_hand_id_ = 1;
     int next_suspect_id_ = -1;
     int next_operation_id_ = 1;
     int active_operation_id_ = 0;

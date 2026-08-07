@@ -56,6 +56,12 @@ int main() {
     test_low_coverage_contact_candidate_releases_at_original();
     test_contact_to_hand_transition_keeps_observed_anchor();
     test_stationary_hand_frame_does_not_change_hand_evidence();
+    test_one_hand_moves_two_items_with_one_hand_id();
+    test_two_hands_keep_opposite_item_deltas_when_detection_order_changes();
+    test_merged_hand_detection_suspends_item_deltas();
+    test_skewed_merged_hand_detection_suspends_all_item_deltas();
+    test_second_hand_overlap_suspends_existing_item_delta();
+    test_temporarily_lost_hand_recovers_without_gap_delta();
     test_post_hand_reveal_commits_on_second_direct_frame();
     test_c_reappear_commits_after_second_direct_frame();
     test_active_a_moves_next_to_static_same_class_b();

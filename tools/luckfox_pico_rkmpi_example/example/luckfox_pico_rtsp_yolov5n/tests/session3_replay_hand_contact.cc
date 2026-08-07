@@ -337,6 +337,216 @@ void test_stationary_hand_frame_does_not_change_hand_evidence() {
            fridge::OperationTrackState::HAND_PARTIAL_BLOCKED);
 }
 
+// 一条 HandTrack 可以同时服务多个物品；两个 HAND_* 都必须记录同一条
+// hand_id 的位移，而不是依赖“当前只检测到一只手”的全局开关。
+void test_one_hand_moves_two_items_with_one_hand_id() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 280, 100, 380, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 280, 100, 380, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(70, 70, 410, 230)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(110, 70, 450, 230)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    const fridge::OperationTrack& left = tracks.find(1)->second;
+    const fridge::OperationTrack& right = tracks.find(2)->second;
+    assert(left.carrier_hand_id >= 0);
+    assert(left.carrier_hand_id == right.carrier_hand_id);
+    assert(!left.carrier_hand_ambiguous);
+    assert(!right.carrier_hand_ambiguous);
+    assert(left.move_values.size() == 1);
+    assert(right.move_values.size() == 1);
+    assert(left.move_values.back().dx > 30.0f);
+    assert(right.move_values.back().dx > 30.0f);
+}
+
+// 输入数组顺序不是手身份。两只手反向移动时，每件物品只能积累自己所关联
+// hand_id 的 delta；把第二张的检测数组反转可防止实现悄悄依赖 YOLO 下标。
+void test_two_hands_keep_opposite_item_deltas_when_detection_order_changes() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 500, 100, 600, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::BBox> first_hands;
+    first_hands.push_back(fridge::BBox(80, 80, 220, 220));
+    first_hands.push_back(fridge::BBox(480, 80, 620, 220));
+    send_frame(&session, std::vector<fridge::Detection>(), first_hands, &frame);
+
+    // H2 排在前面且向左，H1 排在后面且向右。
+    std::vector<fridge::BBox> reversed_hands;
+    reversed_hands.push_back(fridge::BBox(380, 80, 520, 220));
+    reversed_hands.push_back(fridge::BBox(180, 80, 320, 220));
+    send_frame(&session, std::vector<fridge::Detection>(), reversed_hands, &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    const fridge::OperationTrack& left = tracks.find(1)->second;
+    const fridge::OperationTrack& right = tracks.find(2)->second;
+    assert(left.carrier_hand_id >= 0);
+    assert(right.carrier_hand_id >= 0);
+    assert(left.carrier_hand_id != right.carrier_hand_id);
+    assert(!left.carrier_hand_ambiguous);
+    assert(!right.carrier_hand_ambiguous);
+    assert(left.move_values.size() == 1);
+    assert(right.move_values.size() == 1);
+    assert(left.move_values.back().dx > 80.0f);
+    assert(right.move_values.back().dx < -80.0f);
+}
+
+// 两条旧手轨迹合并成一个检测框时，不允许选择面积较大、列表靠前或距离更近
+// 的一条手来伪造位移。两个已有物品都应保留此前路径并暂停本帧 delta。
+void test_merged_hand_detection_suspends_item_deltas() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 500, 100, 600, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::BBox> separate_hands;
+    separate_hands.push_back(fridge::BBox(80, 80, 220, 220));
+    separate_hands.push_back(fridge::BBox(480, 80, 620, 220));
+    send_frame(&session, std::vector<fridge::Detection>(), separate_hands, &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 620, 220)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    const fridge::OperationTrack& left = tracks.find(1)->second;
+    const fridge::OperationTrack& right = tracks.find(2)->second;
+    assert(left.move_values.empty());
+    assert(right.move_values.empty());
+    assert(left.carrier_hand_ambiguous);
+    assert(right.carrier_hand_ambiguous);
+}
+
+// 两条旧手轨迹都能几何接上同一个当前框时，即使 H1 的代价显著更低，
+// 当前框仍可能是合并框。不能让 H1 继续把这个框的位移写给左侧物品。
+void test_skewed_merged_hand_detection_suspends_all_item_deltas() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 350, 100, 450, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 350, 100, 450, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::BBox> separate_hands;
+    separate_hands.push_back(fridge::BBox(0, 50, 300, 250));
+    separate_hands.push_back(fridge::BBox(300, 50, 500, 250));
+    send_frame(&session, std::vector<fridge::Detection>(), separate_hands, &frame);
+
+    // H1 到合并框的代价低于 H2，但两个旧 hand_id 都仍是这个框的连续候选。
+    // 这必须按“合并/歧义”处理，而不是把 H1 选作胜者。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(0, 50, 500, 250)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    const fridge::OperationTrack& left = tracks.find(1)->second;
+    const fridge::OperationTrack& right = tracks.find(2)->second;
+    assert(left.move_values.empty());
+    assert(right.move_values.empty());
+    assert(left.carrier_hand_ambiguous);
+    assert(right.carrier_hand_ambiguous);
+}
+
+// 本帧有两只可靠 hand_id，但第二只手也覆盖到已有物品时，先检查物品的
+// 预测位置是否存在多手关联。若有，不能先写旧 carrier 的 delta、再标歧义。
+void test_second_hand_overlap_suspends_existing_item_delta() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    std::vector<fridge::BBox> first_hands;
+    first_hands.push_back(fridge::BBox(0, 50, 300, 250));
+    first_hands.push_back(fridge::BBox(300, 50, 900, 250));
+    send_frame(&session, std::vector<fridge::Detection>(), first_hands, &frame);
+
+    // 两条 hand_id 的全局匹配仍唯一；但 H2 本帧已经覆盖到 item#1 的预测位置。
+    std::vector<fridge::BBox> overlapping_hands;
+    overlapping_hands.push_back(fridge::BBox(20, 50, 320, 250));
+    overlapping_hands.push_back(fridge::BBox(100, 50, 700, 250));
+    send_frame(&session, std::vector<fridge::Detection>(), overlapping_hands, &frame);
+
+    const fridge::OperationTrack& track = session.operation_tracks().find(1)->second;
+    assert(track.carrier_hand_ambiguous);
+    assert(track.move_values.empty());
+}
+
+// 一只手在另一只手仍被识别时短暂漏检，恢复到同一 hand_id 的首帧只能恢复
+// 身份，不能把漏检间隔两端的差值补写为可靠物品位移；下一张连续帧才可继续。
+void test_temporarily_lost_hand_recovers_without_gap_delta() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    std::vector<fridge::BBox> first_hands;
+    first_hands.push_back(fridge::BBox(80, 80, 220, 220));
+    first_hands.push_back(fridge::BBox(700, 80, 840, 220));
+    send_frame(&session, std::vector<fridge::Detection>(), first_hands, &frame);
+    const int original_hand_id = session.operation_tracks().find(1)->second.carrier_hand_id;
+    assert(original_hand_id >= 0);
+
+    // H1 漏检，H2 仍在，因此该帧属于有手连续操作，而不是无手结算。
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(700, 80, 840, 220)), &frame);
+    assert(session.operation_tracks().find(1)->second.move_values.empty());
+
+    // 让输出顺序反转，确保恢复依赖内部 hand_id 而非检测数组下标。
+    std::vector<fridge::BBox> recovered_hands;
+    recovered_hands.push_back(fridge::BBox(700, 80, 840, 220));
+    recovered_hands.push_back(fridge::BBox(100, 80, 240, 220));
+    send_frame(&session, std::vector<fridge::Detection>(), recovered_hands, &frame);
+    const fridge::OperationTrack& recovered = session.operation_tracks().find(1)->second;
+    assert(recovered.carrier_hand_id == original_hand_id);
+    assert(!recovered.carrier_hand_ambiguous);
+    assert(recovered.move_values.empty());
+
+    std::vector<fridge::BBox> continuous_hands;
+    continuous_hands.push_back(fridge::BBox(120, 80, 260, 220));
+    continuous_hands.push_back(fridge::BBox(700, 80, 840, 220));
+    send_frame(&session, std::vector<fridge::Detection>(), continuous_hands, &frame);
+    const fridge::OperationTrack& continued = session.operation_tracks().find(1)->second;
+    assert(continued.carrier_hand_id == original_hand_id);
+    assert(continued.move_values.size() == 1);
+    assert(continued.move_values.back().dx > 12.0f);
+}
+
 // 细节8-7.2 的自然时序：A 先连续两帧被直接看到仍在原位，触发暂时的
 // STATIC_CONFIRMED；手尚未离开就再次移动，A 在旧位置消失。此时必须重新
 // 激活 A 的轨迹，最终认回移动后的 A，而不是把它登记成新的同类 D。

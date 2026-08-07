@@ -299,6 +299,17 @@ constexpr float TRACK_HAND_MOVE_EPS          = 12.0f;
 // 没有任何未决 HAND_* / CONTACT_* 轨迹时，连续两帧手框几乎没有变化才跳过。
 // 只要有活动轨迹，即使手腕不动也必须继续检查物品框，避免漏掉手指推动。
 constexpr float HAND_MICRO_MOVE_SKIP_EPS     = 6.0f;
+// 业务层维护 hand_id。以下参数只限制旧手轨迹与当前手框的身份恢复，
+// 不改变 HAND_* 覆盖率、物品移动或无手结算阈值。稳定的一对一连续帧
+// 正常累计位移；几何突变、合并或身份不可靠时暂停而不猜测。
+constexpr float HAND_TRACK_MATCH_MAX_CENTER_NORM = 3.00f;
+constexpr float HAND_TRACK_MATCH_MAX_SHAPE_DELTA = 1.20f;
+constexpr float HAND_TRACK_MATCH_MAX_AREA_RATIO = 4.00f;
+// 最优和次优全局分配的总代价差不超过此值时，身份不可靠，暂停该帧 delta。
+constexpr float HAND_TRACK_MATCH_AMBIGUITY_MARGIN = 0.20f;
+// 某条手轨迹在此数量的有手帧内没有唯一匹配时，保留其历史供恢复；期间
+// 不向关联物品追加位移。超过窗口后丢弃过期 hand_id，等待重新建立。
+constexpr int HAND_TRACK_TEMP_LOST_FRAMES = 2;
 // 疑似 D 连续有效观察次数达到该值后，认为身份稳定，可在结算时入库。
 constexpr int   NEW_ITEM_CONFIRM_FRAMES      = 2;
 constexpr int   FLOW3_HOLD_EVIDENCE_REQUIRED = 2;

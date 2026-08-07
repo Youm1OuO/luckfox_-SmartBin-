@@ -44,9 +44,534 @@ const char* candidate_context_decision(const SameClassCandidateContext& context)
         : "multiple-unresolved-old-c";
 }
 
+bool any_hand_is_near(const std::vector<BBox>& hand_boxes, const BBox& box) {
+    for (size_t i = 0; i < hand_boxes.size(); ++i) {
+        if (hand_is_near(hand_boxes[i], box)) return true;
+    }
+    return false;
+}
+
+bool any_hand_affects_box(const std::vector<BBox>& hand_boxes, const BBox& box) {
+    for (size_t i = 0; i < hand_boxes.size(); ++i) {
+        if (hand_affects(hand_boxes[i], box)) return true;
+    }
+    return false;
+}
+
+bool any_hand_fully_covers_box(const std::vector<BBox>& hand_boxes, const BBox& box) {
+    for (size_t i = 0; i < hand_boxes.size(); ++i) {
+        if (hand_fully_covers(hand_boxes[i], box)) return true;
+    }
+    return false;
+}
+
+bool any_hand_touches_detection_box(const std::vector<BBox>& hand_boxes,
+                                    const BBox& box) {
+    for (size_t i = 0; i < hand_boxes.size(); ++i) {
+        if (hand_touches_detection(hand_boxes[i], box)) return true;
+    }
+    return false;
+}
+
+bool detection_matches_any_hand_affected_reference(
+        int cls_id, const BBox& reference, const Detection& detection,
+        const std::vector<BBox>& hand_boxes) {
+    for (size_t i = 0; i < hand_boxes.size(); ++i) {
+        if (matches_hand_affected_reference(cls_id, reference, detection, hand_boxes[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int unique_hand_affected_detection_for_boxes(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        int cls_id, const BBox& reference, const std::vector<BBox>& hand_boxes) {
+    int result = -1;
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (claimed.count(static_cast<int>(i)) || detections[i].cls_id != cls_id ||
+            !detection_matches_any_hand_affected_reference(
+                cls_id, reference, detections[i], hand_boxes)) {
+            continue;
+        }
+        if (result >= 0) return -1;
+        result = static_cast<int>(i);
+    }
+    return result;
+}
+
+int best_hand_affected_detection_for_boxes(
+        const std::vector<Detection>& detections, const std::set<int>& claimed,
+        int cls_id, const BBox& reference, const std::vector<BBox>& hand_boxes) {
+    float best_cost = std::numeric_limits<float>::infinity();
+    int result = -1;
+    bool tied = false;
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (claimed.count(static_cast<int>(i)) || detections[i].cls_id != cls_id ||
+            !detection_matches_any_hand_affected_reference(
+                cls_id, reference, detections[i], hand_boxes)) {
+            continue;
+        }
+        float cost = 0.0f;
+        if (strict_match_box(cls_id, reference, detections[i].cls_id, detections[i].box)) {
+            cost = normalized_nearby_distance(reference, detections[i].box);
+        } else if (partial_match_box(cls_id, reference, detections[i].cls_id,
+                                     detections[i].box)) {
+            cost = 1.0f + (1.0f - iom(reference, detections[i].box));
+        } else {
+            const float observed_cover = intersection_area(reference, detections[i].box) /
+                std::max(detections[i].box.area(), 1.0f);
+            cost = 2.0f + normalized_nearby_distance(reference, detections[i].box) +
+                (1.0f - observed_cover);
+        }
+        if (cost + 0.0001f < best_cost) {
+            best_cost = cost;
+            result = static_cast<int>(i);
+            tied = false;
+        } else if (std::fabs(cost - best_cost) <= 0.0001f) {
+            tied = true;
+        }
+    }
+    return tied ? -1 : result;
+}
+
+int hand_affected_existing_candidate_count_for_boxes(
+        const std::map<int, InventoryItem>& working, const Detection& detection,
+        const std::vector<BBox>& hand_boxes) {
+    int count = 0;
+    for (std::map<int, InventoryItem>::const_iterator it = working.begin();
+         it != working.end(); ++it) {
+        if (it->second.status == ItemStatus::OCCLUDED) continue;
+        const BBox reference = it->second.base_box.area() > 0.0f
+            ? it->second.base_box : it->second.box;
+        if (!detection_matches_any_hand_affected_reference(
+                it->second.cls_id, reference, detection, hand_boxes)) {
+            continue;
+        }
+        ++count;
+        if (count > 1) return count;
+    }
+    return count;
+}
+
+float hand_track_match_cost(const HandTrack& hand, const BBox& current) {
+    if (hand.last_box.area() <= 0.0f || current.area() <= 0.0f) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const float scale = std::max(std::max(diagonal(hand.last_box), diagonal(current)), 1.0f);
+    const float center_shift = center_distance(hand.last_box, current) / scale;
+    const float shape_delta = box_shape_delta(hand.last_box, current);
+    const float smaller_area = std::min(hand.last_box.area(), current.area());
+    const float larger_area = std::max(hand.last_box.area(), current.area());
+    const float area_ratio = smaller_area > 0.0f ? larger_area / smaller_area :
+        std::numeric_limits<float>::infinity();
+    if (center_shift > HAND_TRACK_MATCH_MAX_CENTER_NORM ||
+        shape_delta > HAND_TRACK_MATCH_MAX_SHAPE_DELTA ||
+        area_ratio > HAND_TRACK_MATCH_MAX_AREA_RATIO) {
+        return std::numeric_limits<float>::infinity();
+    }
+
+    float cost = center_shift + 0.25f * shape_delta + 0.15f * std::log(area_ratio);
+    if (hand.state == HandTrackState::OBSERVED && hand.has_last_delta &&
+        move_length(hand.last_delta) >= TRACK_HAND_MOVE_EPS) {
+        const BBox predicted = move_box(hand.last_box, hand.last_delta);
+        cost += 0.25f * center_distance(predicted, current) / scale;
+    }
+    return cost;
+}
+
+struct HandAssignment {
+    float cost = std::numeric_limits<float>::infinity();
+    std::vector<int> choices;
+};
+
+void search_hand_assignments(
+        const std::vector<std::vector<std::pair<int, float> > >& candidates,
+        int choice_count, size_t row, std::vector<bool>* used,
+        std::vector<int>* choices, float cost, HandAssignment* best,
+        HandAssignment* second) {
+    if (row == candidates.size()) {
+        if (cost + 0.0001f < best->cost) {
+            *second = *best;
+            best->cost = cost;
+            best->choices = *choices;
+        } else if (cost + 0.0001f < second->cost) {
+            second->cost = cost;
+            second->choices = *choices;
+        }
+        return;
+    }
+    for (size_t i = 0; i < candidates[row].size(); ++i) {
+        const int choice = candidates[row][i].first;
+        if (choice < 0 || choice >= choice_count || (*used)[choice]) continue;
+        (*used)[choice] = true;
+        choices->push_back(choice);
+        search_hand_assignments(candidates, choice_count, row + 1, used, choices,
+                                cost + candidates[row][i].second, best, second);
+        choices->pop_back();
+        (*used)[choice] = false;
+    }
+}
+
+bool assignment_is_ambiguous(const HandAssignment& best,
+                             const HandAssignment& second) {
+    return best.cost < std::numeric_limits<float>::infinity() &&
+        second.cost < std::numeric_limits<float>::infinity() &&
+        second.cost - best.cost <= HAND_TRACK_MATCH_AMBIGUITY_MARGIN;
+}
+
 }  // namespace
 
-void SessionManager::begin_working_operation_(const BBox& hand_box,
+void SessionManager::initialize_hand_tracks_(const std::vector<BBox>& hand_boxes) {
+    old_hands_.clear();
+    current_hand_boxes_ = hand_boxes;
+    current_hand_id_by_detection_.clear();
+    current_hand_delta_by_id_.clear();
+    current_reliable_hand_delta_ids_.clear();
+    for (size_t i = 0; i < hand_boxes.size(); ++i) {
+        HandTrack hand;
+        hand.hand_id = next_hand_id_++;
+        hand.last_box = hand_boxes[i];
+        hand.history.push_back(hand_boxes[i]);
+        hand.last_seen_frame = trace_frame_id_;
+        hand.state = HandTrackState::OBSERVED;
+        old_hands_[hand.hand_id] = hand;
+        current_hand_id_by_detection_[static_cast<int>(i)] = hand.hand_id;
+        hand_track_.push_back(hand_boxes[i]);
+        trace_("HAND-TRACK", "create hand=%d detection=%zu frame=%d",
+               hand.hand_id, i, trace_frame_id_);
+    }
+}
+
+void SessionManager::update_hand_tracks_(const std::vector<BBox>& hand_boxes) {
+    current_hand_boxes_ = hand_boxes;
+    current_hand_id_by_detection_.clear();
+    current_hand_delta_by_id_.clear();
+    current_reliable_hand_delta_ids_.clear();
+    for (size_t i = 0; i < hand_boxes.size(); ++i) hand_track_.push_back(hand_boxes[i]);
+
+    std::vector<int> old_ids;
+    for (std::map<int, HandTrack>::iterator it = old_hands_.begin();
+         it != old_hands_.end();) {
+        if (it->second.missing_frame_count > HAND_TRACK_TEMP_LOST_FRAMES) {
+            trace_("HAND-TRACK", "expire hand=%d missing=%d", it->first,
+                   it->second.missing_frame_count);
+            old_hands_.erase(it++);
+            continue;
+        }
+        it->second.has_last_delta = false;
+        old_ids.push_back(it->first);
+        ++it;
+    }
+
+    if (old_ids.empty()) {
+        for (size_t i = 0; i < hand_boxes.size(); ++i) {
+            HandTrack hand;
+            hand.hand_id = next_hand_id_++;
+            hand.last_box = hand_boxes[i];
+            hand.history.push_back(hand_boxes[i]);
+            hand.last_seen_frame = trace_frame_id_;
+            old_hands_[hand.hand_id] = hand;
+            current_hand_id_by_detection_[static_cast<int>(i)] = hand.hand_id;
+            trace_("HAND-TRACK", "create hand=%d detection=%zu frame=%d",
+                   hand.hand_id, i, trace_frame_id_);
+        }
+        return;
+    }
+
+    std::vector<std::vector<std::pair<int, float> > > old_rows(old_ids.size());
+    // 当前手框若同时可接到多条旧轨迹，就不能把它当成某一条手的可靠
+    // 延续。仅阻止相关 hand_id；与其无关的手仍可继续使用自己的 delta。
+    std::set<int> ambiguous_current_detection_indices;
+    for (size_t oi = 0; oi < old_ids.size(); ++oi) {
+        const HandTrack& hand = old_hands_[old_ids[oi]];
+        for (size_t ci = 0; ci < hand_boxes.size(); ++ci) {
+            const float cost = hand_track_match_cost(hand, hand_boxes[ci]);
+            if (!(cost < std::numeric_limits<float>::infinity())) continue;
+            old_rows[oi].push_back(std::make_pair(static_cast<int>(ci), cost));
+        }
+    }
+
+    std::map<int, int> accepted_current_by_hand;
+    std::set<int> ambiguous_hand_ids;
+    if (hand_boxes.size() >= old_ids.size()) {
+        std::vector<int> source_rows;
+        std::vector<std::vector<std::pair<int, float> > > candidates;
+        for (size_t oi = 0; oi < old_rows.size(); ++oi) {
+            if (old_rows[oi].empty()) continue;
+            source_rows.push_back(static_cast<int>(oi));
+            candidates.push_back(old_rows[oi]);
+        }
+        if (!candidates.empty()) {
+            HandAssignment best;
+            HandAssignment second;
+            std::vector<bool> used(hand_boxes.size(), false);
+            std::vector<int> choices;
+            search_hand_assignments(candidates, static_cast<int>(hand_boxes.size()), 0,
+                                    &used, &choices, 0.0f, &best, &second);
+            if (!assignment_is_ambiguous(best, second) &&
+                best.cost < std::numeric_limits<float>::infinity()) {
+                for (size_t ri = 0; ri < source_rows.size(); ++ri) {
+                    accepted_current_by_hand[old_ids[source_rows[ri]]] = best.choices[ri];
+                }
+            } else {
+                for (size_t ri = 0; ri < source_rows.size(); ++ri) {
+                    ambiguous_hand_ids.insert(old_ids[source_rows[ri]]);
+                    for (size_t pi = 0; pi < candidates[ri].size(); ++pi) {
+                        ambiguous_current_detection_indices.insert(candidates[ri][pi].first);
+                    }
+                }
+            }
+        }
+    } else {
+        // 当前框少于旧轨迹并不必然表示“合并”：若当前框只能唯一地接上 H1，
+        // 而 H2 只是漏检，H1 仍可保守继续。反之有多个同样合理的旧手时才
+        // 标记为 MERGED_OR_AMBIGUOUS，并暂停它们的 delta。
+        // 如果一个当前框同时是两条旧轨迹的候选，即使其中一个代价较低，
+        // 它仍可能是双手合并框。两条相关轨迹都暂停，不能让“更近”的一
+        // 条继续把合并框的位移写给物品。
+        std::set<int> merged_old_row_indices;
+        for (size_t ci = 0; ci < hand_boxes.size(); ++ci) {
+            std::vector<std::pair<int, float> > row;
+            for (size_t oi = 0; oi < old_rows.size(); ++oi) {
+                for (size_t pi = 0; pi < old_rows[oi].size(); ++pi) {
+                    if (old_rows[oi][pi].first == static_cast<int>(ci)) {
+                        row.push_back(std::make_pair(static_cast<int>(oi),
+                                                     old_rows[oi][pi].second));
+                    }
+                }
+            }
+            if (row.size() <= 1) continue;
+            ambiguous_current_detection_indices.insert(static_cast<int>(ci));
+            for (size_t pi = 0; pi < row.size(); ++pi) {
+                merged_old_row_indices.insert(row[pi].first);
+                ambiguous_hand_ids.insert(old_ids[row[pi].first]);
+            }
+        }
+
+        std::vector<int> source_current_rows;
+        std::vector<std::vector<std::pair<int, float> > > candidates;
+        for (size_t ci = 0; ci < hand_boxes.size(); ++ci) {
+            if (ambiguous_current_detection_indices.count(static_cast<int>(ci))) continue;
+            std::vector<std::pair<int, float> > row;
+            for (size_t oi = 0; oi < old_rows.size(); ++oi) {
+                if (merged_old_row_indices.count(static_cast<int>(oi))) continue;
+                for (size_t pi = 0; pi < old_rows[oi].size(); ++pi) {
+                    if (old_rows[oi][pi].first == static_cast<int>(ci)) {
+                        row.push_back(std::make_pair(static_cast<int>(oi),
+                                                     old_rows[oi][pi].second));
+                    }
+                }
+            }
+            if (row.empty()) continue;
+            source_current_rows.push_back(static_cast<int>(ci));
+            candidates.push_back(row);
+        }
+        if (!candidates.empty()) {
+            HandAssignment best;
+            HandAssignment second;
+            std::vector<bool> used(old_ids.size(), false);
+            std::vector<int> choices;
+            search_hand_assignments(candidates, static_cast<int>(old_ids.size()), 0,
+                                    &used, &choices, 0.0f, &best, &second);
+            if (!assignment_is_ambiguous(best, second) &&
+                best.cost < std::numeric_limits<float>::infinity()) {
+                for (size_t ri = 0; ri < source_current_rows.size(); ++ri) {
+                    accepted_current_by_hand[old_ids[best.choices[ri]]] =
+                        source_current_rows[ri];
+                }
+            } else {
+                for (size_t ri = 0; ri < candidates.size(); ++ri) {
+                    ambiguous_current_detection_indices.insert(source_current_rows[ri]);
+                    for (size_t pi = 0; pi < candidates[ri].size(); ++pi) {
+                        ambiguous_hand_ids.insert(old_ids[candidates[ri][pi].first]);
+                    }
+                }
+            }
+        }
+    }
+
+    std::set<int> matched_hand_ids;
+    for (std::map<int, int>::const_iterator accepted = accepted_current_by_hand.begin();
+         accepted != accepted_current_by_hand.end(); ++accepted) {
+        HandTrack& hand = old_hands_[accepted->first];
+        const bool resumed_after_interruption = hand.missing_frame_count > 0 ||
+            hand.state != HandTrackState::OBSERVED;
+        const BBox previous = hand.last_box;
+        MoveValue delta;
+        delta.dx = hand_boxes[accepted->second].cx() - previous.cx();
+        delta.dy = hand_boxes[accepted->second].cy() - previous.cy();
+        hand.previous_box = previous;
+        hand.has_previous_box = true;
+        hand.last_box = hand_boxes[accepted->second];
+        hand.history.push_back(hand.last_box);
+        hand.last_seen_frame = trace_frame_id_;
+        hand.missing_frame_count = 0;
+        hand.state = HandTrackState::OBSERVED;
+        current_hand_id_by_detection_[accepted->second] = accepted->first;
+        matched_hand_ids.insert(accepted->first);
+        if (resumed_after_interruption) {
+            // 这条位移跨过了漏检、合并或身份歧义的空档。虽然 hand_id 可以
+            // 保守恢复，但首个恢复框不能补写为可靠 delta；下一张连续帧才
+            // 可以重新开始累计。
+            hand.last_delta = MoveValue();
+            hand.has_last_delta = false;
+            trace_("HAND-TRACK", "recover hand=%d detection=%d action=no-delta",
+                   accepted->first, accepted->second);
+        } else {
+            hand.last_delta = delta;
+            hand.has_last_delta = true;
+            current_hand_delta_by_id_[accepted->first] = delta;
+            current_reliable_hand_delta_ids_.insert(accepted->first);
+            trace_("HAND-TRACK", "update hand=%d detection=%d delta=(%.1f,%.1f)",
+                   accepted->first, accepted->second, delta.dx, delta.dy);
+        }
+    }
+
+    for (size_t oi = 0; oi < old_ids.size(); ++oi) {
+        HandTrack& hand = old_hands_[old_ids[oi]];
+        if (matched_hand_ids.count(hand.hand_id)) continue;
+        ++hand.missing_frame_count;
+        hand.has_last_delta = false;
+        if (ambiguous_hand_ids.count(hand.hand_id)) {
+            hand.state = HandTrackState::MERGED_OR_AMBIGUOUS;
+            trace_("HAND-TRACK", "merged-or-ambiguous hand=%d missing=%d action=no-delta",
+                   hand.hand_id, hand.missing_frame_count);
+        } else {
+            hand.state = HandTrackState::TEMP_LOST;
+            trace_("HAND-TRACK", "temporary-lost hand=%d missing=%d action=no-delta",
+                   hand.hand_id, hand.missing_frame_count);
+        }
+    }
+
+    for (size_t ci = 0; ci < hand_boxes.size(); ++ci) {
+        if (current_hand_id_by_detection_.count(static_cast<int>(ci))) continue;
+        // 一个当前框若正处于旧 hand_id 的多对一或全局分配歧义中，不创建
+        // 第二套身份；等它重新分开后再恢复或建立，避免把 merged 手的
+        // delta 写给任一物品。
+        if (ambiguous_current_detection_indices.count(static_cast<int>(ci))) continue;
+        HandTrack hand;
+        hand.hand_id = next_hand_id_++;
+        hand.last_box = hand_boxes[ci];
+        hand.history.push_back(hand_boxes[ci]);
+        hand.last_seen_frame = trace_frame_id_;
+        hand.state = HandTrackState::OBSERVED;
+        old_hands_[hand.hand_id] = hand;
+        current_hand_id_by_detection_[static_cast<int>(ci)] = hand.hand_id;
+        trace_("HAND-TRACK", "create hand=%d detection=%zu frame=%d",
+               hand.hand_id, ci, trace_frame_id_);
+    }
+}
+
+int SessionManager::unique_current_hand_id_for_box_(const BBox& box,
+                                                     bool require_cover) const {
+    int hand_id = -1;
+    bool ambiguous = false;
+    for (size_t i = 0; i < current_hand_boxes_.size(); ++i) {
+        const bool relevant = require_cover
+            ? hand_affects(current_hand_boxes_[i], box)
+            : hand_touches_detection(current_hand_boxes_[i], box);
+        if (!relevant) continue;
+        std::map<int, int>::const_iterator mapped =
+            current_hand_id_by_detection_.find(static_cast<int>(i));
+        if (mapped == current_hand_id_by_detection_.end()) {
+            ambiguous = true;
+            continue;
+        }
+        if (hand_id >= 0 && hand_id != mapped->second) {
+            ambiguous = true;
+            continue;
+        }
+        hand_id = mapped->second;
+    }
+    return ambiguous ? -2 : hand_id;
+}
+
+void SessionManager::associate_track_with_hand_(OperationTrack* track, int hand_id,
+                                                bool ambiguous) {
+    if (!track) return;
+    if (ambiguous) {
+        track->carrier_hand_ambiguous = true;
+        trace_("HAND-ASSOC", "runtime=%d item=%d state=AMBIGUOUS action=suspend-delta",
+               track->is_suspect_new ? track->suspect_id : track->item_id,
+               track->item_id);
+        return;
+    }
+    if (hand_id < 0) return;
+    if (track->carrier_hand_id < 0) {
+        track->carrier_hand_id = hand_id;
+        track->carrier_hand_ambiguous = false;
+        track->hand_track_start_index = hand_history_size_(hand_id) - 1;
+        trace_("HAND-ASSOC", "runtime=%d item=%d hand=%d state=UNIQUE action=bind",
+               track->is_suspect_new ? track->suspect_id : track->item_id,
+               track->item_id, hand_id);
+        return;
+    }
+    if (track->carrier_hand_id == hand_id) {
+        track->carrier_hand_ambiguous = false;
+        return;
+    }
+    // 接手不能只由“当前更近的手框”推断。保留旧 hand_id 和已有路径，但
+    // 暂停新增位移，等待独立物品观察或无手结算给出证据。
+    track->carrier_hand_ambiguous = true;
+    trace_("HAND-ASSOC", "runtime=%d item=%d old-hand=%d candidate-hand=%d "
+           "state=AMBIGUOUS action=suspend-delta",
+           track->is_suspect_new ? track->suspect_id : track->item_id,
+           track->item_id, track->carrier_hand_id, hand_id);
+}
+
+bool SessionManager::current_hand_box_for_id_(int hand_id, BBox* hand_box) const {
+    if (!hand_box || hand_id < 0) return false;
+    for (std::map<int, int>::const_iterator it = current_hand_id_by_detection_.begin();
+         it != current_hand_id_by_detection_.end(); ++it) {
+        if (it->second != hand_id || it->first < 0 ||
+            it->first >= static_cast<int>(current_hand_boxes_.size())) {
+            continue;
+        }
+        *hand_box = current_hand_boxes_[it->first];
+        return true;
+    }
+    return false;
+}
+
+bool SessionManager::current_hand_delta_for_id_(int hand_id, MoveValue* delta) const {
+    if (!delta || !current_reliable_hand_delta_ids_.count(hand_id)) return false;
+    std::map<int, MoveValue>::const_iterator found = current_hand_delta_by_id_.find(hand_id);
+    if (found == current_hand_delta_by_id_.end()) return false;
+    *delta = found->second;
+    return true;
+}
+
+bool SessionManager::current_hand_box_for_track_(const OperationTrack& track,
+                                                  BBox* hand_box) const {
+    return !track.carrier_hand_ambiguous &&
+        current_hand_box_for_id_(track.carrier_hand_id, hand_box);
+}
+
+bool SessionManager::current_hand_delta_for_track_(const OperationTrack& track,
+                                                    MoveValue* delta) const {
+    return !track.carrier_hand_ambiguous &&
+        current_hand_delta_for_id_(track.carrier_hand_id, delta);
+}
+
+int SessionManager::hand_history_size_(int hand_id) const {
+    std::map<int, HandTrack>::const_iterator hand = old_hands_.find(hand_id);
+    return hand == old_hands_.end() ? 0 : static_cast<int>(hand->second.history.size());
+}
+
+bool SessionManager::any_current_hand_moved_() const {
+    for (std::set<int>::const_iterator hand = current_reliable_hand_delta_ids_.begin();
+         hand != current_reliable_hand_delta_ids_.end(); ++hand) {
+        std::map<int, MoveValue>::const_iterator delta = current_hand_delta_by_id_.find(*hand);
+        if (delta != current_hand_delta_by_id_.end() &&
+            move_length(delta->second) >= TRACK_HAND_MOVE_EPS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SessionManager::begin_working_operation_(const std::vector<BBox>& hand_boxes,
                                                const std::vector<Detection>& detections) {
     working_inventory_ = inventory_.items();
     operation_start_inventory_ = inventory_.items();
@@ -73,15 +598,12 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     pending_occlusion_witness_ids_.clear();
     pending_occlusion_witness_boxes_.clear();
     hand_track_.clear();
-    hand_track_.push_back(hand_box);
-    old_hand_box_ = hand_box;
-    has_old_hand_box_ = true;
+    initialize_hand_tracks_(hand_boxes);
     no_hand_streak_ = 0;
     active_operation_id_ = next_operation_id_++;
-    trace_("STATE", "begin operation inventory=%zu detections=%zu hand=(%.1f,%.1f,%.1f,%.1f)",
-           working_inventory_.size(), detections.size(), hand_box.x1, hand_box.y1,
-           hand_box.x2, hand_box.y2);
-    process_effective_hand_frame_(hand_box, detections, true);
+    trace_("STATE", "begin operation inventory=%zu detections=%zu hands=%zu",
+           working_inventory_.size(), detections.size(), hand_boxes.size());
+    process_effective_hand_frame_(hand_boxes, detections, true);
 }
 
 void SessionManager::record_pending_front_evidence_(
@@ -201,25 +723,47 @@ void SessionManager::link_suspect_to_conflicting_old_items_(
     }
 }
 
-void SessionManager::append_move_to_existing_hand_tracks_(const MoveValue& delta) {
+void SessionManager::append_move_to_existing_hand_tracks_() {
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
+        MoveValue delta;
+        if (!current_hand_delta_for_track_(track, &delta)) {
+            // TEMP_LOST、手框合并或 hand_id 关联不唯一时，保留已有预计路径，
+            // 但绝不借用另一只手的 delta。
+            continue;
+        }
+        const bool is_hand_track =
+            track.state == OperationTrackState::HAND_PARTIAL_BLOCKED ||
+            track.state == OperationTrackState::HAND_FULL_BLOCKED;
+        if (is_hand_track) {
+            // 先用“如果采用本 hand_id 的本帧 delta 后”的预测位置检查当前
+            // 手关联。不能先把 delta 写入轨迹、随后才发现第二只手也覆盖
+            // 该物品；那会使歧义帧仍留下不可撤销的错误位移。
+            const BBox predicted = move_box(estimated_box(track), delta);
+            const int predicted_hand = unique_current_hand_id_for_box_(
+                predicted, !track.is_suspect_new);
+            if (predicted_hand == -2) {
+                associate_track_with_hand_(&track, -1, true);
+                continue;
+            }
+            if (predicted_hand >= 0 && predicted_hand != track.carrier_hand_id) {
+                associate_track_with_hand_(&track, predicted_hand, false);
+                continue;
+            }
+        }
         if (track.contact_state != ContactState::NONE) {
             // 仅作调试/未来扩展记录；CONTACT_* 的物品位置不能由手位移推算。
             track.hand_move_values.push_back(delta);
         }
-        if (track.state != OperationTrackState::HAND_PARTIAL_BLOCKED &&
-            track.state != OperationTrackState::HAND_FULL_BLOCKED) {
-            continue;
-        }
+        if (!is_hand_track) continue;
         track.move_values.push_back(delta);
         track.track.push_back(estimated_box(track));
     }
 }
 
 void SessionManager::update_existing_contact_tracks_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
+        const std::vector<BBox>& hand_boxes, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner,
         const HandDirectOldOwnerPlan& direct_old_owner_plan) {
@@ -249,7 +793,7 @@ void SessionManager::update_existing_contact_tracks_(
                 track.drop_evidence_count = 0;
             }
             append_contact_observation(&track, direct,
-                                       hand_is_near(hand_box, direct.box));
+                                       any_hand_is_near(hand_boxes, direct.box));
             track.has_tentative_b_box = false;
             track.tentative_b_match_count = 0;
             track.tentative_b_started_touching_hand = false;
@@ -270,10 +814,14 @@ void SessionManager::update_existing_contact_tracks_(
         const BBox reference = track.has_tentative_b_box ? track.tentative_b_box
             : (track.has_last_seen_box ? track.last_seen_box : track.original_box);
         if (reference.area() <= 0.0f) continue;
+        const int associated_hand = unique_current_hand_id_for_box_(reference, false);
+        associate_track_with_hand_(&track, associated_hand,
+                                   associated_hand == -2);
 
         // 覆盖率达到 e2 后，接触候选转入已有 HAND_* 流程；同一帧稍后由
         // update_existing_hand_tracks_ 继续处理，避免两套逻辑同时认领。
-        if (hand_fully_covers(hand_box, reference) || hand_affects(hand_box, reference)) {
+        if (any_hand_fully_covers_box(hand_boxes, reference) ||
+            any_hand_affects_box(hand_boxes, reference)) {
             // 保留 contact 阶段的真实位置作为之后 HAND_* 估计的原点。
             // original_box 不能改，它还要用于判断最终是否发生整理/出库。
             track.hand_estimate_anchor_box = reference;
@@ -282,7 +830,7 @@ void SessionManager::update_existing_contact_tracks_(
             track.track.clear();
             track.track.push_back(reference);
             track.contact_state = ContactState::NONE;
-            track.state = hand_fully_covers(hand_box, reference)
+            track.state = any_hand_fully_covers_box(hand_boxes, reference)
                 ? OperationTrackState::HAND_FULL_BLOCKED
                 : OperationTrackState::HAND_PARTIAL_BLOCKED;
             if (track.has_last_seen_box) {
@@ -320,7 +868,7 @@ void SessionManager::update_existing_contact_tracks_(
         }
 
         const Detection& detection = detections[observed_index];
-        const bool touching_hand = hand_is_near(hand_box, detection.box);
+        const bool touching_hand = any_hand_is_near(hand_boxes, detection.box);
         const bool had_touch_before = track.contact_started_touching_hand;
         const BBox previous = track.has_last_seen_box
             ? track.last_seen_box : track.original_box;
@@ -418,7 +966,7 @@ void SessionManager::update_existing_contact_tracks_(
 }
 
 void SessionManager::mark_new_contact_candidates_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
+        const std::vector<BBox>& hand_boxes, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner,
         std::set<int>* new_existing_track_ids) {
@@ -429,8 +977,8 @@ void SessionManager::mark_new_contact_candidates_(
         std::map<int, InventoryItem>::const_iterator item =
             working_inventory_.find(*released);
         if (item == working_inventory_.end() ||
-            !hand_is_near(hand_box, item->second.base_box.area() > 0.0f
-                                      ? item->second.base_box : item->second.box)) {
+            !any_hand_is_near(hand_boxes, item->second.base_box.area() > 0.0f
+                                           ? item->second.base_box : item->second.box)) {
             released = released_hand_candidate_ids_.erase(released);
         } else {
             ++released;
@@ -449,9 +997,8 @@ void SessionManager::mark_new_contact_candidates_(
 
         const BBox reference = item.base_box.area() > 0.0f
             ? item.base_box : item.box;
-        if (reference.area() <= 0.0f || hand_cover_ratio(hand_box, reference) >=
-                FLOW3_HAND_PARTIAL_COVER_RATIO ||
-            !hand_is_near(hand_box, reference)) {
+        if (reference.area() <= 0.0f || any_hand_affects_box(hand_boxes, reference) ||
+            !any_hand_is_near(hand_boxes, reference)) {
             continue;
         }
 
@@ -463,9 +1010,10 @@ void SessionManager::mark_new_contact_candidates_(
         track.needs_no_hand_settlement = true;
         track.shelter_or_hold = true;
         track.claim_grace_remaining = FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES;
-        track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
         track_buffer_[item.item_id] = track;
         OperationTrack& created = track_buffer_[item.item_id];
+        const int associated_hand = unique_current_hand_id_for_box_(reference, false);
+        associate_track_with_hand_(&created, associated_hand, associated_hand == -2);
         if (new_existing_track_ids) new_existing_track_ids->insert(item.item_id);
 
         int observed_index = -1;
@@ -482,7 +1030,8 @@ void SessionManager::mark_new_contact_candidates_(
                 working_inventory_, track_buffer_);
         }
         if (observed_index >= 0) {
-            const bool touching = hand_is_near(hand_box, detections[observed_index].box);
+            const bool touching = any_hand_is_near(hand_boxes,
+                                                   detections[observed_index].box);
             const bool at_original = contact_detection_is_at_original(
                 created, detections[observed_index]);
             // 保护期只禁止“移动后的同类 B”的排他归属。C 若确实仍在旧
@@ -681,13 +1230,15 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
     track.hand_move_values.clear();
     track.contact_started_touching_hand = false;
     track.no_hand_missing_count = 0;
+    track.carrier_hand_id = -1;
+    track.carrier_hand_ambiguous = false;
     if (keep_reopen_anchor) {
         track.last_seen_box = reopen_anchor;
         track.has_last_seen_box = reopen_anchor.area() > 0.0f;
         track.hand_estimate_anchor_box = reopen_anchor;
         track.has_hand_estimate_anchor_box = reopen_anchor.area() > 0.0f;
         if (track.has_hand_estimate_anchor_box) track.track.push_back(reopen_anchor);
-        track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
+        track.hand_track_start_index = -1;
     } else {
         track.has_hand_estimate_anchor_box = false;
         track.hand_track_start_index = -1;
@@ -944,14 +1495,11 @@ void SessionManager::advance_claim_grace_(
 }
 
 void SessionManager::update_existing_hand_tracks_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
-        const MoveValue& delta, std::set<int>* claimed_detection_indices,
+        const std::vector<BBox>& hand_boxes, const std::vector<Detection>& detections,
+        std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner,
         const HandDirectOldOwnerPlan& direct_old_owner_plan) {
     std::vector<int> promote_keys;
-    // 对 HAND_* + hold_and_move=false，静止手帧只能更新局部观测，不能把
-    // “还在原位”或“跟手移动”当作新的有效证据。
-    const bool hand_moved = move_length(delta) >= TRACK_HAND_MOVE_EPS;
     bool has_hand_visible_suspect = false;
     for (std::map<int, OperationTrack>::const_iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
@@ -970,7 +1518,7 @@ void SessionManager::update_existing_hand_tracks_(
         // 按 map 顺序抢走本应唯一属于静态旧 C 的严格框。
         static_owner_by_detection =
             build_mutually_unique_hand_static_owner_by_detection_(
-                hand_box, detections, *claimed_detection_indices, *known_item_owner);
+                hand_boxes, detections, *claimed_detection_indices, *known_item_owner);
     }
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
@@ -981,13 +1529,21 @@ void SessionManager::update_existing_hand_tracks_(
         }
 
         const BBox expected = estimated_box(track);
+        const int associated_hand = unique_current_hand_id_for_box_(
+            expected, !track.is_suspect_new);
+        associate_track_with_hand_(&track, associated_hand, associated_hand == -2);
+        MoveValue delta;
+        // 对 HAND_* + hold_and_move=false，只有这个物品自己可靠关联的手移动
+        // 才能累积 hold/drop 证据；另一只手的运动不能代替它。
+        const bool hand_moved = current_hand_delta_for_track_(track, &delta) &&
+            move_length(delta) >= TRACK_HAND_MOVE_EPS;
         // 已有库存物品后续仍按 e2/e1 更新当前 HAND 状态；这里使用完整
         // 估计框，而不是 last_hand_block_box 这类局部 YOLO 框。若手已
         // 移开到 r < e2，则保留候选状态等待放下/收尾，不凭这一帧直接释放。
         if (!track.is_suspect_new) {
-            if (hand_fully_covers(hand_box, expected)) {
+            if (any_hand_fully_covers_box(hand_boxes, expected)) {
                 track.state = OperationTrackState::HAND_FULL_BLOCKED;
-            } else if (hand_affects(hand_box, expected)) {
+            } else if (any_hand_affects_box(hand_boxes, expected)) {
                 track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
             }
         }
@@ -1062,9 +1618,9 @@ void SessionManager::update_existing_hand_tracks_(
                     true, true);
             }
             if (observed_index < 0) {
-                observed_index = unique_hand_affected_detection_for_box(
+                observed_index = unique_hand_affected_detection_for_boxes(
                     detections, candidate_claimed, track.cls_id,
-                    local_expected, hand_box);
+                    local_expected, hand_boxes);
             }
         }
         if (observed_index < 0 && track.has_last_seen_box) {
@@ -1150,7 +1706,7 @@ void SessionManager::update_existing_hand_tracks_(
                 ++track.self_match_count;
                 track.last_seen_box = d.box;
                 track.has_last_seen_box = true;
-                if (hand_touches_detection(hand_box, d.box)) {
+                if (any_hand_touches_detection_box(hand_boxes, d.box)) {
                     track.last_hand_block_box = d.box;
                     track.has_last_hand_block_box = true;
                 }
@@ -1159,7 +1715,7 @@ void SessionManager::update_existing_hand_tracks_(
                     promote_keys.push_back(it->first);
                 }
                 if (track.promoted_to_working_inventory &&
-                    !hand_touches_detection(hand_box, d.box)) {
+                    !any_hand_touches_detection_box(hand_boxes, d.box)) {
                     track.placed_box = d.box;
                     track.has_placed_box = true;
                     track.drop_confirmed = true;
@@ -1209,8 +1765,8 @@ void SessionManager::update_existing_hand_tracks_(
                                       "hand-track-protected-original");
                 }
             } else if (observed_index >= 0) {
-                const bool touching = hand_touches_detection(
-                    hand_box, detections[observed_index].box);
+                const bool touching = any_hand_touches_detection_box(
+                    hand_boxes, detections[observed_index].box);
                 record_tentative_b(&track, detections[observed_index],
                                    touching);
                 if (hand_moved && old_clean &&
@@ -1248,7 +1804,7 @@ void SessionManager::update_existing_hand_tracks_(
                         previous = track.reappear_candidate_box;
                     }
                     candidate_ready = update_reappear_candidate(
-                        &track, d, hand_touches_detection(hand_box, d.box));
+                        &track, d, any_hand_touches_detection_box(hand_boxes, d.box));
                 }
                 if (!candidate_ready) {
                     // 首次 B 仅防止它被登记成 D；不能作为放下或整理的单帧证据。
@@ -1256,7 +1812,7 @@ void SessionManager::update_existing_hand_tracks_(
                 }
                 track.last_seen_box = d.box;
                 track.has_last_seen_box = true;
-                if (hand_touches_detection(hand_box, d.box)) {
+                if (any_hand_touches_detection_box(hand_boxes, d.box)) {
                     track.last_hand_block_box = d.box;
                     track.has_last_hand_block_box = true;
                 }
@@ -1265,7 +1821,8 @@ void SessionManager::update_existing_hand_tracks_(
                 const bool falls_behind = hand_distance >= TRACK_HAND_MOVE_EPS &&
                     object_distance <= hand_distance * FLOW3_DROP_FALL_BEHIND_RATIO &&
                     iom(previous, d.box) >= FLOW3_TRACK_PARTIAL_IOM;
-                const bool detaches_from_hand = !hand_touches_detection(hand_box, d.box);
+                const bool detaches_from_hand =
+                    !any_hand_touches_detection_box(hand_boxes, d.box);
                 const bool becomes_more_complete = becomes_more_like_complete_box(
                     track, previous, d.box);
                 if (falls_behind && (detaches_from_hand || becomes_more_complete)) {
@@ -1321,11 +1878,11 @@ void SessionManager::update_existing_hand_tracks_(
                 (*known_item_owner)[track.item_id] = observed_index;
             }
             const bool candidate_ready = update_reappear_candidate(
-                &track, d, hand_touches_detection(hand_box, d.box));
+                &track, d, any_hand_touches_detection_box(hand_boxes, d.box));
             if (candidate_ready) {
                 track.last_seen_box = d.box;
                 track.has_last_seen_box = true;
-                if (hand_touches_detection(hand_box, d.box)) {
+                if (any_hand_touches_detection_box(hand_boxes, d.box)) {
                     track.last_hand_block_box = d.box;
                     track.has_last_hand_block_box = true;
                 }
@@ -1364,7 +1921,7 @@ void SessionManager::update_existing_hand_tracks_(
             }
             track.last_seen_box = d.box;
             track.has_last_seen_box = true;
-            if (hand_touches_detection(hand_box, d.box)) {
+            if (any_hand_touches_detection_box(hand_boxes, d.box)) {
                 track.last_hand_block_box = d.box;
                 track.has_last_hand_block_box = true;
             }
@@ -1398,7 +1955,7 @@ void SessionManager::update_existing_hand_tracks_(
                         trace_track_("STATE", track,
                                      "confirmed-blocker-keeps-unresolved");
                     }
-                } else if (hand_affects(hand_box, track.original_box)) {
+                } else if (any_hand_affects_box(hand_boxes, track.original_box)) {
                     // 手仍盖在 C 原位置：既不能说明拿起，也不能说明没拿起。
                 } else if (!any_detection_at_old_position(detections, track)) {
                     if (hand_moved) {
@@ -1427,12 +1984,25 @@ void SessionManager::update_existing_hand_tracks_(
 }
 
 void SessionManager::reopen_released_static_tracks_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
-        const MoveValue& delta) {
+        const std::vector<BBox>& hand_boxes, const std::vector<Detection>& detections) {
     // 有手阶段已确认“目前仍在原位”的 C 不是一次操作的最终结论。若同一
     // 只手随后发生有效位移，并且本帧没有 C 自己的唯一原位检测，就把它
-    // 恢复为 HAND_*，从最后一个可靠原位框重新开始记录手部路径。
-    if (move_length(delta) < TRACK_HAND_MOVE_EPS) return;
+    // 恢复为 HAND_*，从最后一个可靠原位框重新开始记录手部路径。多手时只
+    // 有“唯一可靠的当前手位移”才可完成这一步，不能拿任意一只手代替。
+    int only_moving_hand_id = -1;
+    bool multiple_moving_hands = false;
+    for (std::set<int>::const_iterator hand = current_reliable_hand_delta_ids_.begin();
+         hand != current_reliable_hand_delta_ids_.end(); ++hand) {
+        MoveValue moving_delta;
+        if (!current_hand_delta_for_id_(*hand, &moving_delta) ||
+            move_length(moving_delta) < TRACK_HAND_MOVE_EPS) {
+            continue;
+        }
+        if (only_moving_hand_id >= 0 && only_moving_hand_id != *hand) {
+            multiple_moving_hands = true;
+        }
+        only_moving_hand_id = *hand;
+    }
 
     const std::set<int> no_claimed_detections;
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
@@ -1459,8 +2029,24 @@ void SessionManager::reopen_released_static_tracks_(
             continue;
         }
 
+        int associated_hand = unique_current_hand_id_for_box_(anchor, false);
+        if (associated_hand == -2) {
+            associate_track_with_hand_(&track, -1, true);
+            continue;
+        }
+        if (associated_hand < 0 && !multiple_moving_hands) {
+            associated_hand = only_moving_hand_id;
+        }
+        MoveValue delta;
+        if (associated_hand < 0 ||
+            !current_hand_delta_for_id_(associated_hand, &delta) ||
+            move_length(delta) < TRACK_HAND_MOVE_EPS) {
+            continue;
+        }
+        associate_track_with_hand_(&track, associated_hand, false);
+
         released_hand_candidate_ids_.erase(track.item_id);
-        track.state = hand_fully_covers(hand_box, move_box(anchor, delta))
+        track.state = any_hand_fully_covers_box(hand_boxes, move_box(anchor, delta))
             ? OperationTrackState::HAND_FULL_BLOCKED
             : OperationTrackState::HAND_PARTIAL_BLOCKED;
         track.contact_state = ContactState::NONE;
@@ -1501,8 +2087,6 @@ void SessionManager::reopen_released_static_tracks_(
         track.track.push_back(anchor);
         track.move_values.push_back(delta);
         track.track.push_back(estimated_box(track));
-        track.hand_track_start_index = std::max(
-            0, static_cast<int>(hand_track_.size()) - 2);
         trace_("STATE",
                "item=%d reopen-after-static-release-lost-original anchor=(%.1f,%.1f,%.1f,%.1f) "
                "delta=(%.1f,%.1f) expected=(%.1f,%.1f,%.1f,%.1f)",
@@ -1514,7 +2098,7 @@ void SessionManager::reopen_released_static_tracks_(
 }
 
 void SessionManager::scan_or_update_suspects_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
+        const std::vector<BBox>& hand_boxes, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         const std::map<int, int>& known_item_owner,
         const HandDirectOldOwnerPlan& direct_old_owner_plan,
@@ -1540,7 +2124,7 @@ void SessionManager::scan_or_update_suspects_(
             continue;
         }
         const Detection& d = detections[di];
-        const bool hand_visible_d = hand_touches_detection(hand_box, d.box);
+        const bool hand_visible_d = any_hand_touches_detection_box(hand_boxes, d.box);
         // D 已经被放到 C 原位置时，手可能继续移开，因此 D 不一定还贴手。
         // 只要它是唯一一个覆盖“当前看不见的 C”原位置的未认领框，也必须
         // 预登记；否则 C 会在后续无手阶段被错误当成 OUT。
@@ -1760,9 +2344,12 @@ void SessionManager::scan_or_update_suspects_(
             track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
             track.shelter_or_hold = true;
             track.self_match_count = 1;
-            track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
             track.track.push_back(d.box);
             track_buffer_[key] = track;
+            const int associated_hand = hand_visible_d
+                ? unique_current_hand_id_for_box_(d.box, false) : -1;
+            associate_track_with_hand_(&track_buffer_[key], associated_hand,
+                                       associated_hand == -2);
             link_suspect_to_conflicting_old_items_(key, alias_old_item_ids,
                                                     "HAND", detection_index);
             claimed_detection_indices->insert(static_cast<int>(di));
@@ -1831,9 +2418,12 @@ void SessionManager::scan_or_update_suspects_(
         track.state = OperationTrackState::HAND_PARTIAL_BLOCKED;
         track.shelter_or_hold = true;
         track.self_match_count = 1;
-        track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
         track.track.push_back(d.box);
         track_buffer_[key] = track;
+        const int associated_hand = hand_visible_d
+            ? unique_current_hand_id_for_box_(d.box, false) : -1;
+        associate_track_with_hand_(&track_buffer_[key], associated_hand,
+                                   associated_hand == -2);
         claimed_detection_indices->insert(static_cast<int>(di));
         printf("[3.0] 预登记疑似新物品 D suspect#%d cls=%d source=%s\n",
                key, d.cls_id, suspect_source_name(track.suspect_source));
@@ -1842,7 +2432,7 @@ void SessionManager::scan_or_update_suspects_(
 }
 
 void SessionManager::mark_newly_hand_blocked_items_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
+        const std::vector<BBox>& hand_boxes, const std::vector<Detection>& detections,
         std::set<int>* claimed_detection_indices,
         std::map<int, int>* known_item_owner,
         std::set<int>* new_existing_track_ids) {
@@ -1850,7 +2440,8 @@ void SessionManager::mark_newly_hand_blocked_items_(
     for (std::set<int>::iterator it = released_hand_candidate_ids_.begin();
          it != released_hand_candidate_ids_.end();) {
         std::map<int, InventoryItem>::const_iterator item = working_inventory_.find(*it);
-        if (item == working_inventory_.end() || !hand_affects(hand_box, item->second.box)) {
+        if (item == working_inventory_.end() ||
+            !any_hand_affects_box(hand_boxes, item->second.box)) {
             it = released_hand_candidate_ids_.erase(it);
         } else {
             ++it;
@@ -1873,23 +2464,23 @@ void SessionManager::mark_newly_hand_blocked_items_(
         if (known_item_owner->count(item.item_id)) continue;
 
         const BBox reference = item.base_box.area() > 0.0f ? item.base_box : item.box;
-        const bool full = hand_fully_covers(hand_box, reference);
-        const bool partial = !full && hand_affects(hand_box, reference);
+        const bool full = any_hand_fully_covers_box(hand_boxes, reference);
+        const bool partial = !full && any_hand_affects_box(hand_boxes, reference);
         // e2 <= r < e1 即使当前没有 A 的 YOLO 框，也必须进入
         // HAND_PARTIAL；是否有局部框只决定能否更新 last_hand_block_box。
         if (!partial && !full) continue;
 
-        int observed_index = unique_hand_affected_detection_for_box(
-            detections, *claimed_detection_indices, item.cls_id, reference, hand_box);
+        int observed_index = unique_hand_affected_detection_for_boxes(
+            detections, *claimed_detection_indices, item.cls_id, reference, hand_boxes);
         if (observed_index < 0) {
-            observed_index = best_hand_affected_detection_for_box(
-                detections, *claimed_detection_indices, item.cls_id, reference, hand_box);
+            observed_index = best_hand_affected_detection_for_boxes(
+                detections, *claimed_detection_indices, item.cls_id, reference, hand_boxes);
         }
         // 同一局部框若同时合理地属于两个同类旧库存，不能按 map 顺序硬认领。
         // 保持它未决；后续 scan 也会看到它“可能属于旧库存”，因此不会误建 D。
         if (observed_index >= 0 &&
-            hand_affected_existing_candidate_count(working_inventory_,
-                                                    detections[observed_index], hand_box) != 1) {
+            hand_affected_existing_candidate_count_for_boxes(
+                working_inventory_, detections[observed_index], hand_boxes) != 1) {
             observed_index = -1;
         }
 
@@ -1900,7 +2491,6 @@ void SessionManager::mark_newly_hand_blocked_items_(
         track.needs_no_hand_settlement = true;
         track.shelter_or_hold = true;
         track.claim_grace_remaining = FLOW3_NEW_TRACK_CLAIM_GRACE_FRAMES;
-        track.hand_track_start_index = static_cast<int>(hand_track_.size()) - 1;
         track.track.push_back(track.original_box);
         track.state = full ? OperationTrackState::HAND_FULL_BLOCKED
                            : OperationTrackState::HAND_PARTIAL_BLOCKED;
@@ -1922,7 +2512,8 @@ void SessionManager::mark_newly_hand_blocked_items_(
             } else {
                 // 首帧已跑离旧位置的同类框只能记作本地 B；两帧保护期内
                 // 不得以它阻止成熟 C 或真正 D 的仲裁。
-                record_tentative_b(&track, d, hand_touches_detection(hand_box, d.box));
+                record_tentative_b(&track, d,
+                                   any_hand_touches_detection_box(hand_boxes, d.box));
                 track.reappearance_pending = true;
             }
         }
@@ -1956,6 +2547,9 @@ void SessionManager::mark_newly_hand_blocked_items_(
                    item.item_id, suspect->first);
         }
         track_buffer_[item.item_id] = track;
+        const int associated_hand = unique_current_hand_id_for_box_(reference, true);
+        associate_track_with_hand_(&track_buffer_[item.item_id], associated_hand,
+                                   associated_hand == -2);
         if (new_existing_track_ids) new_existing_track_ids->insert(item.item_id);
         trace_track_("STATE", track_buffer_[item.item_id],
                      "create-hand-blocked-existing-item");
@@ -1963,8 +2557,8 @@ void SessionManager::mark_newly_hand_blocked_items_(
 }
 
 void SessionManager::apply_suspect_cover_evidence_(
-        const BBox& hand_box, const std::vector<Detection>& /*detections*/,
-        bool hand_moved) {
+        const std::vector<BBox>& hand_boxes,
+        const std::vector<Detection>& /*detections*/, bool /*any_hand_moved*/) {
     for (std::map<int, OperationTrack>::const_iterator dit = track_buffer_.begin();
          dit != track_buffer_.end(); ++dit) {
         const OperationTrack& d = dit->second;
@@ -1976,6 +2570,9 @@ void SessionManager::apply_suspect_cover_evidence_(
         // 不能再把 last_hand_block_box 当成 D 唯一可用的遮挡位置。
         const BBox d_box = d.has_placed_box ? d.placed_box :
             (d.has_last_seen_box ? d.last_seen_box : d.last_hand_block_box);
+        MoveValue d_delta;
+        const bool d_hand_moved = current_hand_delta_for_track_(d, &d_delta) &&
+            move_length(d_delta) >= TRACK_HAND_MOVE_EPS;
         for (std::map<int, OperationTrack>::iterator cit = track_buffer_.begin();
              cit != track_buffer_.end(); ++cit) {
             OperationTrack& c = cit->second;
@@ -1983,8 +2580,7 @@ void SessionManager::apply_suspect_cover_evidence_(
                 c.state == OperationTrackState::PLACED || c.original_box.area() <= 0.0f) {
                 continue;
             }
-            std::vector<BBox> covers;
-            covers.push_back(hand_box);
+            std::vector<BBox> covers(hand_boxes);
             covers.push_back(d_box);
             const bool union_covers_c = fully_covered_by(c.original_box, covers);
             const bool d_covers_c = fully_covered_by(c.original_box,
@@ -1992,12 +2588,14 @@ void SessionManager::apply_suspect_cover_evidence_(
             if (!union_covers_c) continue;
             // D + 手的并集只能在手实际移动的有效帧中构成 C 的反向证据。
             // 静止手帧仍属于 HAND_* 的模糊帧，不能改变 hold/not_hold 或释放 C。
-            if (!hand_moved) continue;
+            if (!d_hand_moved) continue;
             // 尚未连续确认并放下的 D 只是“可能挡住 C”的解释，不能改变 C
             // 的 hold/not-hold 计数；否则一次误检又会把 C 提前释放。
             if (!d.promoted_to_working_inventory || !d.drop_confirmed) continue;
+            BBox evidence_hand;
+            if (!current_hand_box_for_track_(d, &evidence_hand)) continue;
             record_pending_front_evidence_(
-                c.item_id, dit->first, d.item_id, hand_box, d_box, d_covers_c);
+                c.item_id, dit->first, d.item_id, evidence_hand, d_box, d_covers_c);
             c.hold_evidence_count = 0;
             ++c.not_hold_evidence_count;
         }
@@ -2005,17 +2603,14 @@ void SessionManager::apply_suspect_cover_evidence_(
 }
 
 void SessionManager::process_effective_hand_frame_(
-        const BBox& hand_box, const std::vector<Detection>& detections,
+        const std::vector<BBox>& hand_boxes, const std::vector<Detection>& detections,
         bool first_hand_frame) {
-    MoveValue delta;
     if (!first_hand_frame) {
-        delta.dx = hand_box.cx() - old_hand_box_.cx();
-        delta.dy = hand_box.cy() - old_hand_box_.cy();
-        hand_track_.push_back(hand_box);
-        append_move_to_existing_hand_tracks_(delta);
+        // update_hand_tracks_ 已先完成全局一对一匹配。这里只会把每条
+        // OperationTrack 已关联 hand_id 的可靠 delta 加进自己的路径。
+        append_move_to_existing_hand_tracks_();
     }
-    const bool hand_moved = !first_hand_frame &&
-        move_length(delta) >= TRACK_HAND_MOVE_EPS;
+    const bool any_hand_moved = !first_hand_frame && any_current_hand_moved_();
 
     // 先更新已有 HAND_*；随后先为仍稳定可见的旧库存保留本帧自己的
     // 严格框，再处理新进入 HAND_* 的物品。这个先后顺序很关键：若旧
@@ -2061,24 +2656,24 @@ void SessionManager::process_effective_hand_frame_(
         }
         // 低覆盖率 CONTACT_* 先用物品真实检测框更新；这里不能使用手位移
         // 推算的 estimated_box。
-        update_existing_contact_tracks_(hand_box, detections, &claimed,
+        update_existing_contact_tracks_(hand_boxes, detections, &claimed,
                                         &known_item_owner, direct_old_owner_plan);
-        update_existing_hand_tracks_(hand_box, detections, delta, &claimed,
+        update_existing_hand_tracks_(hand_boxes, detections, &claimed,
                                      &known_item_owner, direct_old_owner_plan);
         // 原位暂时确认后的 C 若在本帧再次随手离开原位置，必须先恢复
         // HAND_* 身份链，再让静态预约或 D 扫描处理剩余检测框。
-        reopen_released_static_tracks_(hand_box, detections, delta);
+        reopen_released_static_tracks_(hand_boxes, detections);
     }
-    reserve_visible_known_detections_(hand_box, detections, &claimed,
+    reserve_visible_known_detections_(hand_boxes, detections, &claimed,
                                       &known_item_owner);
-    mark_new_contact_candidates_(hand_box, detections, &claimed,
+    mark_new_contact_candidates_(hand_boxes, detections, &claimed,
                                  &known_item_owner, &new_existing_track_ids);
-    mark_newly_hand_blocked_items_(hand_box, detections, &claimed,
+    mark_newly_hand_blocked_items_(hand_boxes, detections, &claimed,
                                    &known_item_owner, &new_existing_track_ids);
-    scan_or_update_suspects_(hand_box, detections, &claimed, known_item_owner,
+    scan_or_update_suspects_(hand_boxes, detections, &claimed, known_item_owner,
                              direct_old_owner_plan,
                              first_hand_frame);
-    apply_suspect_cover_evidence_(hand_box, detections, hand_moved);
+    apply_suspect_cover_evidence_(hand_boxes, detections, any_hand_moved);
     advance_claim_grace_(new_existing_track_ids);
     // 有手阶段每张有效帧都必须维护实时观察层。这里不改变库存或事件，
     // 只把 C/D/alias 当前的可撤销结论写入运行时记录和调试日志。
