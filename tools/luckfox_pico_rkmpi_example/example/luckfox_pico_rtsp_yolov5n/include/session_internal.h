@@ -106,6 +106,9 @@ struct BlockerTransitionPlan {
     bool target_has_independent_exit_evidence = false;
     bool target_has_confirmed_independent_exit = false;
     bool target_has_unconfirmed_hand_move_evidence = false;
+    // 当前事务内已建立且本帧重新验证通过的 CAUSAL_FRONT_MISSING。
+    // 它只允许忽略 weak reservation，不能掩盖真实 identity conflict。
+    bool provisional_causal_proof_active = false;
     bool causal_front_missing_candidate = false;
     bool disappearance_candidate = false;
     int matching_missing_frames = 0;

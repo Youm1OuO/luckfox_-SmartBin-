@@ -54,6 +54,8 @@ void test_identity_ambiguity_does_not_block_confirmed_full_occlusion();
 void test_confirmed_target_exit_blocks_causal_front_missing();
 void test_confirmed_moved_orange_occludes_reserved_same_class_apple();
 void test_visible_count_survivors_preserve_causal_missing_apple();
+void test_provisional_causal_occlusion_survives_delayed_no_hand_settlement();
+void test_provisional_causal_occlusion_clears_on_target_direct_observation();
 void test_causal_front_missing_accepts_substantial_partial_cover();
 void test_moved_target_drops_stale_historical_blocker();
 void test_inventory_rejects_invalid_formal_occlusion_proof();

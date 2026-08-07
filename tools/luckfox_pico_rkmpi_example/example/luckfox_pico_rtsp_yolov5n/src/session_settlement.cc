@@ -53,6 +53,9 @@ const char* occlusion_plan_reason(const BlockerTransitionPlan& plan) {
         }
         return "confirmed-front-covered-hidden-target";
     }
+    if (plan.provisional_causal_proof_active) {
+        return "causal-proof-validated";
+    }
     if (plan.allow_revealed_transition) {
         return "confirmed-blocker-moved-away";
     }
@@ -766,10 +769,17 @@ void SessionManager::refresh_confirmed_blockers_(
 
         const OperationTrack* target_runtime = find_runtime_for_item_(target_id);
         const bool target_observed = observed_working_ids.count(target_id) > 0;
-        const bool target_observation_conflict = target_runtime &&
+        const bool target_has_weak_reservation = target_runtime &&
+            target_runtime->no_hand_candidate_reserved_by_stronger_owner;
+        const bool target_has_lifecycle_identity_conflict = target_runtime &&
             (target_runtime->no_hand_candidate_ambiguous ||
-             target_runtime->no_hand_candidate_reserved_by_stronger_owner ||
              old_track_has_unresolved_alias_(*target_runtime));
+        const bool target_has_strong_proof_conflict =
+            target_has_lifecycle_identity_conflict ||
+            (target_runtime && (target_runtime->b_claim_ambiguous ||
+                                target_runtime->contact_path_ambiguous));
+        const bool target_observation_conflict = target_runtime &&
+            (target_has_lifecycle_identity_conflict || target_has_weak_reservation);
         // 细节9的狭义例外：连续无手画面中，同类旧 C 数量大于可靠框数量
         // 时，这个一框一物品计划不是普通身份仲裁。它已经为一个可观察实例
         // 保留框、为其余实例建立连续缺额链，因此不应再被同一份共享 B 的
@@ -779,7 +789,7 @@ void SessionManager::refresh_confirmed_blockers_(
             visible_count_survivor_ids_.count(target_id) > 0 ||
             visible_count_out_candidate_ids_.count(target_id) > 0 ||
             visible_count_identity_relaxed_ids_.count(target_id) > 0;
-        const bool lifecycle_observation_conflict = target_observation_conflict &&
+        bool lifecycle_observation_conflict = target_observation_conflict &&
             !visible_count_final_observability;
         plan.valid_target_observed = target_observed && !lifecycle_observation_conflict;
         // 本帧存在无法唯一归属给 C 的候选框，本身就是身份歧义；它不能因
@@ -837,6 +847,109 @@ void SessionManager::refresh_confirmed_blockers_(
             plan.target_has_unconfirmed_hand_move_evidence = hand_exit;
             plan.target_has_independent_exit_evidence =
                 plan.target_has_independent_exit_evidence || contact_exit || hand_exit;
+        }
+
+        // A causal front-missing conclusion may be correct before the whole
+        // transaction can commit.  Keep it in a transaction-local record and
+        // revalidate it here instead of deriving a new conclusion from a weak
+        // same-class reservation on every later no-hand frame.
+        bool provisional_causal_proof_valid = false;
+        OcclusionProof active_provisional_causal_proof;
+        std::map<int, ProvisionalCausalOcclusion>::iterator provisional =
+            provisional_causal_occlusions_.find(target_id);
+        if (provisional != provisional_causal_occlusions_.end()) {
+            ProvisionalCausalOcclusion& record = provisional->second;
+            const bool target_has_confirmed_exit_now =
+                confirmed_moved_ids_.count(target_id) > 0 ||
+                pending_out_ids_.count(target_id) > 0 ||
+                (target_runtime && !target_runtime->is_suspect_new &&
+                 (target_runtime->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+                  target_runtime->resolution == ExistingItemResolution::OUT_CONFIRMED));
+            const char* invalid_reason = 0;
+            if (record.target_item_id != target_id ||
+                record.proof.kind != OcclusionProofKind::CAUSAL_FRONT_MISSING ||
+                record.proof.witness_blocker_ids.empty() ||
+                record.target_operation_start_box.area() <= 0.0f ||
+                record.last_witness_boxes.empty() ||
+                record.required_coverage_ratio <= 0.0f) {
+                invalid_reason = "malformed-record";
+            } else if (target_observed) {
+                invalid_reason = "target-direct-observed";
+            } else if (target_has_strong_proof_conflict) {
+                invalid_reason = "strong-observation-conflict";
+            } else if (target_has_confirmed_exit_now) {
+                invalid_reason = "target-confirmed-independent-exit";
+            }
+
+            std::map<int, BBox> current_witness_boxes;
+            std::vector<BBox> current_witness_cover_boxes;
+            if (!invalid_reason) {
+                for (std::set<int>::const_iterator witness =
+                         record.proof.witness_blocker_ids.begin();
+                     witness != record.proof.witness_blocker_ids.end(); ++witness) {
+                    const std::map<int, BBox>::const_iterator current_box =
+                        effective_geometry_boxes.find(*witness);
+                    if (!confirmed_front_ids.count(*witness) ||
+                        !effective_block_ids.count(*witness) ||
+                        current_box == effective_geometry_boxes.end() ||
+                        (!confirmed_moved_ids_.count(*witness) &&
+                         !pending_in_ids_.count(*witness))) {
+                        invalid_reason = "front-witness-missing-or-not-confirmed";
+                        break;
+                    }
+                    current_witness_boxes[*witness] = current_box->second;
+                    current_witness_cover_boxes.push_back(current_box->second);
+                }
+            }
+            CoverageEvaluation provisional_coverage;
+            if (!invalid_reason) {
+                provisional_coverage = evaluate_full_coverage(
+                    record.target_operation_start_box, current_witness_cover_boxes,
+                    current_witness_cover_boxes, false);
+                if (provisional_coverage.covered_ratio <
+                    record.required_coverage_ratio) {
+                    invalid_reason = "front-coverage-lost";
+                } else if (!front_witness_boxes_are_continuous(
+                               *final_items, record.last_witness_boxes,
+                               current_witness_boxes)) {
+                    invalid_reason = "front-box-discontinuous";
+                }
+            }
+
+            if (invalid_reason) {
+                trace_("OCCLUSION",
+                       "target=%d action=causal-proof-invalidated reason=%s",
+                       target_id, invalid_reason);
+                provisional_causal_occlusions_.erase(provisional);
+            } else {
+                provisional_causal_proof_valid = true;
+                active_provisional_causal_proof = record.proof;
+                if (record.last_validated_frame != trace_frame_id_) {
+                    record.last_witness_boxes.swap(current_witness_boxes);
+                    record.last_validated_frame = trace_frame_id_;
+                    trace_("OCCLUSION",
+                           "target=%d action=causal-proof-validated witnesses=%s "
+                           "ratio=%.3f required=%.3f",
+                           target_id,
+                           blocker_id_list(record.proof.witness_blocker_ids).c_str(),
+                           provisional_coverage.covered_ratio,
+                           record.required_coverage_ratio);
+                    if (target_has_weak_reservation) {
+                        trace_("OCCLUSION",
+                               "target=%d action=causal-proof-weak-reservation-ignored",
+                               target_id);
+                    }
+                }
+            }
+        }
+
+        if (provisional_causal_proof_valid) {
+            // A stronger neighbor owns its own direct box.  That reservation
+            // is not a direct observation of this hidden target and must not
+            // turn an otherwise valid causal proof into a pending OUT loop.
+            lifecycle_observation_conflict = false;
+            plan.valid_target_observed = target_observed;
+            plan.observation_conflict = false;
         }
 
         // Keep the established two-frame disappearance proof when it is
@@ -946,8 +1059,66 @@ void SessionManager::refresh_confirmed_blockers_(
         decision_input.prior_disappearance_missing_frames = prior_disappearance_count;
         decision_input.after_witness_blocker_ids = effective_with_geometry;
         decision_input.causal_witness_blocker_ids = causal_event_witnesses;
-        const OcclusionDecisionResult decision =
+        OcclusionDecisionResult decision =
             decide_occlusion_lifecycle(decision_input);
+
+        if (!provisional_causal_proof_valid &&
+            decision.allow_occluded_transition &&
+            decision.proposed_proof.kind ==
+                OcclusionProofKind::CAUSAL_FRONT_MISSING) {
+            ProvisionalCausalOcclusion record;
+            record.target_item_id = target_id;
+            record.proof = decision.proposed_proof;
+            record.target_operation_start_box = relationship_target_box;
+            record.required_coverage_ratio = allow_causal_partial_overlap
+                ? FLOW3_CAUSAL_OCCLUSION_MIN_COVER_RATIO
+                : FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO;
+            record.witness_confirmed_frame = trace_frame_id_;
+            record.last_validated_frame = trace_frame_id_;
+            bool complete_witness_record = true;
+            for (std::set<int>::const_iterator witness =
+                     record.proof.witness_blocker_ids.begin();
+                 witness != record.proof.witness_blocker_ids.end(); ++witness) {
+                const std::map<int, BBox>::const_iterator witness_box =
+                    effective_geometry_boxes.find(*witness);
+                if (witness_box == effective_geometry_boxes.end()) {
+                    complete_witness_record = false;
+                    break;
+                }
+                record.last_witness_boxes[*witness] = witness_box->second;
+            }
+            if (complete_witness_record && !record.last_witness_boxes.empty()) {
+                provisional_causal_occlusions_[target_id] = record;
+                provisional_causal_proof_valid = true;
+                active_provisional_causal_proof = record.proof;
+                trace_("OCCLUSION",
+                       "target=%d action=causal-proof-established witnesses=%s "
+                       "ratio=%.3f required=%.3f",
+                       target_id,
+                       blocker_id_list(record.proof.witness_blocker_ids).c_str(),
+                       plan.coverage_after.covered_ratio,
+                       record.required_coverage_ratio);
+            } else {
+                trace_("OCCLUSION",
+                       "target=%d action=causal-proof-not-stored "
+                       "reason=missing-current-witness-box",
+                       target_id);
+            }
+        }
+
+        if (provisional_causal_proof_valid) {
+            // operation_start_inventory_ remains VISIBLE until the whole
+            // transaction commits.  Project the validated runtime proof back
+            // into this frame's lifecycle plan so it cannot regress to OUT.
+            decision.visibility = VisibilityDecision::ENTER_OCCLUDED;
+            decision.out = OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION;
+            decision.proposed_proof = active_provisional_causal_proof;
+            decision.disappearance_candidate = false;
+            decision.causal_front_missing_candidate = true;
+            decision.matching_missing_frames = 0;
+            decision.allow_occluded_transition = true;
+            decision.allow_revealed_transition = false;
+        }
 
         plan.visibility = decision.visibility;
         plan.out = decision.out;
@@ -955,6 +1126,7 @@ void SessionManager::refresh_confirmed_blockers_(
         plan.allow_occluded_transition = decision.allow_occluded_transition;
         plan.allow_revealed_transition = decision.allow_revealed_transition;
         plan.disappearance_candidate = decision.disappearance_candidate;
+        plan.provisional_causal_proof_active = provisional_causal_proof_valid;
         plan.causal_front_missing_candidate =
             decision.causal_front_missing_candidate;
         plan.matching_missing_frames = decision.matching_missing_frames;

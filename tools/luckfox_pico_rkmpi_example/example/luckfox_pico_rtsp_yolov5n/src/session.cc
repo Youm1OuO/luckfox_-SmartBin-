@@ -199,6 +199,7 @@ void SessionManager::reset_operation_runtime_() {
     confirmed_moved_ids_.clear();
     released_hand_candidate_ids_.clear();
     pending_front_evidence_by_target_.clear();
+    provisional_causal_occlusions_.clear();
     cross_class_duplicate_identity_exclusions_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
@@ -454,6 +455,14 @@ FrameProcessResult SessionManager::process_frame(
             pending_occlusion_missing_counts_.clear();
             pending_occlusion_witness_ids_.clear();
             pending_occlusion_witness_boxes_.clear();
+        }
+        // 因果遮挡 proof 只连接连续的无手验证帧。手重新进入后，前景/目标
+        // 可能已被再次操作；下一张无手帧必须按当前证据重新建立它。
+        if (!provisional_causal_occlusions_.empty()) {
+            trace_("OCCLUSION",
+                   "action=clear-provisional-causal-proofs reason=hand-returned targets=%zu",
+                   provisional_causal_occlusions_.size());
+            provisional_causal_occlusions_.clear();
         }
         finalize_initial_check_before_hand_();
         no_hand_streak_ = 0;

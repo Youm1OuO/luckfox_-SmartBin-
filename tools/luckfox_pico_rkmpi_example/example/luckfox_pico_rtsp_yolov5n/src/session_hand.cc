@@ -58,6 +58,7 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     confirmed_moved_ids_.clear();
     released_hand_candidate_ids_.clear();
     pending_front_evidence_by_target_.clear();
+    provisional_causal_occlusions_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
     visible_count_out_candidate_ids_.clear();

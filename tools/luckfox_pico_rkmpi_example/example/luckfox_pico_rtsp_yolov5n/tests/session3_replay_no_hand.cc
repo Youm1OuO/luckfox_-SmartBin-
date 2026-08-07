@@ -280,6 +280,145 @@ void test_visible_count_survivors_preserve_causal_missing_apple() {
     assert(hidden->occlusion_proof.witness_blocker_ids.count(9));
 }
 
+// 第一张无手帧已经建立 CAUSAL_FRONT_MISSING，但另一个独立的 post-hand D
+// 还需要第二张直接无手帧才能结案。期间 #1 不能因为 #3/#5 的强原位 owner
+// 暂时预约了宽松候选框，就从已确认遮挡退回 HOLD/OUT 并无限 defer-commit。
+static std::vector<fridge::Detection> prepare_delayed_causal_occlusion_session(
+        fridge::SessionManager* session, int* frame) {
+    assert(session != 0 && frame != 0);
+    session->start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 300, 100, 400, 200));  // hidden apple
+    initial.push_back(item(3, 0, 700, 100, 800, 200));  // direct apple owner
+    initial.push_back(item(5, 0, 700, 300, 800, 400));  // direct apple owner
+    initial.push_back(item(7, 2, 100, 300, 200, 400));  // static orange
+    initial.push_back(item(9, 2, 100, 100, 200, 200));  // moved front orange
+    session->init_from_backend(initial, true);
+
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 300, 100, 400, 200));
+    stable.push_back(det(0, 700, 100, 800, 200));
+    stable.push_back(det(0, 700, 300, 800, 400));
+    stable.push_back(det(2, 100, 300, 200, 400));
+    stable.push_back(det(2, 100, 100, 200, 200));
+    initial_no_hand_frame(session, stable, frame);
+
+    std::vector<fridge::Detection> hand_start;
+    hand_start.push_back(det(0, 700, 100, 800, 200));
+    hand_start.push_back(det(0, 700, 300, 800, 400));
+    hand_start.push_back(det(2, 100, 300, 200, 400));
+    hand_start.push_back(det(2, 100, 100, 200, 200));
+    send_frame(session, hand_start,
+               std::vector<fridge::BBox>(1, fridge::BBox(70, 70, 430, 230)),
+               frame);
+
+    std::vector<fridge::Detection> hand_middle = hand_start;
+    hand_middle[3] = det(2, 170, 100, 270, 200);
+    send_frame(session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(140, 70, 500, 230)),
+               frame);
+    hand_middle[3] = det(2, 240, 105, 340, 205);
+    send_frame(session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(210, 70, 570, 230)),
+               frame);
+    hand_middle[3] = det(2, 300, 111, 400, 211);
+    send_frame(session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(270, 70, 430, 240)),
+               frame);
+
+    std::vector<fridge::Detection> delayed_no_hand;
+    delayed_no_hand.push_back(det(0, 700, 100, 800, 200));
+    delayed_no_hand.push_back(det(0, 700, 300, 800, 400));
+    delayed_no_hand.push_back(det(2, 100, 300, 200, 400));
+    delayed_no_hand.push_back(det(2, 300, 111, 400, 211));
+    // 无关 D 的第一张无手直接框必须先等待下一帧，故意让 #1 的遮挡
+    // proof 跨过一次 deferred settlement。
+    delayed_no_hand.push_back(det(25, 420, 100, 520, 200));
+    return delayed_no_hand;
+}
+
+void test_provisional_causal_occlusion_survives_delayed_no_hand_settlement() {
+    fridge::SessionManager session;
+    int frame = 1;
+    const std::vector<fridge::Detection> delayed_no_hand =
+        prepare_delayed_causal_occlusion_session(&session, &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        delayed_no_hand, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+    assert(!has_event(first.settlement, fridge::EventKind::OUT, 1));
+
+    const int second_no_hand = frame++;
+    fridge::FrameProcessResult second = session.process_frame(
+        delayed_no_hand, std::vector<fridge::BBox>(), second_no_hand, second_no_hand);
+    assert(second.no_hand_frame_processed);
+    assert(second.settlement.committed);
+    assert(session.inventory().size() == 6);
+    assert(has_event(second.settlement, fridge::EventKind::MOVED, 9));
+    assert(has_event(second.settlement, fridge::EventKind::OCCLUDED, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(second.settlement, fridge::EventKind::MOVED, 7));
+    assert(!has_event(second.settlement, fridge::EventKind::OUT, 7));
+    assert_event_before(second.settlement, fridge::EventKind::MOVED, 9,
+                        fridge::EventKind::OCCLUDED, 1);
+    const fridge::InventoryItem* hidden = session.inventory().find_by_item(1);
+    assert(hidden != 0);
+    assert(hidden->status == fridge::ItemStatus::OCCLUDED);
+    assert(hidden->block_ids.size() == 1);
+    assert(hidden->block_ids.count(9));
+    assert(hidden->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::CAUSAL_FRONT_MISSING);
+    assert(hidden->occlusion_proof.witness_blocker_ids.size() == 1);
+    assert(hidden->occlusion_proof.witness_blocker_ids.count(9));
+}
+
+// 临时 causal proof 不是永久忽略目标。若下一张无手帧已重新得到 #1 的
+// 合法直接框，proof 必须撤销；最终应保留 VISIBLE，而不是强行提交遮挡。
+void test_provisional_causal_occlusion_clears_on_target_direct_observation() {
+    fridge::SessionManager session;
+    int frame = 1;
+    const std::vector<fridge::Detection> delayed_no_hand =
+        prepare_delayed_causal_occlusion_session(&session, &frame);
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        delayed_no_hand, std::vector<fridge::BBox>(), first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+
+    std::vector<fridge::Detection> revealed_no_hand;
+    revealed_no_hand.push_back(det(0, 300, 100, 400, 200));  // target #1 directly seen
+    revealed_no_hand.insert(revealed_no_hand.end(), delayed_no_hand.begin(),
+                            delayed_no_hand.end());
+
+    fridge::SettlementResult result;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int no_hand_frame = frame++;
+        fridge::FrameProcessResult next = session.process_frame(
+            revealed_no_hand, std::vector<fridge::BBox>(),
+            no_hand_frame, no_hand_frame);
+        assert(next.no_hand_frame_processed);
+        result = next.settlement;
+        if (result.committed) break;
+    }
+
+    assert(result.committed);
+    assert(session.inventory().size() == 6);
+    assert(has_event(result, fridge::EventKind::MOVED, 9));
+    assert(!has_event(result, fridge::EventKind::OCCLUDED, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    const fridge::InventoryItem* target = session.inventory().find_by_item(1);
+    assert(target != 0);
+    assert(target->status == fridge::ItemStatus::VISIBLE);
+    // 直接观察会撤销完整遮挡 proof；前景关系本身仍可保留为 VISIBLE + block_ids。
+    assert(target->block_ids.count(9));
+    assert(target->occlusion_proof.kind == fridge::OcclusionProofKind::NONE);
+}
+
 // 因果遮挡不是严格矩形全覆盖，但也不能退化成“任意一点交集”。这里前景
 // 只覆盖目标旧框的一半，目标在有手阶段有 HAND/POSSIBLE_MOVED 线索却没有
 // 自己的唯一终点；前景完成既有自匹配确认后，应采用 causal proof 而不是 OUT。

@@ -251,6 +251,21 @@ struct PendingFrontEvidence {
     int frame_id = -1;
 };
 
+// 只在当前手操作尚未提交时保存的因果遮挡证明。它不是正式库存状态，也
+// 不替代 OperationTrack::resolution：用途是在别的轨迹仍需无手结算时，
+// 让已经成立的 CAUSAL_FRONT_MISSING 能逐帧续验，而不是被弱候选预约重置。
+struct ProvisionalCausalOcclusion {
+    int target_item_id = -1;
+    OcclusionProof proof;
+    BBox target_operation_start_box;
+    // witness 的上一张已验证直接无手框；下一张必须与它连续。
+    std::map<int, BBox> last_witness_boxes;
+    // 建立 proof 时沿用的既有 causal 覆盖下限，不新增全局阈值。
+    float required_coverage_ratio = 0.0f;
+    int witness_confirmed_frame = -1;
+    int last_validated_frame = -1;
+};
+
 // 一张有手帧中，operation-start 旧 C 对检测框的直接原位归属计划。它仅描述
 // 本帧事实，不写 claimed、working_inventory 或任何证据计数；调用方在路径
 // 匹配、D 扫描前依据该计划排除别的 C/D 对同一框的借用。
@@ -492,6 +507,9 @@ private:
     // key 为被遮挡旧 C 的正式 item_id；仅用于 HAND 期可追溯证据，不参与
     // formal blocker graph 的写入。
     std::map<int, PendingFrontEvidence> pending_front_evidence_by_target_;
+    // 在本轮尚未提交时保留已经成立的 CAUSAL_FRONT_MISSING。它必须在每张
+    // 后续无手帧重新验证，手重新进入或操作结束时清空。
+    std::map<int, ProvisionalCausalOcclusion> provisional_causal_occlusions_;
     // 当前无手帧的身份计划：key 为旧 item_id，value 为本帧仅在该旧物
     // 原位仲裁中暂时排除的跨类别低分重复 detection index。它不跨帧、
     // 不写入 InventoryItem，也不影响 OSD/原始 detection。
