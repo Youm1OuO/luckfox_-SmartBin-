@@ -1320,7 +1320,8 @@ bool SessionManager::defer_direct_missing_out_for_possible_occlusion_(
 bool SessionManager::has_unresolved_no_hand_state_(
         const std::vector<Detection>& detections,
         const std::set<int>& observed_item_ids,
-        const std::set<int>& fully_occluded_item_ids) {
+        const std::set<int>& fully_occluded_item_ids,
+        const std::map<int, BlockerTransitionPlan>& transition_plans) {
     bool unresolved = false;
 
     // 数量不足 OUT 候选中可能有“本次手操作没有单独建轨”的旧 C。它们也
@@ -1329,6 +1330,16 @@ bool SessionManager::has_unresolved_no_hand_state_(
     for (std::set<int>::const_iterator item =
              visible_count_out_candidate_ids_.begin();
          item != visible_count_out_candidate_ids_.end(); ++item) {
+        const std::map<int, BlockerTransitionPlan>::const_iterator plan =
+            transition_plans.find(*item);
+        if (plan != transition_plans.end() &&
+            (plan->second.out == OutDisposition::HOLD_FOR_PENDING_OCCLUSION ||
+             plan->second.out == OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION ||
+             plan->second.out == OutDisposition::NOT_APPLICABLE)) {
+            unresolved = unresolved ||
+                plan->second.out == OutDisposition::HOLD_FOR_PENDING_OCCLUSION;
+            continue;
+        }
         if (observed_item_ids.count(*item) || fully_occluded_item_ids.count(*item)) {
             continue;
         }
@@ -1347,6 +1358,32 @@ bool SessionManager::has_unresolved_no_hand_state_(
     for (std::map<int, OperationTrack>::iterator it = track_buffer_.begin();
          it != track_buffer_.end(); ++it) {
         OperationTrack& track = it->second;
+
+        const std::map<int, BlockerTransitionPlan>::const_iterator lifecycle_plan =
+            transition_plans.find(track.item_id);
+        const bool hold_for_pending_occlusion = lifecycle_plan !=
+            transition_plans.end() && lifecycle_plan->second.out ==
+                OutDisposition::HOLD_FOR_PENDING_OCCLUSION;
+        if (hold_for_pending_occlusion) {
+            const bool ordinary_direct_pending_out =
+                pending_out_ids_.count(track.item_id) &&
+                !visible_count_confirmed_out_ids_.count(track.item_id) &&
+                track.no_hand_missing_count >= FLOW3_NO_HAND_OUT_MISSING_FRAMES;
+            if (ordinary_direct_pending_out) {
+                pending_out_ids_.erase(track.item_id);
+                if (track.resolution == ExistingItemResolution::OUT_CONFIRMED) {
+                    track.resolution = ExistingItemResolution::NONE;
+                    track.needs_no_hand_settlement = true;
+                    track.release_reason = ReleaseReason::NONE;
+                }
+                track.no_hand_missing_count = std::max(
+                    0, FLOW3_NO_HAND_OUT_MISSING_FRAMES - 1);
+            }
+            unresolved = true;
+            trace_track_("OCCLUSION", track,
+                         "hold-out-for-pending-disappearance-supported");
+            continue;
+        }
 
         if (track.is_suspect_new) {
             if (!is_active_runtime_track(track)) continue;

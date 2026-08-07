@@ -202,9 +202,13 @@ void SessionManager::reset_operation_runtime_() {
     visible_count_out_candidate_ids_.clear();
     visible_count_missing_counts_.clear();
     visible_count_confirmed_out_ids_.clear();
+    visible_count_continuity_reset_item_ids_.clear();
     visible_count_prior_survivors_by_cls_.clear();
     visible_count_prior_survivor_boxes_by_cls_.clear();
     occlusion_loss_missing_counts_.clear();
+    pending_occlusion_missing_counts_.clear();
+    pending_occlusion_witness_ids_.clear();
+    pending_occlusion_witness_boxes_.clear();
     hand_track_.clear();
     has_old_hand_box_ = false;
     next_suspect_id_ = -1;
@@ -244,6 +248,9 @@ void SessionManager::init_from_backend(const std::vector<InventoryItem>& items,
         if (item.base_box.area() <= 0.0f || item.box.area() <= 0.0f) continue;
         item.status = ItemStatus::VISIBLE;
         item.block_ids.clear();
+        // Backend snapshots are the existing VISIBLE baseline.  The backend
+        // contract does not yet persist blocker/proof relations.
+        item.occlusion_proof.clear();
         loaded[item.item_id] = item;
         next_id = std::max(next_id, item.item_id + 1);
     }
@@ -425,6 +432,18 @@ FrameProcessResult SessionManager::process_frame(
         if (!visible_count_missing_counts_.empty() ||
             !visible_count_confirmed_out_ids_.empty()) {
             clear_visible_count_settlement_(true);
+        }
+        // DISAPPEARANCE_SUPPORTED also requires consecutive no-hand frames.
+        // A returning hand starts a new evidence segment, so it must not
+        // inherit the previous segment's candidate count or witnesses.
+        if (!pending_occlusion_missing_counts_.empty()) {
+            trace_("OCCLUSION",
+                   "action=reset-pending-disappearance-evidence reason=hand-returned "
+                   "targets=%zu",
+                   pending_occlusion_missing_counts_.size());
+            pending_occlusion_missing_counts_.clear();
+            pending_occlusion_witness_ids_.clear();
+            pending_occlusion_witness_boxes_.clear();
         }
         finalize_initial_check_before_hand_();
         no_hand_streak_ = 0;

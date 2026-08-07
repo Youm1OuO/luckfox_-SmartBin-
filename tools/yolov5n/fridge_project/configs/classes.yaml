@@ -74,6 +74,7 @@ classes:
   - lettuce          # 45  生菜
   - cabbage          # 46  卷心菜
   - bitter_gourd     # 47  苦瓜
+  - hairy_gourd      # 48  节瓜
 
 # ---- 2. 粗粒度映射(推理后处理用,不参与训练)----------------------------
 # 这一段的目的:即使细类识别错了(比如把 apple 认成 pear),
@@ -112,6 +113,7 @@ coarse_grained:
     - lettuce
     - cabbage
     - bitter_gourd
+    - hairy_gourd
   meat_seafood:             # 肉蛋生鲜类
     - egg
     - meat_pack

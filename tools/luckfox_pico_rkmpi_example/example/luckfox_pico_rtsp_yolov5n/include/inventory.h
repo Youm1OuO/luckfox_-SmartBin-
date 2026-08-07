@@ -27,6 +27,26 @@ enum class ItemStatus {
     OCCLUDED,   // 【遮挡】— 被其他物品/手遮挡，仍在冰箱中
 };
 
+// A committed explanation for a formal OCCLUDED status.  This is deliberately
+// separate from block_ids: block_ids describes the complete live relation graph,
+// while witnesses records the blockers that actually proved full coverage.
+enum class OcclusionProofKind {
+    NONE,
+    STRICT_UNION,
+    EDGE_RESIDUAL_UNION,
+    DISAPPEARANCE_SUPPORTED,
+};
+
+struct OcclusionProof {
+    OcclusionProofKind kind = OcclusionProofKind::NONE;
+    std::set<int> witness_blocker_ids;
+
+    void clear() {
+        kind = OcclusionProofKind::NONE;
+        witness_blocker_ids.clear();
+    }
+};
+
 struct InventoryItem {
     int item_id = -1;         // 稳定身份ID，永不变
     int cls_id = -1;          // 物品类别
@@ -35,6 +55,7 @@ struct InventoryItem {
     float score = 0.0f;       // 最新检测分数
     ItemStatus status = ItemStatus::VISIBLE;
     std::set<int> block_ids;  // 当前被确认位于其前方的多个库存物品
+    OcclusionProof occlusion_proof; // formal proof when status == OCCLUDED
     int created_frame = 0;    // 入库帧号
     int updated_frame = 0;    // 最近更新帧号
     long long created_time_ms = 0; // 入库时间戳

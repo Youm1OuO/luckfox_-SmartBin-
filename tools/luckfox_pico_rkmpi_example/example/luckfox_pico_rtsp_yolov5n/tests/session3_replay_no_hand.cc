@@ -111,6 +111,124 @@ void test_moved_front_item_occludes_then_reveals() {
                         fridge::EventKind::REVEALED, 2);
 }
 
+// A 11px top-edge residual is wider than the existing 8px edge-residual
+// tolerance, but the confirmed moved front covers 89% of the target.  Two
+// comparable no-hand frames must use the dedicated disappearance proof rather
+// than allowing ordinary two-frame OUT to delete the target.
+void test_disappearance_supported_moved_front_occludes_without_out() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // moved front apple
+    initial.push_back(item(2, 2, 300, 100, 400, 200));  // hidden orange
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> initial_foods;
+    initial_foods.push_back(det(0, 100, 100, 200, 200));
+    initial_foods.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, initial_foods, &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 170, 100, 270, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(150, 80, 250, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 240, 105, 340, 205)),
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 85, 320, 225)), &frame);
+    const fridge::BBox final_front(300, 111, 400, 211);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, final_front.x1, final_front.y1,
+                   final_front.x2, final_front.y2)),
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 91, 380, 231)), &frame);
+
+    const std::vector<fridge::Detection> no_hand_front(1,
+        det(0, final_front.x1, final_front.y1,
+            final_front.x2, final_front.y2));
+    fridge::SettlementResult result = settle_after_hand(
+        &session, no_hand_front, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    const fridge::InventoryItem* target = session.inventory().find_by_item(2);
+    assert(target != 0);
+    assert(target->status == fridge::ItemStatus::OCCLUDED);
+    assert(target->block_ids.size() == 1);
+    assert(target->block_ids.count(1));
+    assert(target->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::DISAPPEARANCE_SUPPORTED);
+    assert(target->occlusion_proof.witness_blocker_ids.size() == 1);
+    assert(target->occlusion_proof.witness_blocker_ids.count(1));
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(has_event(result, fridge::EventKind::OCCLUDED, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+    assert_event_before(result, fridge::EventKind::MOVED, 1,
+                        fridge::EventKind::OCCLUDED, 2);
+}
+
+// DISAPPEARANCE_SUPPORTED 需要连续无手帧。中间重新出现手时，前后两段
+// 候选不能拼成两帧，否则一次短暂漏检会被错误提交为正式 OCCLUDED。
+void test_disappearance_evidence_resets_when_hand_returns() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 300, 100, 400, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> initial_foods;
+    initial_foods.push_back(det(0, 100, 100, 200, 200));
+    initial_foods.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, initial_foods, &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 170, 100, 270, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(150, 80, 250, 220)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 240, 105, 340, 205)),
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 85, 320, 225)), &frame);
+    const fridge::BBox final_front(300, 111, 400, 211);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, final_front.x1, final_front.y1,
+                   final_front.x2, final_front.y2)),
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 91, 380, 231)), &frame);
+
+    const std::vector<fridge::Detection> no_hand_front(1,
+        det(0, final_front.x1, final_front.y1,
+            final_front.x2, final_front.y2));
+    fridge::FrameProcessResult first = session.process_frame(
+        no_hand_front, std::vector<fridge::BBox>(), frame, frame);
+    ++frame;
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::VISIBLE);
+
+    // This hand frame is intentionally stationary at the last hand position;
+    // it only breaks the no-hand evidence segment.
+    send_frame(&session, no_hand_front,
+               std::vector<fridge::BBox>(1, fridge::BBox(280, 91, 380, 231)), &frame);
+    fridge::FrameProcessResult after_hand = session.process_frame(
+        no_hand_front, std::vector<fridge::BBox>(), frame, frame);
+    ++frame;
+    assert(after_hand.no_hand_frame_processed);
+    assert(!after_hand.settlement.committed);
+    assert(session.inventory().find_by_item(2)->status == fridge::ItemStatus::VISIBLE);
+
+    fridge::SettlementResult result = settle_after_hand(
+        &session, no_hand_front, &frame);
+    assert(result.committed);
+    const fridge::InventoryItem* target = session.inventory().find_by_item(2);
+    assert(target != 0);
+    assert(target->status == fridge::ItemStatus::OCCLUDED);
+    assert(target->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::DISAPPEARANCE_SUPPORTED);
+    assert(has_event(result, fridge::EventKind::OCCLUDED, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+}
+
 // 第一事务中 A 的确认终点在 B 的左侧留下 6px 外边缘残余。当前 confirmed
 // MOVED front 可以按既有 edge-residual 规则使 B 正式 OCCLUDED；下一事务
 // A 离开后，历史 before 也必须用同一正式语义，否则 B 会残留 OCCLUDED。

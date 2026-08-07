@@ -50,6 +50,9 @@ void InventoryDB::set_status(int item_id, ItemStatus new_status) {
     auto it = items_.find(item_id);
     if (it == items_.end()) return;
     it->second.status = new_status;
+    if (new_status == ItemStatus::VISIBLE) {
+        it->second.occlusion_proof.clear();
+    }
 }
 
 void InventoryDB::update_seen_item(int item_id, const BBox& box,
@@ -64,6 +67,16 @@ void InventoryDB::update_seen_item(int item_id, const BBox& box,
 void InventoryDB::replace_all(const std::map<int, InventoryItem>& items,
                               int next_item_id) {
     items_ = items;
+    // A visible committed item cannot retain a historical occlusion proof.
+    // OCCLUDED proofs are validated by the no-hand lifecycle before this
+    // atomic commit; this keeps the VISIBLE side of the persistent invariant
+    // true for every replace_all caller, including backend/bootstrap paths.
+    for (std::map<int, InventoryItem>::iterator it = items_.begin();
+         it != items_.end(); ++it) {
+        if (it->second.status == ItemStatus::VISIBLE) {
+            it->second.occlusion_proof.clear();
+        }
+    }
     next_item_id_ = std::max(1, next_item_id);
 }
 

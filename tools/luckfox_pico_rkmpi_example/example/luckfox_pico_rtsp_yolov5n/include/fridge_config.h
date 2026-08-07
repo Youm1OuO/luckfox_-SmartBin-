@@ -9,7 +9,7 @@
 namespace fridge {
 
 // 每次会话状态机行为有实质调整时递增。用于板端启动日志核实真正运行的二进制。
-constexpr const char* FLOW3_BUILD_TAG = "3.0-r20";
+constexpr const char* FLOW3_BUILD_TAG = "3.0-r21";
 
 // =========================================================================
 //  类别 ID 配置
@@ -254,13 +254,16 @@ constexpr float COVER_REMAINING_AREA_EPS = 4.0f;
 // 严格覆盖只剩目标外边缘窄条带时的受限容差。它只在结算层确认了
 // 当前 IN/MOVED blocker 后使用，不改变 COVER_REMAINING_AREA_EPS 的并集语义。
 constexpr float FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX = 8.0f;
+// Dedicated threshold for DISAPPEARANCE_SUPPORTED.  It does not participate
+// in identity, D/MOVED confirmation, ordinary OUT, or blocker creation.
+constexpr float FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO = 0.85f;
 // 3.0 的 D→C 遮挡在 D 已确认放下时才写入 block_ids。新 D 只部分覆盖
 // C 但 C 已处于 HAND_* 时，达到该比例可以作为“先保留 C，不判 OUT”的证据。
 constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
 // 可开关的 3.0 状态机诊断追踪。开启后会按操作号、帧号记录状态转换、
 // C->B 仲裁、D 防线和无手结算依据；它只输出日志，不参与任何业务判断。
-constexpr bool FLOW3_DEBUG_TRACE_LOG = true;
+constexpr bool FLOW3_DEBUG_TRACE_LOG = false;
 
 // 当前尚未对接后台，允许首张无手直接检测建立本地测试库存。
 // 接入可信后台后建议改为 false：此时冷启动画面只做只读校验，不负责建库。

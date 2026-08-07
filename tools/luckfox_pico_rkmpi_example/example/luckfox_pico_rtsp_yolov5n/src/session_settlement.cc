@@ -28,17 +28,8 @@ CoverageEvaluation evaluate_full_coverage(const BBox& target_box,
                                           const std::vector<BBox>& strict_cover_boxes,
                                           const std::vector<BBox>& edge_cover_boxes,
                                           bool allow_edge_residual) {
-    CoverageEvaluation evaluation;
-    evaluation.cover_box_count = strict_cover_boxes.size();
-    if (target_box.area() <= 0.0f) return evaluation;
-
-    evaluation.strict_full = fully_covered_by(target_box, strict_cover_boxes);
-    evaluation.edge_residual_full = !evaluation.strict_full &&
-        allow_edge_residual && edge_residual_within_target_border(
-            target_box, edge_cover_boxes,
-            FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX);
-    evaluation.full = evaluation.strict_full || evaluation.edge_residual_full;
-    return evaluation;
+    return evaluate_coverage_facts(target_box, strict_cover_boxes,
+                                   edge_cover_boxes, allow_edge_residual);
 }
 
 std::string blocker_id_list(const std::set<int>& item_ids) {
@@ -120,6 +111,7 @@ void SessionManager::clear_visible_count_settlement_(bool restore_uncommitted_ou
     visible_count_out_candidate_ids_.clear();
     visible_count_missing_counts_.clear();
     visible_count_confirmed_out_ids_.clear();
+    visible_count_continuity_reset_item_ids_.clear();
     visible_count_prior_survivors_by_cls_.clear();
     visible_count_prior_survivor_boxes_by_cls_.clear();
 }
@@ -168,9 +160,9 @@ void SessionManager::prepare_visible_count_settlement_(
 
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
+    visible_count_continuity_reset_item_ids_.clear();
     std::set<int> next_out_candidates;
     std::set<int> active_deficit_classes;
-    std::set<int> continuity_reset_item_ids;
 
     for (std::map<int, std::vector<int> >::const_iterator group =
              old_visible_ids_by_cls.begin();
@@ -406,7 +398,8 @@ void SessionManager::prepare_visible_count_settlement_(
             }
         }
         if (survivor_box_discontinuous) {
-            continuity_reset_item_ids.insert(old_ids.begin(), old_ids.end());
+            visible_count_continuity_reset_item_ids_.insert(
+                old_ids.begin(), old_ids.end());
         }
         visible_count_prior_survivors_by_cls_[cls_id] = survivors;
         visible_count_prior_survivor_boxes_by_cls_[cls_id] = current_survivor_boxes;
@@ -480,13 +473,40 @@ void SessionManager::prepare_visible_count_settlement_(
         }
     }
 
-    // 数量恢复、类别不再短缺或手再次出现之前，都不能让上一轮缺失证据在
-    // 随机帧继续累积；已标记但尚未提交的 OUT 也要一并撤销。
+    visible_count_out_candidate_ids_.swap(next_out_candidates);
+    // Missing evidence and pending OUT are intentionally applied by
+    // apply_visible_count_missing_evidence_ after the occlusion plan exists.
+}
+
+void SessionManager::apply_visible_count_missing_evidence_(
+        const std::map<int, BlockerTransitionPlan>& transition_plans) {
+    std::set<int> eligible_out_candidates;
+    for (std::set<int>::const_iterator candidate =
+             visible_count_out_candidate_ids_.begin();
+         candidate != visible_count_out_candidate_ids_.end(); ++candidate) {
+        const std::map<int, BlockerTransitionPlan>::const_iterator plan =
+            transition_plans.find(*candidate);
+        const bool held_by_occlusion = plan != transition_plans.end() &&
+            (plan->second.out == OutDisposition::HOLD_FOR_PENDING_OCCLUSION ||
+             plan->second.out == OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION ||
+             plan->second.out == OutDisposition::NOT_APPLICABLE);
+        if (!held_by_occlusion) {
+            eligible_out_candidates.insert(*candidate);
+        } else {
+            trace_("VISIBLE-COUNT",
+                   "item=%d action=hold-missing-evidence out-disposition=%d",
+                   *candidate, static_cast<int>(plan->second.out));
+        }
+    }
+
+    // Quantity recovery, a discontinuous survivor box, or a confirmed
+    // occlusion retracts only this uncommitted visible-count chain.
     for (std::map<int, int>::iterator missing = visible_count_missing_counts_.begin();
          missing != visible_count_missing_counts_.end();) {
         const bool reset_for_discontinuity =
-            continuity_reset_item_ids.count(missing->first) > 0;
-        if (next_out_candidates.count(missing->first) && !reset_for_discontinuity) {
+            visible_count_continuity_reset_item_ids_.count(missing->first) > 0;
+        if (eligible_out_candidates.count(missing->first) &&
+            !reset_for_discontinuity) {
             ++missing;
             continue;
         }
@@ -511,7 +531,7 @@ void SessionManager::prepare_visible_count_settlement_(
         missing = visible_count_missing_counts_.erase(missing);
     }
 
-    visible_count_out_candidate_ids_.swap(next_out_candidates);
+    visible_count_out_candidate_ids_.swap(eligible_out_candidates);
     for (std::set<int>::const_iterator candidate =
              visible_count_out_candidate_ids_.begin();
          candidate != visible_count_out_candidate_ids_.end(); ++candidate) {
@@ -539,6 +559,36 @@ void SessionManager::prepare_visible_count_settlement_(
             }
         }
     }
+    visible_count_continuity_reset_item_ids_.clear();
+}
+
+void SessionManager::update_pending_occlusion_evidence_(
+        const std::map<int, BlockerTransitionPlan>& transition_plans) {
+    std::set<int> active_candidates;
+    for (std::map<int, BlockerTransitionPlan>::const_iterator it =
+             transition_plans.begin(); it != transition_plans.end(); ++it) {
+        const BlockerTransitionPlan& plan = it->second;
+        if (!plan.disappearance_candidate) continue;
+        active_candidates.insert(it->first);
+        pending_occlusion_missing_counts_[it->first] = plan.matching_missing_frames;
+        pending_occlusion_witness_ids_[it->first] = plan.disappearance_witness_ids;
+        pending_occlusion_witness_boxes_[it->first] = plan.disappearance_witness_boxes;
+        trace_("OCCLUSION",
+               "target=%d action=store-disappearance-evidence count=%d/%d",
+               it->first, plan.matching_missing_frames,
+               FLOW3_NO_HAND_OUT_MISSING_FRAMES);
+    }
+    for (std::map<int, int>::iterator it =
+             pending_occlusion_missing_counts_.begin();
+         it != pending_occlusion_missing_counts_.end();) {
+        if (!active_candidates.count(it->first)) {
+            pending_occlusion_witness_ids_.erase(it->first);
+            pending_occlusion_witness_boxes_.erase(it->first);
+            it = pending_occlusion_missing_counts_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void SessionManager::refresh_confirmed_blockers_(
@@ -551,129 +601,103 @@ void SessionManager::refresh_confirmed_blockers_(
     fully_occluded_item_ids->clear();
     if (transition_plans) transition_plans->clear();
 
-    // 所有身份、最终可靠框和 pending IN / MOVED 都已经在调用前准备完毕。
-    // 这里统一读取上一轮已提交关系和本轮已确认前景，绝不把 hand/suspect D
-    // 的临时框直接写成正式 blocker。正式 VISIBLE/OCCLUDED 状态也只在下面
-    // 的 blocker 因果计划通过门控后改变，不能由 observed_working_ids 直接改写。
+    const BlockerRelationGraph graph = build_event_driven_blocker_graph(
+        operation_start_inventory_, *final_items, confirmed_front_ids,
+        confirmed_moved_ids_, pending_out_ids_);
+
     for (std::map<int, InventoryItem>::iterator target = final_items->begin();
          target != final_items->end(); ++target) {
         const int target_id = target->first;
         const std::map<int, InventoryItem>::const_iterator original =
             operation_start_inventory_.find(target_id);
-        const InventoryItem& relationship_source =
-            original == operation_start_inventory_.end() ? target->second : original->second;
-        // 已确认 MOVED / IN 的 target 已在 final_items 中刷新为本轮可靠最终框；
-        // 未观察到的旧 C 则仍保留操作开始时的完整参考框。
+        BlockerTransitionPlan plan;
+        const std::set<int> empty_ids;
+        const std::map<int, std::set<int> >::const_iterator effective_it =
+            graph.effective_by_target.find(target_id);
+        const std::set<int>& effective_block_ids = effective_it ==
+            graph.effective_by_target.end() ? empty_ids : effective_it->second;
+        plan.effective_blocker_ids = effective_block_ids;
+        if (original != operation_start_inventory_.end()) {
+            plan.historical_blocker_ids = original->second.block_ids;
+        }
+        const std::map<int, std::set<int> >::const_iterator added_it =
+            graph.added_by_target.find(target_id);
+        const std::map<int, std::set<int> >::const_iterator removed_it =
+            graph.removed_by_target.find(target_id);
+        const std::map<int, std::set<int> >::const_iterator moved_it =
+            graph.moved_by_target.find(target_id);
+        if (added_it != graph.added_by_target.end())
+            plan.added_blocker_ids = added_it->second;
+        if (removed_it != graph.removed_by_target.end())
+            plan.removed_blocker_ids = removed_it->second;
+        if (moved_it != graph.moved_by_target.end())
+            plan.moved_blocker_ids = moved_it->second;
+
         const BBox target_box = target->second.base_box.area() > 0.0f
             ? target->second.base_box : target->second.box;
+        const BBox relationship_target_box = original !=
+            operation_start_inventory_.end()
+            ? (original->second.base_box.area() > 0.0f
+                ? original->second.base_box : original->second.box)
+            : target_box;
 
-        BlockerTransitionPlan plan;
-        std::set<int> effective_block_ids;
-        std::vector<BBox> cover_boxes;
-        std::vector<BBox> edge_residual_cover_boxes;
-        bool has_current_confirmed_front_cover = false;
-        const std::set<int> historical_block_ids = relationship_source.block_ids;
-        plan.historical_blocker_ids = historical_block_ids;
-
-        // “before” 必须使用事务开始时已提交的可靠位置，而不是把本轮移动
-        // 后的框倒灌回去。它只用于判断本轮覆盖是否真的发生了完整/不完整
-        // 变化，不会直接改变任何状态。
-        const BBox relationship_target_box = relationship_source.base_box.area() > 0.0f
-            ? relationship_source.base_box : relationship_source.box;
         std::vector<BBox> historical_cover_boxes;
-        for (std::set<int>::const_iterator blocker = historical_block_ids.begin();
-             blocker != historical_block_ids.end(); ++blocker) {
-            if (*blocker == target_id) continue;
-            std::map<int, InventoryItem>::const_iterator historical_front =
+        std::set<int> historical_geometry_ids;
+        for (std::set<int>::const_iterator blocker =
+                 plan.historical_blocker_ids.begin();
+             blocker != plan.historical_blocker_ids.end(); ++blocker) {
+            const std::map<int, InventoryItem>::const_iterator front =
                 operation_start_inventory_.find(*blocker);
-            if (historical_front == operation_start_inventory_.end()) continue;
-            const BBox historical_box = historical_front->second.base_box.area() > 0.0f
-                ? historical_front->second.base_box : historical_front->second.box;
-            if (relationship_target_box.area() > 0.0f && historical_box.area() > 0.0f &&
-                intersection_area(relationship_target_box, historical_box) >
+            if (front == operation_start_inventory_.end()) continue;
+            const BBox front_box = front->second.base_box.area() > 0.0f
+                ? front->second.base_box : front->second.box;
+            if (relationship_target_box.area() > 0.0f && front_box.area() > 0.0f &&
+                intersection_area(relationship_target_box, front_box) >
                     BLOCK_OVERLAP_AREA_EPS) {
-                historical_cover_boxes.push_back(historical_box);
+                historical_cover_boxes.push_back(front_box);
+                historical_geometry_ids.insert(*blocker);
             }
         }
-        const bool allow_historical_edge_residual =
-            original != operation_start_inventory_.end() &&
+        const bool allow_historical_edge_residual = original !=
+            operation_start_inventory_.end() &&
             original->second.status == ItemStatus::OCCLUDED &&
-            !historical_block_ids.empty() && !historical_cover_boxes.empty();
+            !historical_cover_boxes.empty();
         plan.coverage_before = evaluate_full_coverage(
-            relationship_target_box, historical_cover_boxes, historical_cover_boxes,
-            allow_historical_edge_residual);
+            relationship_target_box, historical_cover_boxes,
+            historical_cover_boxes, allow_historical_edge_residual);
 
-        for (int source = 0; source < 2; ++source) {
-            const std::set<int>& candidate_ids = source == 0
-                ? historical_block_ids : confirmed_front_ids;
-            for (std::set<int>::const_iterator blocker = candidate_ids.begin();
-                 blocker != candidate_ids.end(); ++blocker) {
-                if (*blocker == target_id || pending_out_ids_.count(*blocker)) continue;
-                std::map<int, InventoryItem>::const_iterator front =
-                    final_items->find(*blocker);
-                if (front == final_items->end()) continue;
-                const BBox front_box = front->second.base_box.area() > 0.0f
-                    ? front->second.base_box : front->second.box;
-                if (target_box.area() <= 0.0f || front_box.area() <= 0.0f ||
-                    intersection_area(target_box, front_box) <= BLOCK_OVERLAP_AREA_EPS) {
-                    continue;
-                }
-                if (effective_block_ids.insert(*blocker).second) {
-                    cover_boxes.push_back(front_box);
-                    if (source == 0) {
-                        // 已提交的 historical blocker 只能提供可靠 base_box；
-                        // 它本身不足以启用窄边缘容差，但可与当前 confirmed
-                        // front 一起参与残余差集。
-                        edge_residual_cover_boxes.push_back(front_box);
-                    } else {
-                        const OperationTrack* runtime =
-                            find_runtime_for_item_(*blocker);
-                        const bool confirmed_moved_front =
-                            confirmed_moved_ids_.count(*blocker) > 0;
-                        const bool confirmed_in_front =
-                            pending_in_ids_.count(*blocker) > 0 && runtime &&
-                            runtime->is_suspect_new &&
-                            runtime->promoted_to_working_inventory &&
-                            !runtime->pending_d_quarantined_by_old_c &&
-                            runtime->no_hand_self_match_count >=
-                                FLOW3_NO_HAND_D_CONFIRM_FRAMES;
-                        // 未达到已有 D 无手直接确认门槛的 pending D 绝不能
-                        // 借边缘容差成为 blocker；它仍可走原有严格覆盖/未决
-                        // 流程，但不会在本 helper 中留下正式遮挡结论。
-                        if (confirmed_moved_front || confirmed_in_front) {
-                            edge_residual_cover_boxes.push_back(front_box);
-                            has_current_confirmed_front_cover = true;
-                        }
-                    }
-                }
+        std::vector<BBox> cover_boxes;
+        std::vector<BBox> edge_cover_boxes;
+        std::set<int> effective_with_geometry;
+        std::set<int> current_front_witnesses;
+        std::map<int, BBox> current_front_witness_boxes;
+        for (std::set<int>::const_iterator blocker = effective_block_ids.begin();
+             blocker != effective_block_ids.end(); ++blocker) {
+            const std::map<int, InventoryItem>::const_iterator front =
+                final_items->find(*blocker);
+            if (front == final_items->end()) continue;
+            const BBox front_box = front->second.base_box.area() > 0.0f
+                ? front->second.base_box : front->second.box;
+            if (target_box.area() <= 0.0f || front_box.area() <= 0.0f ||
+                intersection_area(target_box, front_box) <= BLOCK_OVERLAP_AREA_EPS) {
+                continue;
+            }
+            cover_boxes.push_back(front_box);
+            edge_cover_boxes.push_back(front_box);
+            effective_with_geometry.insert(*blocker);
+            if (confirmed_front_ids.count(*blocker)) {
+                current_front_witnesses.insert(*blocker);
+                current_front_witness_boxes[*blocker] = front_box;
             }
         }
-
-        // 差分单独计算，允许保留部分相交的历史 blocker，同时把确认移动到
-        // 不相交位置或正式 OUT 的 blocker 从有效关系中移除。未确认漏检不在
-        // 这里删除历史关系。
-        for (std::set<int>::const_iterator blocker = historical_block_ids.begin();
-             blocker != historical_block_ids.end(); ++blocker) {
-            if (pending_out_ids_.count(*blocker)) {
-                plan.removed_blocker_ids.insert(*blocker);
-            }
-            if (confirmed_moved_ids_.count(*blocker)) {
-                plan.moved_blocker_ids.insert(*blocker);
-                if (!effective_block_ids.count(*blocker)) {
-                    plan.removed_blocker_ids.insert(*blocker);
-                }
-            }
-        }
-        for (std::set<int>::const_iterator blocker = confirmed_front_ids.begin();
-             blocker != confirmed_front_ids.end(); ++blocker) {
-            if (*blocker == target_id || !effective_block_ids.count(*blocker)) continue;
-            if (!historical_block_ids.count(*blocker)) {
-                plan.added_blocker_ids.insert(*blocker);
-            } else if (confirmed_moved_ids_.count(*blocker)) {
-                plan.moved_blocker_ids.insert(*blocker);
-            }
-        }
-        plan.effective_blocker_ids = effective_block_ids;
+        const bool has_current_confirmed_front_cover =
+            !current_front_witnesses.empty();
+        plan.coverage_after = evaluate_full_coverage(
+            target_box, cover_boxes, edge_cover_boxes,
+            has_current_confirmed_front_cover);
+        plan.coverage_changed_by_confirmed_front =
+            !plan.added_blocker_ids.empty() || !plan.moved_blocker_ids.empty() ||
+            !plan.removed_blocker_ids.empty();
 
         const OperationTrack* target_runtime = find_runtime_for_item_(target_id);
         const bool target_observed = observed_working_ids.count(target_id) > 0;
@@ -685,69 +709,188 @@ void SessionManager::refresh_confirmed_blockers_(
         plan.observation_conflict = target_observed && target_observation_conflict;
 
         if (original == operation_start_inventory_.end()) {
-            // 本轮新 D 没有直接无手身份时不会成为正式库存目标，更不能凭几何
-            // 推导出新的遮挡关系。
-            target->second.block_ids.swap(effective_block_ids);
+            // A newly promoted D is a front candidate only; it cannot acquire
+            // inferred historical blockers in the same transaction.
+            target->second.block_ids = effective_block_ids;
+            target->second.occlusion_proof.clear();
+            target->second.status = ItemStatus::VISIBLE;
             if (transition_plans) (*transition_plans)[target_id] = plan;
             continue;
         }
 
-        plan.coverage_after = evaluate_full_coverage(
-            target_box, cover_boxes, edge_residual_cover_boxes,
-            has_current_confirmed_front_cover);
-        plan.coverage_changed_by_confirmed_front =
-            plan.coverage_before.full != plan.coverage_after.full &&
-            (!plan.added_blocker_ids.empty() ||
-             !plan.removed_blocker_ids.empty() ||
-             !plan.moved_blocker_ids.empty());
+        plan.before_proof = original->second.occlusion_proof;
+        // Older committed snapshots may carry OCCLUDED + block_ids without a
+        // proof field.  Rehydrate only when the historical geometry itself
+        // proves full coverage; otherwise keep the record conservative and
+        // unresolved rather than fabricating a reveal.
+        if (plan.before_proof.kind == OcclusionProofKind::NONE &&
+            original->second.status == ItemStatus::OCCLUDED &&
+            plan.coverage_before.full && !historical_geometry_ids.empty()) {
+            plan.before_proof.kind = plan.coverage_before.strict_full
+                ? OcclusionProofKind::STRICT_UNION
+                : OcclusionProofKind::EDGE_RESIDUAL_UNION;
+            plan.before_proof.witness_blocker_ids = historical_geometry_ids;
+            trace_("OCCLUSION", "target=%d action=rehydrate-legacy-proof kind=%d",
+                   target_id, static_cast<int>(plan.before_proof.kind));
+        }
+        plan.target_has_independent_exit_evidence =
+            confirmed_moved_ids_.count(target_id) > 0;
+        if (target_runtime && !target_runtime->is_suspect_new &&
+            !target_observation_conflict) {
+            const bool contact_exit =
+                target_runtime->contact_state == ContactState::CONTACT_MOVING &&
+                target_runtime->hold_and_move &&
+                !target_runtime->observed_move_values.empty();
+            const bool hand_exit = target_runtime->contact_state == ContactState::NONE &&
+                target_runtime->state != OperationTrackState::NORMAL &&
+                (target_runtime->hold_and_move ||
+                 has_meaningful_hand_move(*target_runtime));
+            plan.target_has_independent_exit_evidence =
+                plan.target_has_independent_exit_evidence || contact_exit || hand_exit;
+        }
 
-        // 未直接观察到的旧 C 继续使用操作开始时的可靠身份和 base_box，丢弃
-        // 有手阶段可能留下的临时 status / block_ids，只保留有效历史和新前景。
-        // 对本轮已合法确认的直接观察保留最终框（尤其是 MOVED）；但若
-        // 目标仍正式 OCCLUDED 且没有 blocker 解除原因，后面会恢复成
-        // operation-start 的正式几何，把当前框仅当作临时 observation。
-        InventoryItem retained = target_observed ? target->second : original->second;
-        retained.block_ids.swap(effective_block_ids);
-        if (original->second.status == ItemStatus::VISIBLE) {
-            if (!plan.valid_target_observed && !plan.coverage_before.full &&
-                plan.coverage_after.full && plan.coverage_changed_by_confirmed_front) {
-                retained.status = ItemStatus::OCCLUDED;
-                plan.allow_occluded_transition = true;
-                fully_occluded_item_ids->insert(target_id);
-            } else {
-                retained.status = ItemStatus::VISIBLE;
-            }
-        } else {
-            if (plan.coverage_after.full) {
-                retained.status = ItemStatus::OCCLUDED;
-                fully_occluded_item_ids->insert(target_id);
-            } else if (plan.valid_target_observed && plan.coverage_before.full &&
-                       !plan.coverage_after.full &&
-                       plan.coverage_changed_by_confirmed_front) {
-                retained.status = ItemStatus::VISIBLE;
-                plan.allow_revealed_transition = true;
-            } else {
-                // 目标框再次出现但 blocker 没有确认变化时，只是临时
-                // observation。正式状态与历史关系必须保持 OCCLUDED。
-                if (target_observed) {
-                    retained.box = original->second.box;
-                    retained.base_box = original->second.base_box;
-                    retained.score = original->second.score;
-                    retained.updated_frame = original->second.updated_frame;
-                }
-                retained.status = ItemStatus::OCCLUDED;
-                plan.observation_conflict = plan.observation_conflict || target_observed;
+        plan.valid_target_observed = target_observed && !target_observation_conflict;
+        const bool previous_proof_valid =
+            original->second.status == ItemStatus::OCCLUDED &&
+            occlusion_proof_witnesses_valid(
+                plan.before_proof,
+                plan.historical_blocker_ids);
+        const bool previous_proof_effective_valid = previous_proof_valid &&
+            occlusion_proof_witnesses_valid(
+                plan.before_proof, effective_block_ids);
+        bool previous_proof_unchanged = previous_proof_valid;
+        for (std::set<int>::const_iterator witness =
+                 plan.before_proof.witness_blocker_ids.begin();
+             witness != plan.before_proof.witness_blocker_ids.end();
+             ++witness) {
+            if ((removed_it != graph.removed_by_target.end() &&
+                 removed_it->second.count(*witness)) ||
+                (moved_it != graph.moved_by_target.end() &&
+                 moved_it->second.count(*witness))) {
+                previous_proof_unchanged = false;
+                break;
             }
         }
-        if (plan.coverage_after.edge_residual_full && plan.allow_occluded_transition) {
+
+        int prior_disappearance_count = 0;
+        const std::map<int, std::set<int> >::const_iterator prior_witness =
+            pending_occlusion_witness_ids_.find(target_id);
+        if (prior_witness != pending_occlusion_witness_ids_.end() &&
+            prior_witness->second == current_front_witnesses) {
+            const std::map<int, std::map<int, BBox> >::const_iterator prior_boxes =
+                pending_occlusion_witness_boxes_.find(target_id);
+            if (prior_boxes != pending_occlusion_witness_boxes_.end() &&
+                front_witness_boxes_are_continuous(
+                    *final_items, prior_boxes->second,
+                    current_front_witness_boxes)) {
+                const std::map<int, int>::const_iterator prior_count =
+                    pending_occlusion_missing_counts_.find(target_id);
+                if (prior_count != pending_occlusion_missing_counts_.end()) {
+                    prior_disappearance_count = prior_count->second;
+                }
+            } else if (prior_boxes != pending_occlusion_witness_boxes_.end()) {
+                trace_("OCCLUSION",
+                       "target=%d action=reset-pending-disappearance-evidence "
+                       "reason=front-box-discontinuous",
+                       target_id);
+            }
+        }
+
+        OcclusionDecisionInput decision_input;
+        decision_input.previous_status = original->second.status;
+        decision_input.previous_proof = plan.before_proof;
+        decision_input.before_geometry = plan.coverage_before;
+        decision_input.after_geometry = plan.coverage_after;
+        decision_input.previous_proof_valid = previous_proof_valid;
+        decision_input.previous_proof_unchanged = previous_proof_unchanged;
+        decision_input.relation_changed_by_confirmed_front =
+            !plan.added_blocker_ids.empty() || !plan.moved_blocker_ids.empty();
+        decision_input.current_confirmed_front = has_current_confirmed_front_cover;
+        decision_input.valid_direct_observation = plan.valid_target_observed;
+        decision_input.observation_conflict = plan.observation_conflict;
+        decision_input.target_has_independent_exit_evidence =
+            plan.target_has_independent_exit_evidence;
+        decision_input.prior_disappearance_missing_frames = prior_disappearance_count;
+        decision_input.after_witness_blocker_ids = effective_with_geometry;
+        const OcclusionDecisionResult decision =
+            decide_occlusion_lifecycle(decision_input);
+
+        plan.visibility = decision.visibility;
+        plan.out = decision.out;
+        plan.proposed_proof = decision.proposed_proof;
+        plan.allow_occluded_transition = decision.allow_occluded_transition;
+        plan.allow_revealed_transition = decision.allow_revealed_transition;
+        plan.disappearance_candidate = decision.disappearance_candidate;
+        plan.matching_missing_frames = decision.matching_missing_frames;
+        plan.disappearance_witness_ids = current_front_witnesses;
+        plan.disappearance_witness_boxes = current_front_witness_boxes;
+
+        InventoryItem retained = target_observed ? target->second : original->second;
+        retained.block_ids = effective_block_ids;
+        if (decision.visibility == VisibilityDecision::ENTER_OCCLUDED ||
+            decision.visibility == VisibilityDecision::KEEP_OCCLUDED) {
+            retained.status = ItemStatus::OCCLUDED;
+            if (decision.proposed_proof.kind != OcclusionProofKind::NONE &&
+                !decision.proposed_proof.witness_blocker_ids.empty()) {
+                retained.occlusion_proof = decision.proposed_proof;
+            } else if (previous_proof_effective_valid) {
+                retained.occlusion_proof = plan.before_proof;
+            }
+            fully_occluded_item_ids->insert(target_id);
+        } else if (decision.visibility == VisibilityDecision::REVEAL_VISIBLE ||
+                   decision.visibility == VisibilityDecision::KEEP_VISIBLE) {
+            retained.status = ItemStatus::VISIBLE;
+            retained.occlusion_proof.clear();
+        } else if (decision.visibility == VisibilityDecision::PENDING_OCCLUSION_EVIDENCE) {
+            retained.status = original->second.status;
+            if (original->second.status == ItemStatus::VISIBLE) {
+                retained.occlusion_proof.clear();
+            }
+        } else {
+            // Pending reveal keeps the last committed formal proof in the
+            // working view until a direct reveal or OUT is actually confirmed.
+            retained.status = ItemStatus::OCCLUDED;
+            if (previous_proof_effective_valid) {
+                retained.occlusion_proof = plan.before_proof;
+            } else {
+                retained.occlusion_proof.clear();
+            }
+        }
+
+        if (original->second.status == ItemStatus::OCCLUDED &&
+            (decision.visibility == VisibilityDecision::KEEP_OCCLUDED ||
+             decision.visibility == VisibilityDecision::PENDING_REVEAL_OR_OUT ||
+             decision.visibility == VisibilityDecision::PENDING_OCCLUSION_EVIDENCE)) {
+            // A frame that happens to match an already-hidden target is only a
+            // projection until its blocker lifecycle proves a reveal.
+            if (target_observed) {
+                retained.box = original->second.box;
+                retained.base_box = original->second.base_box;
+                retained.score = original->second.score;
+                retained.updated_frame = original->second.updated_frame;
+            }
+        }
+        target->second = retained;
+
+        if (plan.coverage_after.edge_residual_full &&
+            plan.allow_occluded_transition) {
             trace_("OCCLUSION",
                    "target=%d action=confirm-edge-residual-occlusion edge-px=%.1f "
                    "confirmed-front=%d covers=%zu",
                    target_id, FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX,
                    has_current_confirmed_front_cover ? 1 : 0,
-                   edge_residual_cover_boxes.size());
+                   edge_cover_boxes.size());
         }
-        target->second = retained;
+        if (plan.disappearance_candidate) {
+            trace_("OCCLUSION",
+                   "target=%d action=disappearance-candidate count=%d/%d "
+                   "covered-ratio=%.3f outer-residual=%d witnesses=%zu",
+                   target_id, plan.matching_missing_frames,
+                   FLOW3_NO_HAND_OUT_MISSING_FRAMES,
+                   plan.coverage_after.covered_ratio,
+                   plan.coverage_after.residual_is_outer_boundary_only ? 1 : 0,
+                   plan.disappearance_witness_ids.size());
+        }
         if (!plan.historical_blocker_ids.empty() || !plan.effective_blocker_ids.empty() ||
             original->second.status == ItemStatus::OCCLUDED ||
             plan.allow_occluded_transition || plan.allow_revealed_transition) {
@@ -760,9 +903,9 @@ void SessionManager::refresh_confirmed_blockers_(
                 "OCCLUSION-PLAN",
                 "target=%d observed=%d observation-conflict=%d historical=%s effective=%s "
                 "before=(strict=%d edge=%d full=%d covers=%zu) "
-                "after=(strict=%d edge=%d full=%d covers=%zu) "
-                "added=%s removed=%s moved=%s allow-occluded=%d allow-revealed=%d "
-                "reason=%s",
+                "after=(strict=%d edge=%d full=%d ratio=%.3f outer=%d covers=%zu) "
+                "added=%s removed=%s moved=%s visibility=%d out=%d "
+                "allow-occluded=%d allow-revealed=%d reason=%s",
                 target_id, target_observed ? 1 : 0, plan.observation_conflict ? 1 : 0,
                 historical_ids.c_str(), effective_ids.c_str(),
                 plan.coverage_before.strict_full ? 1 : 0,
@@ -772,8 +915,11 @@ void SessionManager::refresh_confirmed_blockers_(
                 plan.coverage_after.strict_full ? 1 : 0,
                 plan.coverage_after.edge_residual_full ? 1 : 0,
                 plan.coverage_after.full ? 1 : 0,
+                plan.coverage_after.covered_ratio,
+                plan.coverage_after.residual_is_outer_boundary_only ? 1 : 0,
                 plan.coverage_after.cover_box_count,
                 added_ids.c_str(), removed_ids.c_str(), moved_ids.c_str(),
+                static_cast<int>(plan.visibility), static_cast<int>(plan.out),
                 plan.allow_occluded_transition ? 1 : 0,
                 plan.allow_revealed_transition ? 1 : 0,
                 occlusion_plan_reason(plan));
@@ -1025,7 +1171,8 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         if (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first)) {
             item.base_box = observed[it->second].box;
         }
-        item.status = ItemStatus::VISIBLE;
+        // This is only an observation projection.  Formal VISIBLE/OCCLUDED
+        // status and its proof are applied after the blocker lifecycle plan.
     }
 
     // 仅“本轮确认移动/确认入库，且在当前无手帧直接出现”的物品可成为前景遮挡物。
@@ -1040,16 +1187,19 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     std::map<int, BlockerTransitionPlan> transition_plans;
     refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
                                 &fully_occluded_ids, &transition_plans);
+    update_pending_occlusion_evidence_(transition_plans);
+    apply_visible_count_missing_evidence_(transition_plans);
 
     // OUT 判定会在本帧把 blocker 加入 pending_out_ids_。若这改变了 blocker
     // 集合，必须在删除 final_items 前重算一次，不能让已正式 OUT 的 A 继续
     // 遮挡 C，也不能把 C 直接伪造为 REVEALED。
     const std::set<int> pending_out_before_no_hand = pending_out_ids_;
     bool has_unresolved_state = has_unresolved_no_hand_state_(
-        detections, observed_ids, fully_occluded_ids);
+        detections, observed_ids, fully_occluded_ids, transition_plans);
     if (pending_out_before_no_hand != pending_out_ids_) {
         refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
                                     &fully_occluded_ids, &transition_plans);
+        update_pending_occlusion_evidence_(transition_plans);
     }
 
     const std::set<int> pending_out_before_occlusion_loss = pending_out_ids_;
@@ -1060,6 +1210,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     if (pending_out_before_occlusion_loss != pending_out_ids_) {
         refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
                                     &fully_occluded_ids, &transition_plans);
+        update_pending_occlusion_evidence_(transition_plans);
     }
 
     for (std::set<int>::const_iterator out = pending_out_ids_.begin();

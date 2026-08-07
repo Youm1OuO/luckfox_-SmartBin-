@@ -19,7 +19,63 @@ struct CoverageEvaluation {
     bool strict_full = false;
     bool edge_residual_full = false;
     bool full = false;
+    bool residual_is_outer_boundary_only = false;
+    float covered_ratio = 0.0f;
+    float uncovered_ratio = 1.0f;
     std::size_t cover_box_count = 0;
+};
+
+enum class VisibilityDecision {
+    KEEP_VISIBLE,
+    KEEP_OCCLUDED,
+    ENTER_OCCLUDED,
+    REVEAL_VISIBLE,
+    PENDING_OCCLUSION_EVIDENCE,
+    PENDING_REVEAL_OR_OUT,
+};
+
+enum class OutDisposition {
+    NORMAL_OUT_EVIDENCE,
+    HOLD_FOR_PENDING_OCCLUSION,
+    BLOCKED_BY_CONFIRMED_OCCLUSION,
+    START_AFTER_OCCLUSION_LOSS,
+    NOT_APPLICABLE,
+};
+
+// Event-driven relation graph for one no-hand transaction.  It is calculated
+// from operation-start relations plus confirmed enter/move/exit deltas; it is
+// never a per-frame intersection cache.
+struct BlockerRelationGraph {
+    std::map<int, std::set<int> > effective_by_target;
+    std::map<int, std::set<int> > added_by_target;
+    std::map<int, std::set<int> > removed_by_target;
+    std::map<int, std::set<int> > moved_by_target;
+};
+
+struct OcclusionDecisionInput {
+    ItemStatus previous_status = ItemStatus::VISIBLE;
+    OcclusionProof previous_proof;
+    CoverageEvaluation before_geometry;
+    CoverageEvaluation after_geometry;
+    bool previous_proof_valid = false;
+    bool previous_proof_unchanged = false;
+    bool relation_changed_by_confirmed_front = false;
+    bool current_confirmed_front = false;
+    bool valid_direct_observation = false;
+    bool observation_conflict = false;
+    bool target_has_independent_exit_evidence = false;
+    int prior_disappearance_missing_frames = 0;
+    std::set<int> after_witness_blocker_ids;
+};
+
+struct OcclusionDecisionResult {
+    VisibilityDecision visibility = VisibilityDecision::KEEP_VISIBLE;
+    OutDisposition out = OutDisposition::NORMAL_OUT_EVIDENCE;
+    OcclusionProof proposed_proof;
+    bool disappearance_candidate = false;
+    int matching_missing_frames = 0;
+    bool allow_occluded_transition = false;
+    bool allow_revealed_transition = false;
 };
 
 // 只存在于一次无手结算调用的 blocker 因果计划。它不写入 InventoryItem，
@@ -37,7 +93,34 @@ struct BlockerTransitionPlan {
     bool observation_conflict = false;
     bool allow_occluded_transition = false;
     bool allow_revealed_transition = false;
+    OcclusionProof before_proof;
+    OcclusionProof proposed_proof;
+    VisibilityDecision visibility = VisibilityDecision::KEEP_VISIBLE;
+    OutDisposition out = OutDisposition::NORMAL_OUT_EVIDENCE;
+    bool target_has_independent_exit_evidence = false;
+    bool disappearance_candidate = false;
+    int matching_missing_frames = 0;
+    std::set<int> disappearance_witness_ids;
+    std::map<int, BBox> disappearance_witness_boxes;
 };
+
+CoverageEvaluation evaluate_coverage_facts(
+        const BBox& target_box, const std::vector<BBox>& strict_cover_boxes,
+        const std::vector<BBox>& edge_cover_boxes, bool allow_edge_residual);
+BlockerRelationGraph build_event_driven_blocker_graph(
+        const std::map<int, InventoryItem>& operation_start,
+        const std::map<int, InventoryItem>& working,
+        const std::set<int>& confirmed_front_ids,
+        const std::set<int>& confirmed_moved_ids,
+        const std::set<int>& confirmed_out_ids);
+bool occlusion_proof_witnesses_valid(const OcclusionProof& proof,
+                                     const std::set<int>& effective_blocker_ids);
+bool front_witness_boxes_are_continuous(
+        const std::map<int, InventoryItem>& items,
+        const std::map<int, BBox>& previous_boxes,
+        const std::map<int, BBox>& current_boxes);
+OcclusionDecisionResult decide_occlusion_lifecycle(
+        const OcclusionDecisionInput& input);
 
 float ratio_difference(float a, float b);
 float box_edge_distance(const BBox& a, const BBox& b);

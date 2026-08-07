@@ -375,7 +375,9 @@ private:
     bool has_unresolved_no_hand_state_(
         const std::vector<Detection>& detections,
         const std::set<int>& observed_item_ids,
-        const std::set<int>& fully_occluded_item_ids);
+        const std::set<int>& fully_occluded_item_ids,
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans);
     // 普通 direct-missing OUT 即将达到门槛时的窄事务保护：只有另一个
     // operation-start 旧物已有真实移动证据，且本帧自己的候选框确实压在
     // 目标可靠 base_box 上，才暂缓这一轮 OUT。它不写 blocker/事件。
@@ -385,6 +387,14 @@ private:
     // 单摄像头下同类旧物品的最终可见实例结算。它只在连续无手帧中、
     // 同类可见框数量持续少于旧库存时启用；有手阶段和 D 证据链不使用它。
     void prepare_visible_count_settlement_(const std::vector<Detection>& detections);
+    // prepare_visible_count_settlement_ 只预约当前帧的 detection；缺失计数
+    // 和 pending OUT 必须等待遮挡 lifecycle plan 完成后再应用。
+    void apply_visible_count_missing_evidence_(
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans);
+    void update_pending_occlusion_evidence_(
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans);
     void clear_visible_count_settlement_(bool restore_uncommitted_outs);
     void clear_runtime_after_commit_();
 
@@ -463,6 +473,7 @@ private:
     // 这两个容器跨连续无手帧保存；手重新出现或可见数量恢复时必须撤销。
     std::map<int, int> visible_count_missing_counts_;
     std::set<int> visible_count_confirmed_out_ids_;
+    std::set<int> visible_count_continuity_reset_item_ids_;
     std::map<int, std::set<int> > visible_count_prior_survivors_by_cls_;
     // 上一张直接无手帧中各保留实例的真实框。只有框仍连续时，才能沿用
     // 对应的 survivor / OUT 缺失计数，避免一次框跳变被误当作连续缺失。
@@ -470,6 +481,13 @@ private:
     // 历史完整遮挡解释失效后，且旧 C 本轮没有自己的运行时轨迹时使用的
     // 连续缺失计数。它只存在于当前事务，不能复用 D 或可见数量计数。
     std::map<int, int> occlusion_loss_missing_counts_;
+    // 当前操作内 DISAPPEARANCE_SUPPORTED 的连续无手候选；它与普通 OUT、
+    // visible-count 和遮挡失效后的 OUT 计数相互独立。
+    std::map<int, int> pending_occlusion_missing_counts_;
+    std::map<int, std::set<int> > pending_occlusion_witness_ids_;
+    // 同一 witness 身份还必须保持可比的无手直接框；不能把前后位置明显
+    // 不连续的前景检测误拼成一份“连续消失支持”证据。
+    std::map<int, std::map<int, BBox> > pending_occlusion_witness_boxes_;
     std::vector<BBox> hand_track_;
     BBox old_hand_box_;
     bool has_old_hand_box_ = false;

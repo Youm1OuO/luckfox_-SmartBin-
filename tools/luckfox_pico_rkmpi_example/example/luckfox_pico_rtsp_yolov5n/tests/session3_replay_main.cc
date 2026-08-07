@@ -29,6 +29,8 @@ int main() {
     test_adjacent_same_class_new_item_gets_its_own_d_chain();
     test_unbound_no_hand_box_never_auto_in();
     test_moved_front_item_occludes_then_reveals();
+    test_disappearance_supported_moved_front_occludes_without_out();
+    test_disappearance_evidence_resets_when_hand_returns();
     test_edge_residual_historical_blocker_reveals_after_move();
     test_dense_three_apple_topology_reveals_edge_residual_target();
     test_occluded_target_observation_without_blocker_change_stays_occluded();

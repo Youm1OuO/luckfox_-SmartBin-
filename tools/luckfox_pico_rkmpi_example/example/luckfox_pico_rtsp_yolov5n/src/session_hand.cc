@@ -62,9 +62,13 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     visible_count_out_candidate_ids_.clear();
     visible_count_missing_counts_.clear();
     visible_count_confirmed_out_ids_.clear();
+    visible_count_continuity_reset_item_ids_.clear();
     visible_count_prior_survivors_by_cls_.clear();
     visible_count_prior_survivor_boxes_by_cls_.clear();
     occlusion_loss_missing_counts_.clear();
+    pending_occlusion_missing_counts_.clear();
+    pending_occlusion_witness_ids_.clear();
+    pending_occlusion_witness_boxes_.clear();
     hand_track_.clear();
     hand_track_.push_back(hand_box);
     old_hand_box_ = hand_box;
