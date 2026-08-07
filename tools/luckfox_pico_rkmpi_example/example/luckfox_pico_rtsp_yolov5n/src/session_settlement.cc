@@ -47,6 +47,10 @@ const char* occlusion_plan_reason(const BlockerTransitionPlan& plan) {
     const bool confirmed_front_changed = !plan.added_blocker_ids.empty() ||
         !plan.removed_blocker_ids.empty() || !plan.moved_blocker_ids.empty();
     if (plan.allow_occluded_transition) {
+        if (plan.proposed_proof.kind ==
+            OcclusionProofKind::CAUSAL_FRONT_MISSING) {
+            return "confirmed-front-missing-target";
+        }
         return "confirmed-front-covered-hidden-target";
     }
     if (plan.allow_revealed_transition) {
@@ -715,6 +719,7 @@ void SessionManager::refresh_confirmed_blockers_(
         std::set<int> effective_with_geometry;
         std::map<int, BBox> effective_geometry_boxes;
         std::set<int> current_front_witnesses;
+        std::set<int> causal_front_witnesses;
         for (std::set<int>::const_iterator blocker = effective_block_ids.begin();
              blocker != effective_block_ids.end(); ++blocker) {
             const std::map<int, InventoryItem>::const_iterator front =
@@ -732,6 +737,14 @@ void SessionManager::refresh_confirmed_blockers_(
             effective_geometry_boxes[*blocker] = front_box;
             if (confirmed_front_ids.count(*blocker)) {
                 current_front_witnesses.insert(*blocker);
+                // The formal causal proof is anchored to the operation-start
+                // location.  A target's temporary HAND estimate must not make
+                // a front event appear to overlap a different final position.
+                if (relationship_target_box.area() > 0.0f &&
+                    intersection_area(relationship_target_box, front_box) >
+                        BLOCK_OVERLAP_AREA_EPS) {
+                    causal_front_witnesses.insert(*blocker);
+                }
             }
         }
         const bool has_current_confirmed_front_cover =
@@ -742,6 +755,26 @@ void SessionManager::refresh_confirmed_blockers_(
         plan.coverage_changed_by_confirmed_front =
             !plan.added_blocker_ids.empty() || !plan.moved_blocker_ids.empty() ||
             !plan.removed_blocker_ids.empty();
+
+        // A causal proof must be backed by a front event that is already
+        // reliable enough to be formal and by a substantial overlap.  The
+        // existing disappearance ratio is deliberately reused as a
+        // conservative lower bound: unlike the old route, causal proof does
+        // not require an outer residual or a second missing frame.  A small
+        // partial front remains subject to the existing cover-union behavior.
+        std::set<int> causal_event_witnesses;
+        for (std::set<int>::const_iterator witness =
+                 causal_front_witnesses.begin();
+             witness != causal_front_witnesses.end(); ++witness) {
+            if (plan.coverage_after.covered_ratio <
+                    FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO) {
+                continue;
+            }
+            if (confirmed_moved_ids_.count(*witness) ||
+                pending_in_ids_.count(*witness)) {
+                causal_event_witnesses.insert(*witness);
+            }
+        }
 
         const OperationTrack* target_runtime = find_runtime_for_item_(target_id);
         const bool target_observed = observed_working_ids.count(target_id) > 0;
@@ -791,8 +824,19 @@ void SessionManager::refresh_confirmed_blockers_(
         }
         plan.target_has_independent_exit_evidence =
             confirmed_moved_ids_.count(target_id) > 0;
+        // Keep the pre-existing broader hand/path clue for the legacy
+        // disappearance-supported route, but do not let it veto a causal
+        // front-missing proof.  The latter needs an actual target-side final
+        // conclusion, not merely HAND_* or POSSIBLE_MOVED evidence.
+        plan.target_has_confirmed_independent_exit =
+            confirmed_moved_ids_.count(target_id) > 0 ||
+            pending_out_ids_.count(target_id) > 0;
         if (target_runtime && !target_runtime->is_suspect_new &&
             !target_observation_conflict) {
+            plan.target_has_confirmed_independent_exit =
+                plan.target_has_confirmed_independent_exit ||
+                target_runtime->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
+                target_runtime->resolution == ExistingItemResolution::OUT_CONFIRMED;
             const bool contact_exit =
                 target_runtime->contact_state == ContactState::CONTACT_MOVING &&
                 target_runtime->hold_and_move &&
@@ -804,6 +848,24 @@ void SessionManager::refresh_confirmed_blockers_(
             plan.target_has_independent_exit_evidence =
                 plan.target_has_independent_exit_evidence || contact_exit || hand_exit;
         }
+
+        // Keep the established two-frame disappearance proof when it is
+        // already sufficient.  The causal route is needed when that legacy
+        // geometry is insufficient, or when HAND/POSSIBLE_MOVED evidence would
+        // otherwise veto the otherwise valid front-missing explanation.
+        const bool legacy_disappearance_geometry =
+            !plan.coverage_after.full &&
+            plan.coverage_after.covered_ratio >=
+                FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO &&
+            plan.coverage_after.residual_is_outer_boundary_only;
+        const bool causal_route_needed = !legacy_disappearance_geometry ||
+            (plan.target_has_independent_exit_evidence &&
+             !plan.target_has_confirmed_independent_exit);
+        plan.causal_front_missing_candidate =
+            causal_route_needed && original->second.status == ItemStatus::VISIBLE &&
+            !plan.valid_target_observed && !plan.observation_conflict &&
+            !plan.target_has_confirmed_independent_exit &&
+            causal_event_witnesses.size() == 1;
 
         plan.valid_target_observed = target_observed && !lifecycle_observation_conflict;
         const bool previous_proof_valid =
@@ -865,8 +927,13 @@ void SessionManager::refresh_confirmed_blockers_(
         decision_input.observation_conflict = plan.observation_conflict;
         decision_input.target_has_independent_exit_evidence =
             plan.target_has_independent_exit_evidence;
+        decision_input.target_has_confirmed_independent_exit =
+            plan.target_has_confirmed_independent_exit;
+        decision_input.causal_front_missing_candidate =
+            plan.causal_front_missing_candidate;
         decision_input.prior_disappearance_missing_frames = prior_disappearance_count;
         decision_input.after_witness_blocker_ids = effective_with_geometry;
+        decision_input.causal_witness_blocker_ids = causal_event_witnesses;
         const OcclusionDecisionResult decision =
             decide_occlusion_lifecycle(decision_input);
 
@@ -876,6 +943,8 @@ void SessionManager::refresh_confirmed_blockers_(
         plan.allow_occluded_transition = decision.allow_occluded_transition;
         plan.allow_revealed_transition = decision.allow_revealed_transition;
         plan.disappearance_candidate = decision.disappearance_candidate;
+        plan.causal_front_missing_candidate =
+            decision.causal_front_missing_candidate;
         plan.matching_missing_frames = decision.matching_missing_frames;
         // DISAPPEARANCE_SUPPORTED 最终 proof 声明所有参与当前覆盖的正式
         // blocker，因此连续性也必须跟踪同一组 witness，不能只记录新增 front。

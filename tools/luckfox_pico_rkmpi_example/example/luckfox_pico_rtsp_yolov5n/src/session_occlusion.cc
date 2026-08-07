@@ -286,6 +286,11 @@ OcclusionDecisionResult decide_occlusion_lifecycle(
     const bool after_full = input.after_geometry.full;
     const bool new_front_cover = input.relation_changed_by_confirmed_front &&
         input.current_confirmed_front;
+    const bool causal_front_missing = input.causal_front_missing_candidate &&
+        new_front_cover && !input.valid_direct_observation &&
+        !input.observation_conflict &&
+        !input.target_has_confirmed_independent_exit &&
+        !input.causal_witness_blocker_ids.empty();
 
     // A target with a legal direct observation is never promoted to a new
     // occlusion in this transaction.  Existing OCCLUDED status is handled
@@ -318,6 +323,22 @@ OcclusionDecisionResult decide_occlusion_lifecycle(
             result.proposed_proof = make_proof(
                 OcclusionProofKind::EDGE_RESIDUAL_UNION,
                 input.after_witness_blocker_ids);
+            return result;
+        }
+
+        // A confirmed front event can explain a target disappearing even when
+        // a detector-visible edge remains outside the strict/edge geometry
+        // proof.  This route is deliberately downstream of the geometric
+        // proofs and requires a separate causal witness set, so arbitrary
+        // frame-to-frame overlap cannot manufacture OCCLUDED.
+        if (causal_front_missing) {
+            result.visibility = VisibilityDecision::ENTER_OCCLUDED;
+            result.out = OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION;
+            result.allow_occluded_transition = true;
+            result.causal_front_missing_candidate = true;
+            result.proposed_proof = make_proof(
+                OcclusionProofKind::CAUSAL_FRONT_MISSING,
+                input.causal_witness_blocker_ids);
             return result;
         }
 

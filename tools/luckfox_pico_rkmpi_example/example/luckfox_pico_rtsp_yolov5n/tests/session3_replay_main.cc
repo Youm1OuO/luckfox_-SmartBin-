@@ -30,12 +30,14 @@ int main() {
     test_unbound_no_hand_box_never_auto_in();
     test_identity_ambiguity_holds_visible_target_without_out_evidence();
     test_identity_ambiguity_does_not_block_confirmed_full_occlusion();
+    test_confirmed_target_exit_blocks_causal_front_missing();
     test_confirmed_moved_orange_occludes_reserved_same_class_apple();
     test_moved_target_drops_stale_historical_blocker();
     test_inventory_rejects_invalid_formal_occlusion_proof();
     test_pending_out_candidates_converge_monotonically();
     test_moved_front_item_occludes_then_reveals();
     test_disappearance_supported_moved_front_occludes_without_out();
+    test_causal_front_missing_releases_hand_target_without_out();
     test_disappearance_evidence_resets_when_hand_returns();
     test_edge_residual_historical_blocker_reveals_after_move();
     test_dense_three_apple_topology_reveals_edge_residual_target();

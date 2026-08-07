@@ -64,8 +64,13 @@ struct OcclusionDecisionInput {
     bool valid_direct_observation = false;
     bool observation_conflict = false;
     bool target_has_independent_exit_evidence = false;
+    // Narrow, confirmed target-side conclusion used by the causal route.
+    // HAND/POSSIBLE_MOVED clues deliberately do not set this flag.
+    bool target_has_confirmed_independent_exit = false;
+    bool causal_front_missing_candidate = false;
     int prior_disappearance_missing_frames = 0;
     std::set<int> after_witness_blocker_ids;
+    std::set<int> causal_witness_blocker_ids;
 };
 
 struct OcclusionDecisionResult {
@@ -73,6 +78,7 @@ struct OcclusionDecisionResult {
     OutDisposition out = OutDisposition::NORMAL_OUT_EVIDENCE;
     OcclusionProof proposed_proof;
     bool disappearance_candidate = false;
+    bool causal_front_missing_candidate = false;
     int matching_missing_frames = 0;
     bool allow_occluded_transition = false;
     bool allow_revealed_transition = false;
@@ -98,6 +104,8 @@ struct BlockerTransitionPlan {
     VisibilityDecision visibility = VisibilityDecision::KEEP_VISIBLE;
     OutDisposition out = OutDisposition::NORMAL_OUT_EVIDENCE;
     bool target_has_independent_exit_evidence = false;
+    bool target_has_confirmed_independent_exit = false;
+    bool causal_front_missing_candidate = false;
     bool disappearance_candidate = false;
     int matching_missing_frames = 0;
     std::set<int> disappearance_witness_ids;

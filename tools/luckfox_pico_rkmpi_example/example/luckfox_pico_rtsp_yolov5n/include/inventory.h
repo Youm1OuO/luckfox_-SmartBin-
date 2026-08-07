@@ -35,6 +35,10 @@ enum class OcclusionProofKind {
     STRICT_UNION,
     EDGE_RESIDUAL_UNION,
     DISAPPEARANCE_SUPPORTED,
+    // A confirmed IN/MOVED front item overlaps the target's reliable old
+    // position and explains why the target has no legal direct observation.
+    // This is causal evidence, not a claim that rectangle difference is zero.
+    CAUSAL_FRONT_MISSING,
 };
 
 struct OcclusionProof {

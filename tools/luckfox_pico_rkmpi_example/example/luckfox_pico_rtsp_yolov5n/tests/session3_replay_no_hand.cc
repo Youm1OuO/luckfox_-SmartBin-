@@ -96,6 +96,28 @@ void test_identity_ambiguity_does_not_block_confirmed_full_occlusion() {
     assert(result.proposed_proof.witness_blocker_ids.count(5));
 }
 
+// A target with its own confirmed exit conclusion must be settled by that
+// conclusion; a moved/IN front witness cannot relabel it as causal occlusion.
+void test_confirmed_target_exit_blocks_causal_front_missing() {
+    fridge::session_internal::OcclusionDecisionInput input;
+    input.previous_status = fridge::ItemStatus::VISIBLE;
+    input.relation_changed_by_confirmed_front = true;
+    input.current_confirmed_front = true;
+    input.after_geometry.covered_ratio = 0.90f;
+    input.after_geometry.residual_is_outer_boundary_only = true;
+    input.target_has_independent_exit_evidence = true;
+    input.target_has_confirmed_independent_exit = true;
+    input.causal_front_missing_candidate = true;
+    input.causal_witness_blocker_ids.insert(7);
+
+    const fridge::session_internal::OcclusionDecisionResult result =
+        fridge::session_internal::decide_occlusion_lifecycle(input);
+    assert(result.visibility == fridge::session_internal::VisibilityDecision::KEEP_VISIBLE);
+    assert(result.out == fridge::session_internal::OutDisposition::NORMAL_OUT_EVIDENCE);
+    assert(!result.allow_occluded_transition);
+    assert(!result.causal_front_missing_candidate);
+}
+
 // 实机回放：三个同类苹果各有自己的静态 owner，橙子 #5 从左侧移到右上角
 // 并完整覆盖苹果 #1。#1 的同类候选路径会被更强 owner reservation 排除，
 // 但这不能阻止已确认的橙子前景提交正式 OCCLUDED。
@@ -409,6 +431,73 @@ void test_disappearance_supported_moved_front_occludes_without_out() {
     assert(!has_event(result, fridge::EventKind::OUT, 2));
     assert_event_before(result, fridge::EventKind::MOVED, 1,
                         fridge::EventKind::OCCLUDED, 2);
+}
+
+// The target is HAND_FULL/POSSIBLE_MOVED during the same operation, but never
+// gets a unique endpoint.  A confirmed moved front covers 89% of its old box;
+// the 11px top residual intentionally fails the existing 8px edge proof.  The
+// causal front-missing proof must still settle the target without OUT.
+void test_causal_front_missing_releases_hand_target_without_out() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // moved front
+    initial.push_back(item(2, 2, 300, 100, 400, 200));  // hand-affected target
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)),
+               &frame);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 170, 100, 270, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(150, 80, 250, 220)),
+               &frame);
+    send_frame(&session,
+               std::vector<fridge::Detection>(1, det(0, 240, 105, 340, 205)),
+               std::vector<fridge::BBox>(1, fridge::BBox(220, 80, 340, 240)),
+               &frame);
+
+    const fridge::BBox final_front(300, 111, 400, 211);
+    // The hand fully covers the target's old box in the last HAND frame while
+    // the front object's own endpoint remains directly observable.
+    send_frame(&session,
+               std::vector<fridge::Detection>(1,
+                   det(0, final_front.x1, final_front.y1,
+                       final_front.x2, final_front.y2)),
+               std::vector<fridge::BBox>(1, fridge::BBox(270, 70, 430, 240)),
+               &frame);
+
+    const fridge::SettlementResult result = settle_after_hand(
+        &session,
+        std::vector<fridge::Detection>(1,
+            det(0, final_front.x1, final_front.y1,
+                final_front.x2, final_front.y2)),
+        &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 2);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(has_event(result, fridge::EventKind::OCCLUDED, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+    assert_event_before(result, fridge::EventKind::MOVED, 1,
+                        fridge::EventKind::OCCLUDED, 2);
+
+    const fridge::InventoryItem* target = session.inventory().find_by_item(2);
+    assert(target != 0);
+    assert(target->status == fridge::ItemStatus::OCCLUDED);
+    assert(target->block_ids.size() == 1);
+    assert(target->block_ids.count(1));
+    assert(target->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::CAUSAL_FRONT_MISSING);
+    assert(target->occlusion_proof.witness_blocker_ids.size() == 1);
+    assert(target->occlusion_proof.witness_blocker_ids.count(1));
+    assert(target->base_box.x1 == 300.0f && target->base_box.y1 == 100.0f &&
+           target->base_box.x2 == 400.0f && target->base_box.y2 == 200.0f);
 }
 
 // DISAPPEARANCE_SUPPORTED 需要连续无手帧。中间重新出现手时，前后两段
