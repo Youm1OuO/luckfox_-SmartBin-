@@ -68,6 +68,121 @@ void test_identity_ambiguity_holds_visible_target_without_out_evidence() {
     assert(!result.disappearance_candidate);
 }
 
+// 同类 owner reservation 只阻止候选框归属，不会推翻已确认前景给出的
+// strict/edge-residual 完整遮挡证明。该证明必须直接提交 OCCLUDED。
+void test_identity_ambiguity_does_not_block_confirmed_full_occlusion() {
+    fridge::session_internal::OcclusionDecisionInput input;
+    input.previous_status = fridge::ItemStatus::VISIBLE;
+    input.observation_conflict = true;
+    input.relation_changed_by_confirmed_front = true;
+    input.current_confirmed_front = true;
+    input.after_geometry.strict_full = false;
+    input.after_geometry.edge_residual_full = true;
+    input.after_geometry.full = true;
+    input.after_geometry.covered_ratio = 0.956f;
+    input.after_geometry.residual_is_outer_boundary_only = true;
+    input.after_witness_blocker_ids.insert(5);
+
+    const fridge::session_internal::OcclusionDecisionResult result =
+        fridge::session_internal::decide_occlusion_lifecycle(input);
+    assert(result.visibility ==
+           fridge::session_internal::VisibilityDecision::ENTER_OCCLUDED);
+    assert(result.out ==
+           fridge::session_internal::OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION);
+    assert(result.allow_occluded_transition);
+    assert(result.proposed_proof.kind ==
+           fridge::OcclusionProofKind::EDGE_RESIDUAL_UNION);
+    assert(result.proposed_proof.witness_blocker_ids.size() == 1);
+    assert(result.proposed_proof.witness_blocker_ids.count(5));
+}
+
+// 实机回放：三个同类苹果各有自己的静态 owner，橙子 #5 从左侧移到右上角
+// 并完整覆盖苹果 #1。#1 的同类候选路径会被更强 owner reservation 排除，
+// 但这不能阻止已确认的橙子前景提交正式 OCCLUDED。
+void test_confirmed_moved_orange_occludes_reserved_same_class_apple() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 878, 245, 1060, 427));  // upper-right apple
+    initial.push_back(item(2, 0, 803, 387, 989, 565));   // lower apple
+    initial.push_back(item(3, 0, 727, 247, 901, 423));   // upper-left apple
+    initial.push_back(item(4, 25, 96, 332, 374, 580));   // soda can
+    initial.push_back(item(5, 2, 461, 270, 656, 461));   // orange
+    session.init_from_backend(initial, true);
+    int frame = 1;
+
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(25, 96, 332, 374, 583));
+    stable.push_back(det(0, 878, 245, 1058, 423));
+    stable.push_back(det(0, 805, 387, 987, 565));
+    stable.push_back(det(0, 727, 247, 901, 421));
+    stable.push_back(det(2, 460, 272, 654, 465));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(301, 354, 641, 716)),
+               &frame);
+
+    std::vector<fridge::Detection> hand_middle;
+    hand_middle.push_back(det(0, 805, 387, 989, 565));
+    hand_middle.push_back(det(0, 880, 245, 1058, 425));
+    hand_middle.push_back(det(0, 729, 245, 901, 421));
+    hand_middle.push_back(det(25, 103, 330, 372, 580));
+    hand_middle.push_back(det(2, 505, 272, 654, 465));
+    send_frame(&session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(349, 261, 701, 710)),
+               &frame);
+    send_frame(&session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(341, 243, 678, 650)),
+               &frame);
+
+    std::vector<fridge::Detection> hand_late;
+    hand_late.push_back(det(0, 900, 249, 1058, 423));
+    hand_late.push_back(det(2, 783, 220, 950, 421));
+    hand_late.push_back(det(25, 101, 334, 372, 578));
+    hand_late.push_back(det(0, 798, 385, 990, 567));
+    send_frame(&session, hand_late,
+               std::vector<fridge::BBox>(1, fridge::BBox(456, 154, 958, 634)),
+               &frame);
+
+    std::vector<fridge::Detection> hand_near;
+    hand_near.push_back(det(25, 96, 332, 380, 580));
+    hand_near.push_back(det(2, 945, 260, 1050, 445));
+    hand_near.push_back(det(0, 725, 254, 841, 369, 0.308f));
+    send_frame(&session, hand_near,
+               std::vector<fridge::BBox>(1, fridge::BBox(621, 190, 1036, 621)),
+               &frame);
+
+    std::vector<fridge::Detection> hand_end;
+    hand_end.push_back(det(2, 940, 245, 1047, 434));
+    hand_end.push_back(det(25, 98, 332, 374, 574));
+    send_frame(&session, hand_end,
+               std::vector<fridge::BBox>(1, fridge::BBox(614, 170, 1045, 610)),
+               &frame);
+
+    std::vector<fridge::Detection> final_no_hand;
+    final_no_hand.push_back(det(0, 801, 394, 989, 565));
+    final_no_hand.push_back(det(0, 727, 247, 887, 425));
+    final_no_hand.push_back(det(25, 96, 336, 376, 578));
+    final_no_hand.push_back(det(2, 823, 234, 1052, 450));
+    const fridge::SettlementResult result = settle_after_hand(
+        &session, final_no_hand, &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 5);
+    assert(has_event(result, fridge::EventKind::MOVED, 5));
+    assert(has_event(result, fridge::EventKind::OCCLUDED, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert_event_before(result, fridge::EventKind::MOVED, 5,
+                        fridge::EventKind::OCCLUDED, 1);
+    const fridge::InventoryItem* hidden = session.inventory().find_by_item(1);
+    assert(hidden != 0);
+    assert(hidden->status == fridge::ItemStatus::OCCLUDED);
+    assert(hidden->block_ids.count(5));
+    assert(hidden->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::EDGE_RESIDUAL_UNION);
+}
+
 // A 移到新位置时，A 在旧位置曾被 B 遮挡这一历史关系不能自动迁移到
 // 新位置。二维重叠本身不提供 B 仍在 A 前方的深度证据。
 void test_moved_target_drops_stale_historical_blocker() {

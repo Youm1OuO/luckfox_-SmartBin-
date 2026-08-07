@@ -1436,9 +1436,15 @@ bool SessionManager::has_unresolved_no_hand_state_(
             continue;
         }
 
-        if (is_claim_protected(track) || track.b_claim_ambiguous ||
-            track.contact_path_ambiguous || track.no_hand_candidate_ambiguous ||
-            track.no_hand_candidate_reserved_by_stronger_owner) {
+        // Once the blocker lifecycle has produced a formal full-coverage
+        // result for this target, same-class reservation ambiguity no longer
+        // represents unresolved OUT evidence.  It only affected which visible
+        // box could belong to the target; the confirmed front blocker already
+        // owns the causal OCCLUDED proof for this transaction.
+        if (!fully_occluded_item_ids.count(track.item_id) &&
+            (is_claim_protected(track) || track.b_claim_ambiguous ||
+             track.contact_path_ambiguous || track.no_hand_candidate_ambiguous ||
+             track.no_hand_candidate_reserved_by_stronger_owner)) {
             unresolved = true;
             trace_track_("NO-HAND", track,
                          track.no_hand_candidate_ambiguous
@@ -1448,7 +1454,8 @@ bool SessionManager::has_unresolved_no_hand_state_(
                                  : "claim-or-contact-ambiguity"));
             continue;
         }
-        if (old_track_has_unresolved_alias_(track)) {
+        if (!fully_occluded_item_ids.count(track.item_id) &&
+            old_track_has_unresolved_alias_(track)) {
             unresolved = true;
             trace_track_("C-D-ALIAS", track,
                          "old-c-awaits-quarantined-pending-d-no-hand-arbitration");

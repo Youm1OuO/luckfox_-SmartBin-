@@ -50,6 +50,8 @@ void test_ambiguous_hand_partial_box_does_not_create_d();
 void test_adjacent_same_class_new_item_gets_its_own_d_chain();
 void test_unbound_no_hand_box_never_auto_in();
 void test_identity_ambiguity_holds_visible_target_without_out_evidence();
+void test_identity_ambiguity_does_not_block_confirmed_full_occlusion();
+void test_confirmed_moved_orange_occludes_reserved_same_class_apple();
 void test_moved_target_drops_stale_historical_blocker();
 void test_inventory_rejects_invalid_formal_occlusion_proof();
 void test_pending_out_candidates_converge_monotonically();

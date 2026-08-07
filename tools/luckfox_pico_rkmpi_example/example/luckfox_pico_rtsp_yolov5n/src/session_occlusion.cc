@@ -297,14 +297,11 @@ OcclusionDecisionResult decide_occlusion_lifecycle(
             result.out = OutDisposition::NOT_APPLICABLE;
             return result;
         }
-        if (input.observation_conflict) {
-            // Ambiguity is neither disappearance nor direct observation.
-            // It must stop both disappearance and ordinary OUT evidence so
-            // a later clear frame cannot be stitched onto this frame.
-            result.visibility = VisibilityDecision::PENDING_OCCLUSION_EVIDENCE;
-            result.out = OutDisposition::HOLD_FOR_PENDING_OCCLUSION;
-            return result;
-        }
+        // A confirmed front item with a strict/edge-residual full-coverage
+        // proof has direct causal evidence for OCCLUDED.  An identity
+        // reservation on a same-class candidate only says that this target
+        // cannot claim that candidate; it does not invalidate this already
+        // established geometric proof.
         if (new_front_cover && after_strict) {
             result.visibility = VisibilityDecision::ENTER_OCCLUDED;
             result.out = OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION;
@@ -321,6 +318,16 @@ OcclusionDecisionResult decide_occlusion_lifecycle(
             result.proposed_proof = make_proof(
                 OcclusionProofKind::EDGE_RESIDUAL_UNION,
                 input.after_witness_blocker_ids);
+            return result;
+        }
+
+        if (input.observation_conflict) {
+            // Ambiguity is neither disappearance nor direct observation.
+            // It must stop both disappearance and ordinary OUT evidence so
+            // a later clear frame cannot be stitched onto this frame.  The
+            // formal full-coverage cases above are the intentional exception.
+            result.visibility = VisibilityDecision::PENDING_OCCLUSION_EVIDENCE;
+            result.out = OutDisposition::HOLD_FOR_PENDING_OCCLUSION;
             return result;
         }
 
