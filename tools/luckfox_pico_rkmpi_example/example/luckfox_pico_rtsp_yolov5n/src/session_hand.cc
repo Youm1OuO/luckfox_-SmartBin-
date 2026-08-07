@@ -57,6 +57,7 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     pending_out_ids_.clear();
     confirmed_moved_ids_.clear();
     released_hand_candidate_ids_.clear();
+    pending_front_evidence_by_target_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
     visible_count_out_candidate_ids_.clear();
@@ -79,6 +80,62 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
            working_inventory_.size(), detections.size(), hand_box.x1, hand_box.y1,
            hand_box.x2, hand_box.y2);
     process_effective_hand_frame_(hand_box, detections, true);
+}
+
+void SessionManager::record_pending_front_evidence_(
+        int target_item_id, int candidate_front_runtime_key,
+        int candidate_front_item_id, const BBox& hand_box,
+        const BBox& front_box, bool front_alone_covers_target) {
+    if (target_item_id <= 0 || candidate_front_runtime_key == 0 ||
+        candidate_front_item_id <= 0 || hand_box.area() <= 0.0f ||
+        front_box.area() <= 0.0f) {
+        return;
+    }
+    PendingFrontEvidence evidence;
+    evidence.candidate_front_runtime_key = candidate_front_runtime_key;
+    evidence.candidate_front_item_id = candidate_front_item_id;
+    evidence.hand_box = hand_box;
+    evidence.front_box = front_box;
+    evidence.hand_and_front_cover_target = true;
+    evidence.front_alone_covers_target = front_alone_covers_target;
+    evidence.frame_id = trace_frame_id_;
+    pending_front_evidence_by_target_[target_item_id] = evidence;
+    trace_("PENDING-FRONT",
+           "target=%d candidate-runtime=%d candidate-item=%d frame=%d "
+           "hand-plus-front=1 front-alone=%d action=record-provisional-evidence",
+           target_item_id, candidate_front_runtime_key, candidate_front_item_id,
+           evidence.frame_id, front_alone_covers_target ? 1 : 0);
+}
+
+void SessionManager::clear_pending_front_evidence_for_target_(
+        int target_item_id, const char* reason) {
+    std::map<int, PendingFrontEvidence>::iterator evidence =
+        pending_front_evidence_by_target_.find(target_item_id);
+    if (evidence == pending_front_evidence_by_target_.end()) return;
+    trace_("PENDING-FRONT",
+           "target=%d candidate-runtime=%d candidate-item=%d action=clear reason=%s",
+           target_item_id, evidence->second.candidate_front_runtime_key,
+           evidence->second.candidate_front_item_id,
+           reason ? reason : "unknown");
+    pending_front_evidence_by_target_.erase(evidence);
+}
+
+void SessionManager::clear_pending_front_evidence_for_suspect_(
+        int runtime_key, const char* reason) {
+    for (std::map<int, PendingFrontEvidence>::iterator evidence =
+             pending_front_evidence_by_target_.begin();
+         evidence != pending_front_evidence_by_target_.end();) {
+        if (evidence->second.candidate_front_runtime_key != runtime_key) {
+            ++evidence;
+            continue;
+        }
+        trace_("PENDING-FRONT",
+               "target=%d candidate-runtime=%d candidate-item=%d action=clear reason=%s",
+               evidence->first, evidence->second.candidate_front_runtime_key,
+               evidence->second.candidate_front_item_id,
+               reason ? reason : "unknown");
+        evidence = pending_front_evidence_by_target_.erase(evidence);
+    }
 }
 
 void SessionManager::link_suspect_to_conflicting_old_items_(
@@ -105,6 +162,8 @@ void SessionManager::link_suspect_to_conflicting_old_items_(
     if (valid_old_item_ids.empty()) return;
 
     OperationTrack& d = suspect->second;
+    clear_pending_front_evidence_for_suspect_(
+        runtime_key, "suspect-downgraded-to-c-d-alias");
     // 某个旧 C 的可行路径可能在 D 连续自匹配后才显露。此时 D 虽然已经
     // 暂存进 working_inventory_，仍只是未提交候选；必须回收该 staged item
     // 并降回 C-D alias，不能让一个“不认识 A”的 pending D 保留排他资格、
@@ -484,8 +543,10 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     item->second.base_box = release_box;
     item->second.score = score;
     item->second.updated_frame = frame_id;
-    item->second.status = ItemStatus::VISIBLE;
-    item->second.block_ids.clear();
+    // 可见性、block_ids 与 proof 仍由无手 lifecycle plan 决定。这里仅记录
+    // 已确认的本次移动终点，不能把旧位置的正式遮挡关系就地清掉。
+    clear_pending_front_evidence_for_target_(
+        track.item_id, "target-confirmed-moved");
     track.placed_box = release_box;
     track.has_placed_box = true;
     track.drop_confirmed = true;
@@ -530,8 +591,8 @@ void SessionManager::rollback_provisional_moved_to_direct_original_(
     if (item == working_inventory_.end()) return;
     update_seen(item->second, detection, trace_frame_id_);
     item->second.base_box = detection.box;
-    item->second.status = ItemStatus::VISIBLE;
-    item->second.block_ids.clear();
+    clear_pending_front_evidence_for_target_(
+        track->item_id, "target-returned-to-direct-original");
 
     confirmed_moved_ids_.erase(track->item_id);
     pending_out_ids_.erase(track->item_id);
@@ -573,19 +634,23 @@ void SessionManager::release_not_held_(OperationTrack& track, bool occluded,
          reason == ReleaseReason::CONTACT_RETURNED_ORIGINAL);
     const BBox reopen_anchor = track.has_last_seen_box
         ? track.last_seen_box : track.original_box;
-    if (track.item_id > 0) {
-        std::map<int, InventoryItem>::iterator item = working_inventory_.find(track.item_id);
-        if (item != working_inventory_.end()) item->second.status =
-            occluded ? ItemStatus::OCCLUDED : ItemStatus::VISIBLE;
-        released_hand_candidate_ids_.insert(track.item_id);
+    if (track.item_id > 0 &&
+        (reason == ReleaseReason::ORIGINAL_DETECTION ||
+         reason == ReleaseReason::CONTACT_RETURNED_ORIGINAL ||
+         reason == ReleaseReason::STABLE_NEAR_ORIGINAL_NO_HAND)) {
+        clear_pending_front_evidence_for_target_(
+            track.item_id, "target-regained-direct-original-observation");
     }
+    if (track.item_id > 0) released_hand_candidate_ids_.insert(track.item_id);
     track.state = OperationTrackState::NORMAL;
     track.contact_state = ContactState::NONE;
     track.release_reason = reason;
-    track.resolution = reason == ReleaseReason::FULLY_OCCLUDED
-        ? ExistingItemResolution::OCCLUDED_CONFIRMED
-        : ExistingItemResolution::STATIC_CONFIRMED;
-    track.needs_no_hand_settlement = keep_reopen_anchor;
+    // HAND 的“完全遮住”只是一条临时证据，不能让运行时绕过无手的 identity
+    // 与 blocker/proof 生命周期。保留结算义务，正式 OCCLUDED 只在 no-hand
+    // plan 中写入 final_items。
+    track.resolution = ExistingItemResolution::STATIC_CONFIRMED;
+    track.needs_no_hand_settlement = keep_reopen_anchor || occluded ||
+        reason == ReleaseReason::FULLY_OCCLUDED;
     track.stable_near_original_no_hand_count = 0;
     track.has_stable_near_original_box = false;
     track.stable_near_original_box = BBox();
@@ -1860,6 +1925,8 @@ void SessionManager::mark_newly_hand_blocked_items_(
             }
         }
         // 已经放下过又再次被手接触时，覆盖旧运行时记录即可。
+        clear_pending_front_evidence_for_target_(
+            item.item_id, "target-retouched-by-hand");
         for (std::map<int, OperationTrack>::iterator rt = track_buffer_.begin();
              rt != track_buffer_.end();) {
             if (rt->second.item_id == item.item_id) {
@@ -1927,18 +1994,10 @@ void SessionManager::apply_suspect_cover_evidence_(
             // 尚未连续确认并放下的 D 只是“可能挡住 C”的解释，不能改变 C
             // 的 hold/not-hold 计数；否则一次误检又会把 C 提前释放。
             if (!d.promoted_to_working_inventory || !d.drop_confirmed) continue;
+            record_pending_front_evidence_(
+                c.item_id, dit->first, d.item_id, hand_box, d_box, d_covers_c);
             c.hold_evidence_count = 0;
             ++c.not_hold_evidence_count;
-            if (d_covers_c) {
-                std::map<int, InventoryItem>::iterator item = working_inventory_.find(c.item_id);
-                if (item != working_inventory_.end()) {
-                    item->second.status = ItemStatus::OCCLUDED;
-                    item->second.block_ids.insert(d.item_id);
-                }
-                release_not_held_(c, true, ReleaseReason::FULLY_OCCLUDED,
-                                  -1, nullptr,
-                                  "hand-confirmed-full-occlusion");
-            }
         }
     }
 }

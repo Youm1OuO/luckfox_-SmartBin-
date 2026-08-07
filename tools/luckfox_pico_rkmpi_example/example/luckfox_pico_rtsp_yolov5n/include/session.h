@@ -238,6 +238,19 @@ struct OperationTrack {
     bool no_hand_candidate_reserved_by_stronger_owner = false;
 };
 
+// HAND 期“手 + 已提升 D 可能遮住旧 C”的临时几何证据。它不属于库存关系图，
+// 也不能直接改变 status/block_ids/proof；只有无手阶段完成 D 的直接身份确认后，
+// blocker lifecycle 才能把相同事实写成正式状态。
+struct PendingFrontEvidence {
+    int candidate_front_runtime_key = 0;
+    int candidate_front_item_id = -1;
+    BBox hand_box;
+    BBox front_box;
+    bool hand_and_front_cover_target = false;
+    bool front_alone_covers_target = false;
+    int frame_id = -1;
+};
+
 // 一张有手帧中，operation-start 旧 C 对检测框的直接原位归属计划。它仅描述
 // 本帧事实，不写 claimed、working_inventory 或任何证据计数；调用方在路径
 // 匹配、D 扫描前依据该计划排除别的 C/D 对同一框的借用。
@@ -363,6 +376,16 @@ private:
     void apply_suspect_cover_evidence_(const BBox& hand_box,
                                        const std::vector<Detection>& detections,
                                        bool hand_moved);
+    void record_pending_front_evidence_(int target_item_id,
+                                        int candidate_front_runtime_key,
+                                        int candidate_front_item_id,
+                                        const BBox& hand_box,
+                                        const BBox& front_box,
+                                        bool front_alone_covers_target);
+    void clear_pending_front_evidence_for_target_(int target_item_id,
+                                                  const char* reason);
+    void clear_pending_front_evidence_for_suspect_(int runtime_key,
+                                                   const char* reason);
     void advance_claim_grace_(const std::set<int>& new_existing_track_ids);
 
     // 手离开后的收尾与提交
@@ -393,6 +416,11 @@ private:
         const std::map<int, session_internal::BlockerTransitionPlan>&
             transition_plans);
     void update_pending_occlusion_evidence_(
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans);
+    // 只撤回当前操作中已不符合最终 lifecycle plan 的 OUT 候选；不推进任何
+    // 帧计数，因此可在同一帧的单调固定点循环中安全重复调用。
+    bool reconcile_pending_out_with_occlusion_plan_(
         const std::map<int, session_internal::BlockerTransitionPlan>&
             transition_plans);
     void clear_visible_count_settlement_(bool restore_uncommitted_outs);
@@ -461,6 +489,9 @@ private:
     std::set<int> pending_out_ids_;
     std::set<int> confirmed_moved_ids_;
     std::set<int> released_hand_candidate_ids_;
+    // key 为被遮挡旧 C 的正式 item_id；仅用于 HAND 期可追溯证据，不参与
+    // formal blocker graph 的写入。
+    std::map<int, PendingFrontEvidence> pending_front_evidence_by_target_;
     // 当前无手帧的身份计划：key 为旧 item_id，value 为本帧仅在该旧物
     // 原位仲裁中暂时排除的跨类别低分重复 detection index。它不跨帧、
     // 不写入 InventoryItem，也不影响 OSD/原始 detection。

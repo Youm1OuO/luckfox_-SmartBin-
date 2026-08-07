@@ -48,6 +48,136 @@ void test_unbound_no_hand_box_never_auto_in() {
     assert(!has_event(result, fridge::EventKind::IN, 2));
 }
 
+// 身份归属不唯一和“目标没有检测框”是两件不同的事。前者必须中断
+// disappearance / OUT 证据，而不能被当作无歧义的消失。
+void test_identity_ambiguity_holds_visible_target_without_out_evidence() {
+    fridge::session_internal::OcclusionDecisionInput input;
+    input.previous_status = fridge::ItemStatus::VISIBLE;
+    input.observation_conflict = true;
+    input.after_geometry.covered_ratio = 0.95f;
+    input.after_geometry.residual_is_outer_boundary_only = true;
+    input.relation_changed_by_confirmed_front = true;
+    input.current_confirmed_front = true;
+
+    const fridge::session_internal::OcclusionDecisionResult result =
+        fridge::session_internal::decide_occlusion_lifecycle(input);
+    assert(result.visibility ==
+           fridge::session_internal::VisibilityDecision::PENDING_OCCLUSION_EVIDENCE);
+    assert(result.out ==
+           fridge::session_internal::OutDisposition::HOLD_FOR_PENDING_OCCLUSION);
+    assert(!result.disappearance_candidate);
+}
+
+// A 移到新位置时，A 在旧位置曾被 B 遮挡这一历史关系不能自动迁移到
+// 新位置。二维重叠本身不提供 B 仍在 A 前方的深度证据。
+void test_moved_target_drops_stale_historical_blocker() {
+    std::map<int, fridge::InventoryItem> operation_start;
+    std::map<int, fridge::InventoryItem> working;
+    fridge::InventoryItem moved = item(1, 0, 100, 100, 200, 200);
+    fridge::InventoryItem historical_front = item(2, 2, 100, 100, 200, 200);
+    moved.block_ids.insert(historical_front.item_id);
+    operation_start[moved.item_id] = moved;
+    operation_start[historical_front.item_id] = historical_front;
+
+    moved.box = fridge::BBox(500, 100, 600, 200);
+    moved.base_box = moved.box;
+    working[moved.item_id] = moved;
+    working[historical_front.item_id] = historical_front;
+
+    std::set<int> confirmed_front_ids;
+    confirmed_front_ids.insert(moved.item_id);
+    std::set<int> confirmed_moved_ids;
+    confirmed_moved_ids.insert(moved.item_id);
+    const fridge::session_internal::BlockerRelationGraph graph =
+        fridge::session_internal::build_event_driven_blocker_graph(
+            operation_start, working, confirmed_front_ids, confirmed_moved_ids,
+            std::set<int>());
+
+    const std::map<int, std::set<int> >::const_iterator effective =
+        graph.effective_by_target.find(moved.item_id);
+    const std::map<int, std::set<int> >::const_iterator removed =
+        graph.removed_by_target.find(moved.item_id);
+    assert(effective != graph.effective_by_target.end());
+    assert(removed != graph.removed_by_target.end());
+    assert(effective->second.empty());
+    assert(removed->second.count(historical_front.item_id));
+}
+
+// 正式库存中 OCCLUDED 不是一个孤立状态：它必须给出当前 blocker 图中的
+// witness。失败提交不能半更新已经持久化的库存；VISIBLE 则一律清空旧 proof。
+void test_inventory_rejects_invalid_formal_occlusion_proof() {
+    fridge::InventoryDB inventory;
+    std::map<int, fridge::InventoryItem> baseline;
+    baseline[1] = item(1, 0, 100, 100, 200, 200);
+    assert(inventory.replace_all(baseline, 2));
+
+    std::map<int, fridge::InventoryItem> candidate = baseline;
+    candidate[2] = item(2, 2, 100, 100, 200, 200);
+    candidate[1].status = fridge::ItemStatus::OCCLUDED;
+    candidate[1].block_ids.insert(2);
+
+    // No kind and no witness is malformed; the old atomic snapshot survives.
+    assert(!inventory.replace_all(candidate, 3));
+    assert(inventory.size() == 1);
+    assert(inventory.find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
+
+    candidate[1].occlusion_proof.kind = fridge::OcclusionProofKind::STRICT_UNION;
+    candidate[1].occlusion_proof.witness_blocker_ids.insert(99);
+    assert(!inventory.replace_all(candidate, 3));
+    assert(inventory.size() == 1);
+
+    candidate[1].block_ids.insert(99);
+    assert(!inventory.replace_all(candidate, 3));
+    assert(inventory.size() == 1);
+    candidate[1].block_ids.erase(99);
+
+    candidate[1].occlusion_proof.witness_blocker_ids.clear();
+    candidate[1].occlusion_proof.witness_blocker_ids.insert(2);
+    // VISIBLE proof must be normalized away even if a caller accidentally
+    // carries an old proof alongside an ordinary visible item.
+    candidate[2].occlusion_proof.kind = fridge::OcclusionProofKind::STRICT_UNION;
+    candidate[2].occlusion_proof.witness_blocker_ids.insert(1);
+    assert(inventory.replace_all(candidate, 3));
+    assert(inventory.find_by_item(1)->status == fridge::ItemStatus::OCCLUDED);
+    assert(inventory.find_by_item(1)->occlusion_proof.witness_blocker_ids.count(2));
+    assert(inventory.find_by_item(2)->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::NONE);
+    assert(inventory.find_by_item(2)->occlusion_proof.witness_blocker_ids.empty());
+}
+
+// 多层 blocker 的 OUT 求值只能收缩候选集合。这里模拟第一轮中 B 已被
+// 确认遮挡保护，下一轮中 C 又因 B 的保留关系进入 pending；无论候选集合
+// 的遍历顺序如何，最终都只能留下仍具有普通 OUT 证据的 A。
+void test_pending_out_candidates_converge_monotonically() {
+    std::set<int> candidates;
+    candidates.insert(1);  // A: ordinary OUT remains legal.
+    candidates.insert(2);  // B: current confirmed occlusion protects it.
+    candidates.insert(3);  // C: becomes pending after the first replan.
+
+    std::map<int, fridge::session_internal::BlockerTransitionPlan> first_plan;
+    first_plan[1].out = fridge::session_internal::OutDisposition::NORMAL_OUT_EVIDENCE;
+    first_plan[2].out =
+        fridge::session_internal::OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION;
+    first_plan[3].out = fridge::session_internal::OutDisposition::NORMAL_OUT_EVIDENCE;
+    const std::set<int> after_first =
+        fridge::session_internal::retain_pending_out_candidates(candidates, first_plan);
+    assert(after_first.size() == 2);
+    assert(after_first.count(1));
+    assert(after_first.count(3));
+
+    std::map<int, fridge::session_internal::BlockerTransitionPlan> stable_plan;
+    stable_plan[1].out = fridge::session_internal::OutDisposition::NORMAL_OUT_EVIDENCE;
+    stable_plan[3].out =
+        fridge::session_internal::OutDisposition::HOLD_FOR_PENDING_OCCLUSION;
+    const std::set<int> after_second =
+        fridge::session_internal::retain_pending_out_candidates(after_first, stable_plan);
+    const std::set<int> after_stable =
+        fridge::session_internal::retain_pending_out_candidates(after_second, stable_plan);
+    assert(after_second.size() == 1);
+    assert(after_second.count(1));
+    assert(after_stable == after_second);
+}
+
 void test_moved_front_item_occludes_then_reveals() {
     fridge::SessionManager session;
     session.start_new_session();

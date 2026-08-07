@@ -11,6 +11,40 @@
 
 namespace fridge {
 
+namespace {
+
+bool formal_occlusion_proof_is_valid(
+        const std::map<int, InventoryItem>& items,
+        const InventoryItem& item, const char** reason) {
+    if (item.occlusion_proof.kind == OcclusionProofKind::NONE) {
+        if (reason) *reason = "missing-proof-kind";
+        return false;
+    }
+    if (item.occlusion_proof.witness_blocker_ids.empty()) {
+        if (reason) *reason = "missing-proof-witness";
+        return false;
+    }
+    for (std::set<int>::const_iterator witness =
+             item.occlusion_proof.witness_blocker_ids.begin();
+         witness != item.occlusion_proof.witness_blocker_ids.end(); ++witness) {
+        if (*witness == item.item_id) {
+            if (reason) *reason = "self-proof-witness";
+            return false;
+        }
+        if (!item.block_ids.count(*witness)) {
+            if (reason) *reason = "proof-witness-not-in-block-ids";
+            return false;
+        }
+        if (!items.count(*witness)) {
+            if (reason) *reason = "proof-witness-not-active";
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 const char* item_status_to_str(ItemStatus s) {
     switch (s) {
         case ItemStatus::VISIBLE:  return "可见";
@@ -64,20 +98,38 @@ void InventoryDB::update_seen_item(int item_id, const BBox& box,
     it->second.updated_frame = frame_id;
 }
 
-void InventoryDB::replace_all(const std::map<int, InventoryItem>& items,
+bool InventoryDB::replace_all(const std::map<int, InventoryItem>& items,
                               int next_item_id) {
-    items_ = items;
+    std::map<int, InventoryItem> normalized = items;
     // A visible committed item cannot retain a historical occlusion proof.
-    // OCCLUDED proofs are validated by the no-hand lifecycle before this
-    // atomic commit; this keeps the VISIBLE side of the persistent invariant
-    // true for every replace_all caller, including backend/bootstrap paths.
-    for (std::map<int, InventoryItem>::iterator it = items_.begin();
-         it != items_.end(); ++it) {
+    // Keep the normalization local until every OCCLUDED record has passed
+    // validation, so a rejected commit cannot partially mutate persistence.
+    for (std::map<int, InventoryItem>::iterator it = normalized.begin();
+         it != normalized.end(); ++it) {
         if (it->second.status == ItemStatus::VISIBLE) {
             it->second.occlusion_proof.clear();
         }
     }
+
+    for (std::map<int, InventoryItem>::const_iterator it = normalized.begin();
+         it != normalized.end(); ++it) {
+        if (it->second.status != ItemStatus::OCCLUDED) continue;
+        const char* reason = "unknown";
+        if (formal_occlusion_proof_is_valid(normalized, it->second, &reason)) {
+            continue;
+        }
+        // Do not silently downgrade legacy malformed OCCLUDED records to
+        // VISIBLE.  The caller receives an explicit failure and retains the
+        // previous atomic snapshot until a valid lifecycle proof is available.
+        fprintf(stderr,
+                "[InventoryDB] reject replace_all: item#%d OCCLUDED proof invalid (%s)\n",
+                it->first, reason);
+        return false;
+    }
+
+    items_.swap(normalized);
     next_item_id_ = std::max(1, next_item_id);
+    return true;
 }
 
 void InventoryDB::remove_item(int item_id) {

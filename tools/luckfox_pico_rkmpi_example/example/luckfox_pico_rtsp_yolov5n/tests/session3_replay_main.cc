@@ -28,6 +28,10 @@ int main() {
     test_ambiguous_hand_partial_box_does_not_create_d();
     test_adjacent_same_class_new_item_gets_its_own_d_chain();
     test_unbound_no_hand_box_never_auto_in();
+    test_identity_ambiguity_holds_visible_target_without_out_evidence();
+    test_moved_target_drops_stale_historical_blocker();
+    test_inventory_rejects_invalid_formal_occlusion_proof();
+    test_pending_out_candidates_converge_monotonically();
     test_moved_front_item_occludes_then_reveals();
     test_disappearance_supported_moved_front_occludes_without_out();
     test_disappearance_evidence_resets_when_hand_returns();
@@ -70,6 +74,7 @@ int main() {
     test_hand_affected_old_c_does_not_block_static_owner_reservation();
     test_same_class_old_owner_blocks_path_match_before_identity_swap();
     test_direct_original_evidence_rolls_back_provisional_moved();
+    test_hand_front_cover_remains_provisional_until_no_hand_confirmation();
     test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
     test_same_class_candidate_context_includes_unowned_viable_old_c();
     test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie();

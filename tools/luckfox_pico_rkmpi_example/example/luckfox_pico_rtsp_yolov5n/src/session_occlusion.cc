@@ -149,6 +149,14 @@ BlockerRelationGraph build_event_driven_blocker_graph(
     for (std::set<int>::const_iterator moved = confirmed_moved_ids.begin();
          moved != confirmed_moved_ids.end(); ++moved) {
         erase_blocker_from_all(&graph.effective_by_target, *moved);
+        // A 移动后，A 自己在旧位置被谁遮住的历史关系同样失效。二维重叠
+        // 不能推断静态 B 仍位于 A 新位置之前；后续仅允许本轮已确认的前景
+        // 事件按新位置重新加入关系。
+        std::map<int, std::set<int> >::iterator moved_target =
+            graph.effective_by_target.find(*moved);
+        if (moved_target != graph.effective_by_target.end()) {
+            moved_target->second.clear();
+        }
     }
     for (std::set<int>::const_iterator out = confirmed_out_ids.begin();
          out != confirmed_out_ids.end(); ++out) {
@@ -210,6 +218,29 @@ BlockerRelationGraph build_event_driven_blocker_graph(
     return graph;
 }
 
+std::set<int> retain_pending_out_candidates(
+        const std::set<int>& pending_out_ids,
+        const std::map<int, BlockerTransitionPlan>& transition_plans) {
+    std::set<int> retained;
+    for (std::set<int>::const_iterator candidate = pending_out_ids.begin();
+         candidate != pending_out_ids.end(); ++candidate) {
+        const std::map<int, BlockerTransitionPlan>::const_iterator plan =
+            transition_plans.find(*candidate);
+        if (plan == transition_plans.end()) {
+            retained.insert(*candidate);
+            continue;
+        }
+        const OutDisposition disposition = plan->second.out;
+        if (disposition == OutDisposition::HOLD_FOR_PENDING_OCCLUSION ||
+            disposition == OutDisposition::BLOCKED_BY_CONFIRMED_OCCLUSION ||
+            disposition == OutDisposition::NOT_APPLICABLE) {
+            continue;
+        }
+        retained.insert(*candidate);
+    }
+    return retained;
+}
+
 bool occlusion_proof_witnesses_valid(
         const OcclusionProof& proof,
         const std::set<int>& effective_blocker_ids) {
@@ -267,12 +298,11 @@ OcclusionDecisionResult decide_occlusion_lifecycle(
             return result;
         }
         if (input.observation_conflict) {
-            // Ambiguity is not disappearance evidence.  Existing owner and
-            // visible-count arbitration remains responsible for deciding
-            // whether the operation must wait; do not turn it into a generic
-            // occlusion/OUT override here.
-            result.visibility = VisibilityDecision::KEEP_VISIBLE;
-            result.out = OutDisposition::NORMAL_OUT_EVIDENCE;
+            // Ambiguity is neither disappearance nor direct observation.
+            // It must stop both disappearance and ordinary OUT evidence so
+            // a later clear frame cannot be stitched onto this frame.
+            result.visibility = VisibilityDecision::PENDING_OCCLUSION_EVIDENCE;
+            result.out = OutDisposition::HOLD_FOR_PENDING_OCCLUSION;
             return result;
         }
         if (new_front_cover && after_strict) {

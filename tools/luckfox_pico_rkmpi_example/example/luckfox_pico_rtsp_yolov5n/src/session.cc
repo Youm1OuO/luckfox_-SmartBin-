@@ -114,6 +114,8 @@ void SessionManager::unlink_quarantined_suspect_(int runtime_key,
                                                   const char* action) {
     std::map<int, OperationTrack>::iterator suspect = track_buffer_.find(runtime_key);
     if (suspect == track_buffer_.end() || !suspect->second.is_suspect_new) return;
+    clear_pending_front_evidence_for_suspect_(runtime_key,
+                                              action ? action : "unlink-suspect");
     OperationTrack& d = suspect->second;
     for (std::set<int>::const_iterator old_id = d.conflicting_old_item_ids.begin();
          old_id != d.conflicting_old_item_ids.end(); ++old_id) {
@@ -196,6 +198,7 @@ void SessionManager::reset_operation_runtime_() {
     pending_out_ids_.clear();
     confirmed_moved_ids_.clear();
     released_hand_candidate_ids_.clear();
+    pending_front_evidence_by_target_.clear();
     cross_class_duplicate_identity_exclusions_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
@@ -254,7 +257,10 @@ void SessionManager::init_from_backend(const std::vector<InventoryItem>& items,
         loaded[item.item_id] = item;
         next_id = std::max(next_id, item.item_id + 1);
     }
-    inventory_.replace_all(loaded, next_id);
+    if (!inventory_.replace_all(loaded, next_id)) {
+        printf("[INIT] 后端库存不满足正式遮挡证明不变式，保留当前库存\n");
+        return;
+    }
     rebuild_persistent_item_index_();
     has_local_inventory_ = true;
     backend_status_ = BackendStatus::TRUSTED;
@@ -313,7 +319,10 @@ void SessionManager::initialize_from_bootstrap_no_hand_frame_(
                                                current_time_ms_);
         ++next_id;
     }
-    inventory_.replace_all(loaded, next_id);
+    if (!inventory_.replace_all(loaded, next_id)) {
+        printf("[INIT] 首帧建库不满足正式遮挡证明不变式，保留当前库存\n");
+        return;
+    }
     rebuild_persistent_item_index_();
     has_local_inventory_ = true;
     initial_check_state_ = InitialCheckState::DONE;

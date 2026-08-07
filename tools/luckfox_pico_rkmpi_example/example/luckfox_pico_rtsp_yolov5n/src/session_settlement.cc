@@ -591,6 +591,50 @@ void SessionManager::update_pending_occlusion_evidence_(
     }
 }
 
+bool SessionManager::reconcile_pending_out_with_occlusion_plan_(
+        const std::map<int, BlockerTransitionPlan>& transition_plans) {
+    const std::set<int> retained_ids = retain_pending_out_candidates(
+        pending_out_ids_, transition_plans);
+    std::set<int> retract_ids;
+    for (std::set<int>::const_iterator candidate = pending_out_ids_.begin();
+         candidate != pending_out_ids_.end(); ++candidate) {
+        if (!retained_ids.count(*candidate)) retract_ids.insert(*candidate);
+    }
+
+    for (std::set<int>::const_iterator candidate = retract_ids.begin();
+         candidate != retract_ids.end(); ++candidate) {
+        const std::map<int, BlockerTransitionPlan>::const_iterator plan =
+            transition_plans.find(*candidate);
+        const OutDisposition disposition = plan->second.out;
+        pending_out_ids_.erase(*candidate);
+
+        // A visible-count conclusion is operation-local just like an ordinary
+        // direct-missing OUT.  When lifecycle protection retracts it, restart
+        // its deficit chain on a later clear no-hand frame instead of leaving
+        // a stale count ready to re-add the same OUT immediately.
+        visible_count_confirmed_out_ids_.erase(*candidate);
+        visible_count_missing_counts_.erase(*candidate);
+        visible_count_out_candidate_ids_.erase(*candidate);
+        occlusion_loss_missing_counts_.erase(*candidate);
+
+        OperationTrack* track = find_runtime_for_item_(*candidate);
+        if (track && !track->is_suspect_new &&
+            track->resolution == ExistingItemResolution::OUT_CONFIRMED) {
+            track->resolution = ExistingItemResolution::NONE;
+            track->release_reason = ReleaseReason::NONE;
+            track->needs_no_hand_settlement = true;
+            track->no_hand_missing_count = plan->second.valid_target_observed
+                ? 0 : std::max(0, FLOW3_NO_HAND_OUT_MISSING_FRAMES - 1);
+            trace_track_("OUT-FIXPOINT", *track,
+                         "retract-out-after-lifecycle-protection");
+        }
+        trace_("OUT-FIXPOINT",
+               "item=%d action=retract-pending-out out-disposition=%d",
+               *candidate, static_cast<int>(disposition));
+    }
+    return !retract_ids.empty();
+}
+
 void SessionManager::refresh_confirmed_blockers_(
         std::map<int, InventoryItem>* final_items,
         const std::set<int>& observed_working_ids,
@@ -669,8 +713,8 @@ void SessionManager::refresh_confirmed_blockers_(
         std::vector<BBox> cover_boxes;
         std::vector<BBox> edge_cover_boxes;
         std::set<int> effective_with_geometry;
+        std::map<int, BBox> effective_geometry_boxes;
         std::set<int> current_front_witnesses;
-        std::map<int, BBox> current_front_witness_boxes;
         for (std::set<int>::const_iterator blocker = effective_block_ids.begin();
              blocker != effective_block_ids.end(); ++blocker) {
             const std::map<int, InventoryItem>::const_iterator front =
@@ -685,9 +729,9 @@ void SessionManager::refresh_confirmed_blockers_(
             cover_boxes.push_back(front_box);
             edge_cover_boxes.push_back(front_box);
             effective_with_geometry.insert(*blocker);
+            effective_geometry_boxes[*blocker] = front_box;
             if (confirmed_front_ids.count(*blocker)) {
                 current_front_witnesses.insert(*blocker);
-                current_front_witness_boxes[*blocker] = front_box;
             }
         }
         const bool has_current_confirmed_front_cover =
@@ -705,8 +749,20 @@ void SessionManager::refresh_confirmed_blockers_(
             (target_runtime->no_hand_candidate_ambiguous ||
              target_runtime->no_hand_candidate_reserved_by_stronger_owner ||
              old_track_has_unresolved_alias_(*target_runtime));
-        plan.valid_target_observed = target_observed && !target_observation_conflict;
-        plan.observation_conflict = target_observed && target_observation_conflict;
+        // 细节9的狭义例外：连续无手画面中，同类旧 C 数量大于可靠框数量
+        // 时，这个一框一物品计划不是普通身份仲裁。它已经为一个可观察实例
+        // 保留框、为其余实例建立连续缺额链，因此不应再被同一份共享 B 的
+        // runtime 歧义无限冻结。除此以外，任何 owner / alias 歧义都必须
+        // 传入 lifecycle plan 并暂停 OUT/遮挡证据。
+        const bool visible_count_final_observability =
+            visible_count_survivor_ids_.count(target_id) > 0 ||
+            visible_count_out_candidate_ids_.count(target_id) > 0;
+        const bool lifecycle_observation_conflict = target_observation_conflict &&
+            !visible_count_final_observability;
+        plan.valid_target_observed = target_observed && !lifecycle_observation_conflict;
+        // 本帧存在无法唯一归属给 C 的候选框，本身就是身份歧义；它不能因
+        // C 最终没有获得绑定而伪装成“无歧义消失”。
+        plan.observation_conflict = lifecycle_observation_conflict;
 
         if (original == operation_start_inventory_.end()) {
             // A newly promoted D is a front candidate only; it cannot acquire
@@ -749,7 +805,7 @@ void SessionManager::refresh_confirmed_blockers_(
                 plan.target_has_independent_exit_evidence || contact_exit || hand_exit;
         }
 
-        plan.valid_target_observed = target_observed && !target_observation_conflict;
+        plan.valid_target_observed = target_observed && !lifecycle_observation_conflict;
         const bool previous_proof_valid =
             original->second.status == ItemStatus::OCCLUDED &&
             occlusion_proof_witnesses_valid(
@@ -776,13 +832,12 @@ void SessionManager::refresh_confirmed_blockers_(
         const std::map<int, std::set<int> >::const_iterator prior_witness =
             pending_occlusion_witness_ids_.find(target_id);
         if (prior_witness != pending_occlusion_witness_ids_.end() &&
-            prior_witness->second == current_front_witnesses) {
+            prior_witness->second == effective_with_geometry) {
             const std::map<int, std::map<int, BBox> >::const_iterator prior_boxes =
                 pending_occlusion_witness_boxes_.find(target_id);
             if (prior_boxes != pending_occlusion_witness_boxes_.end() &&
                 front_witness_boxes_are_continuous(
-                    *final_items, prior_boxes->second,
-                    current_front_witness_boxes)) {
+                    *final_items, prior_boxes->second, effective_geometry_boxes)) {
                 const std::map<int, int>::const_iterator prior_count =
                     pending_occlusion_missing_counts_.find(target_id);
                 if (prior_count != pending_occlusion_missing_counts_.end()) {
@@ -822,8 +877,10 @@ void SessionManager::refresh_confirmed_blockers_(
         plan.allow_revealed_transition = decision.allow_revealed_transition;
         plan.disappearance_candidate = decision.disappearance_candidate;
         plan.matching_missing_frames = decision.matching_missing_frames;
-        plan.disappearance_witness_ids = current_front_witnesses;
-        plan.disappearance_witness_boxes = current_front_witness_boxes;
+        // DISAPPEARANCE_SUPPORTED 最终 proof 声明所有参与当前覆盖的正式
+        // blocker，因此连续性也必须跟踪同一组 witness，不能只记录新增 front。
+        plan.disappearance_witness_ids = effective_with_geometry;
+        plan.disappearance_witness_boxes = effective_geometry_boxes;
 
         InventoryItem retained = target_observed ? target->second : original->second;
         retained.block_ids = effective_block_ids;
@@ -1187,30 +1244,43 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     std::map<int, BlockerTransitionPlan> transition_plans;
     refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
                                 &fully_occluded_ids, &transition_plans);
-    update_pending_occlusion_evidence_(transition_plans);
     apply_visible_count_missing_evidence_(transition_plans);
 
-    // OUT 判定会在本帧把 blocker 加入 pending_out_ids_。若这改变了 blocker
-    // 集合，必须在删除 final_items 前重算一次，不能让已正式 OUT 的 A 继续
-    // 遮挡 C，也不能把 C 直接伪造为 REVEALED。
-    const std::set<int> pending_out_before_no_hand = pending_out_ids_;
+    // 可见数量缺额可能刚新增 OUT 候选；先以该候选集合重新计算 lifecycle，
+    // 再推进普通 direct-missing 证据。每类帧证据最多推进一次，后续固定点只
+    // 会撤回不再合法的候选，不会重复增加任何连续计数。
+    refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
+                                &fully_occluded_ids, &transition_plans);
     bool has_unresolved_state = has_unresolved_no_hand_state_(
         detections, observed_ids, fully_occluded_ids, transition_plans);
-    if (pending_out_before_no_hand != pending_out_ids_) {
-        refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
-                                    &fully_occluded_ids, &transition_plans);
-        update_pending_occlusion_evidence_(transition_plans);
-    }
 
-    const std::set<int> pending_out_before_occlusion_loss = pending_out_ids_;
+    // 普通 missing 链路可能新增 blocker 的 OUT；遮挡解释失效链在其后的
+    // 新关系图上只推进一次，避免同一无手帧被循环重复计数。
+    refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
+                                &fully_occluded_ids, &transition_plans);
     if (advance_occlusion_loss_out_evidence_(final_items, observed_ids,
                                              fully_occluded_ids)) {
         has_unresolved_state = true;
     }
-    if (pending_out_before_occlusion_loss != pending_out_ids_) {
+
+    // pending_out_ids_ 是有限集合。这里执行单调固定点：每一轮仅删除被当前
+    // visibility/proof plan 保护的 OUT，不新增候选，也不推进帧计数。这样 A
+    // -> B -> C 多层 blocker 的最终关系不依赖有限的“重算两次”或 map 顺序。
+    for (;;) {
         refresh_confirmed_blockers_(&final_items, observed_ids, confirmed_front_ids,
                                     &fully_occluded_ids, &transition_plans);
-        update_pending_occlusion_evidence_(transition_plans);
+        if (!reconcile_pending_out_with_occlusion_plan_(transition_plans)) break;
+    }
+
+    // DISAPPEARANCE_SUPPORTED 的连续计数只在本帧的最终稳定 plan 上写一次。
+    // 中间固定点重算不触碰它，防止一张无手帧被误算成两张连续证据。
+    update_pending_occlusion_evidence_(transition_plans);
+    for (std::map<int, BlockerTransitionPlan>::const_iterator plan =
+             transition_plans.begin(); plan != transition_plans.end(); ++plan) {
+        if (plan->second.out == OutDisposition::HOLD_FOR_PENDING_OCCLUSION) {
+            has_unresolved_state = true;
+            break;
+        }
     }
 
     for (std::set<int>::const_iterator out = pending_out_ids_.begin();
@@ -1302,7 +1372,12 @@ SettlementResult SessionManager::settle_no_hand_frame_(
                event.after_box.x2, event.after_box.y2);
     }
 
-    inventory_.replace_all(final_items, working_next_item_id_);
+    if (!inventory_.replace_all(final_items, working_next_item_id_)) {
+        trace_("SETTLE",
+               "reject-commit reason=invalid-formal-occlusion-proof inventory-before=%zu",
+               inventory_.size());
+        return result;
+    }
     rebuild_persistent_item_index_();
     result.committed = true;
     result.happened = !events.empty();

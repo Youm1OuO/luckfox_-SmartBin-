@@ -113,6 +113,11 @@ BlockerRelationGraph build_event_driven_blocker_graph(
         const std::set<int>& confirmed_front_ids,
         const std::set<int>& confirmed_moved_ids,
         const std::set<int>& confirmed_out_ids);
+// Fixed-point helper: lifecycle can only retract a pending OUT candidate.
+// It never adds one or advances per-frame evidence counters.
+std::set<int> retain_pending_out_candidates(
+        const std::set<int>& pending_out_ids,
+        const std::map<int, BlockerTransitionPlan>& transition_plans);
 bool occlusion_proof_witnesses_valid(const OcclusionProof& proof,
                                      const std::set<int>& effective_blocker_ids);
 bool front_witness_boxes_are_continuous(

@@ -1233,6 +1233,8 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
             confirmed_moved_ids_.erase(item_id);
             pending_out_ids_.erase(item_id);
         }
+        clear_pending_front_evidence_for_suspect_(
+            track->first, "discard-suspect-before-no-hand-commit");
         track_buffer_.erase(track);
     }
 

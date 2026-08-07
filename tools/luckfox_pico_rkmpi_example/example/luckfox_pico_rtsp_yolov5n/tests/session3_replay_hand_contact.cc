@@ -446,4 +446,60 @@ void test_direct_original_evidence_rolls_back_provisional_moved() {
     assert(!has_event(result, fridge::EventKind::IN, 2));
     assert(!has_event(result, fridge::EventKind::OUT, 1));
 }
+
+// D 在 HAND 期已经提升并获得放下证据时，D + 手覆盖 C 仍只是临时解释。
+// 没有 D 的无手直接身份确认前，C 不能被 runtime 标成 OCCLUDED_CONFIRMED，
+// 也不能失去自己的无手结算义务。
+void test_hand_front_cover_remains_provisional_until_no_hand_confirmation() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 100, 100, 200, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(2, 100, 100, 200, 200)), &frame);
+
+    const fridge::Detection front = det(0, 100, 100, 200, 200);
+    const fridge::BBox covering_hand(80, 80, 220, 220);
+    send_frame(&session, std::vector<fridge::Detection>(1, front),
+               std::vector<fridge::BBox>(1, covering_hand), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, front),
+               std::vector<fridge::BBox>(1, covering_hand), &frame);
+
+    // 两张持续脱手的有手帧让 D 走完既有提升/放下链，但故意不进入无手确认。
+    const fridge::BBox hand_moved_once(300, 80, 440, 220);
+    const fridge::BBox hand_moved_twice(500, 80, 640, 220);
+    send_frame(&session, std::vector<fridge::Detection>(1, front),
+               std::vector<fridge::BBox>(1, hand_moved_once), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1, front),
+               std::vector<fridge::BBox>(1, hand_moved_twice), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    const std::map<int, fridge::OperationTrack>::const_iterator target = tracks.find(1);
+    assert(target != tracks.end());
+    assert(target->second.resolution !=
+           fridge::ExistingItemResolution::OCCLUDED_CONFIRMED);
+    assert(target->second.needs_no_hand_settlement);
+
+    bool saw_confirmed_front = false;
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        if (it->second.is_suspect_new && it->second.promoted_to_working_inventory &&
+            it->second.drop_confirmed) {
+            saw_confirmed_front = true;
+        }
+    }
+    assert(saw_confirmed_front);
+    assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
+
+    const int first_no_hand = frame++;
+    const fridge::FrameProcessResult result = session.process_frame(
+        std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+        first_no_hand, first_no_hand);
+    assert(result.no_hand_frame_processed);
+    assert(!result.settlement.committed);
+    assert(session.operation_pending());
+    assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
+}
 }  // namespace session3_replay

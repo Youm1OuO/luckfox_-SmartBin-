@@ -89,7 +89,8 @@ public:
     int next_item_id() const { return next_item_id_; }
 
     // SessionManager 在 planned_changes 全部算完后一次性替换库存，避免半提交。
-    void replace_all(const std::map<int, InventoryItem>& items, int next_item_id);
+    // 返回 false 表示输入不满足正式库存不变式，原库存保持不变。
+    bool replace_all(const std::map<int, InventoryItem>& items, int next_item_id);
 
     // 调试打印
     void print(const char* prefix = "") const;
