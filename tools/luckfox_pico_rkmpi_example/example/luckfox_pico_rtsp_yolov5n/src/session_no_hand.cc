@@ -1400,6 +1400,26 @@ bool SessionManager::has_unresolved_no_hand_state_(
             continue;
         }
 
+        // OCCLUDED_CONFIRMED is also used as a per-frame runtime marker after
+        // a newly established causal/full-coverage plan.  A deferred
+        // transaction does not write that projection to working_inventory_,
+        // so an ordinary VISIBLE operation-start item must not remain
+        // terminal when the front relation loses coverage on the next frame.
+        // Formal OCCLUDED inventory starts are intentionally left untouched;
+        // their dedicated coverage-loss chain handles the historical proof.
+        const std::map<int, InventoryItem>::const_iterator original_item =
+            operation_start_inventory_.find(track.item_id);
+        if (!fully_occluded_item_ids.count(track.item_id) &&
+            track.resolution == ExistingItemResolution::OCCLUDED_CONFIRMED &&
+            original_item != operation_start_inventory_.end() &&
+            original_item->second.status == ItemStatus::VISIBLE) {
+            track.resolution = ExistingItemResolution::NONE;
+            track.release_reason = ReleaseReason::NONE;
+            track.needs_no_hand_settlement = true;
+            trace_track_("OCCLUSION", track,
+                         "retract-provisional-occlusion-after-coverage-loss");
+        }
+
         if (!existing_item_needs_settlement(track)) continue;
 
         const bool is_visible_count_out_candidate =

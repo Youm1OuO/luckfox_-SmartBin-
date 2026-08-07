@@ -501,6 +501,10 @@ private:
     std::map<int, int> visible_count_detection_owner_;
     std::set<int> visible_count_survivor_ids_;
     std::set<int> visible_count_out_candidate_ids_;
+    // 当前无手帧中，同类数量缺额已经被一对一分配解决的旧 C。它与
+    // visible_count_out_candidate_ids_ 的 OUT 计数生命周期分离，遮挡计划
+    // 的同一帧固定点重算仍须保留这份身份结论。
+    std::set<int> visible_count_identity_relaxed_ids_;
     // 这两个容器跨连续无手帧保存；手重新出现或可见数量恢复时必须撤销。
     std::map<int, int> visible_count_missing_counts_;
     std::set<int> visible_count_confirmed_out_ids_;

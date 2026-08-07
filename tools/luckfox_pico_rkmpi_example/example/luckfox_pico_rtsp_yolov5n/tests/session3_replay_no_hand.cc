@@ -205,6 +205,135 @@ void test_confirmed_moved_orange_occludes_reserved_same_class_apple() {
            fridge::OcclusionProofKind::EDGE_RESIDUAL_UNION);
 }
 
+// 现场拓扑的主机压缩回放：三只苹果中 #1 被手影响并在收尾无手帧中漏检，
+// #3/#5 各自保留自己的直接框；两只橙子中只有 #9 从左侧移动到 #1 的旧位置。
+// visible-count 的身份结论不能把 #1 恢复成 observation-conflict，也不能让
+// #1 的缺额先走 OUT；已确认的 #9 必须先发布 MOVED，再由因果 proof 保护 #1。
+void test_visible_count_survivors_preserve_causal_missing_apple() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 300, 100, 400, 200));  // missing apple
+    initial.push_back(item(3, 0, 700, 100, 800, 200));  // visible apple
+    initial.push_back(item(5, 0, 700, 300, 800, 400));  // visible apple
+    initial.push_back(item(7, 2, 100, 300, 200, 400));  // static orange
+    initial.push_back(item(9, 2, 100, 100, 200, 200));  // moved front orange
+    session.init_from_backend(initial, true);
+    int frame = 1;
+
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 300, 100, 400, 200));
+    stable.push_back(det(0, 700, 100, 800, 200));
+    stable.push_back(det(0, 700, 300, 800, 400));
+    stable.push_back(det(2, 100, 300, 200, 400));
+    stable.push_back(det(2, 100, 100, 200, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> hand_start;
+    hand_start.push_back(det(0, 700, 100, 800, 200));
+    hand_start.push_back(det(0, 700, 300, 800, 400));
+    hand_start.push_back(det(2, 100, 300, 200, 400));
+    hand_start.push_back(det(2, 100, 100, 200, 200));
+    send_frame(&session, hand_start,
+               std::vector<fridge::BBox>(1, fridge::BBox(70, 70, 430, 230)),
+               &frame);
+
+    std::vector<fridge::Detection> hand_middle = hand_start;
+    hand_middle[3] = det(2, 170, 100, 270, 200);
+    send_frame(&session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(140, 70, 500, 230)),
+               &frame);
+
+    hand_middle[3] = det(2, 240, 105, 340, 205);
+    send_frame(&session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(210, 70, 570, 230)),
+               &frame);
+
+    hand_middle[3] = det(2, 300, 111, 400, 211);
+    send_frame(&session, hand_middle,
+               std::vector<fridge::BBox>(1, fridge::BBox(270, 70, 430, 240)),
+               &frame);
+
+    std::vector<fridge::Detection> final_no_hand;
+    final_no_hand.push_back(det(0, 700, 100, 800, 200));
+    final_no_hand.push_back(det(0, 700, 300, 800, 400));
+    final_no_hand.push_back(det(2, 100, 300, 200, 400));
+    final_no_hand.push_back(det(2, 300, 111, 400, 211));
+    const fridge::SettlementResult result = settle_after_hand(
+        &session, final_no_hand, &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 5);
+    assert(has_event(result, fridge::EventKind::MOVED, 9));
+    assert(has_event(result, fridge::EventKind::OCCLUDED, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert_event_before(result, fridge::EventKind::MOVED, 9,
+                        fridge::EventKind::OCCLUDED, 1);
+    const fridge::InventoryItem* hidden = session.inventory().find_by_item(1);
+    assert(hidden != 0);
+    assert(hidden->status == fridge::ItemStatus::OCCLUDED);
+    assert(hidden->block_ids.size() == 1);
+    assert(hidden->block_ids.count(9));
+    assert(hidden->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::CAUSAL_FRONT_MISSING);
+    assert(hidden->occlusion_proof.witness_blocker_ids.size() == 1);
+    assert(hidden->occlusion_proof.witness_blocker_ids.count(9));
+}
+
+// 因果遮挡不是严格矩形全覆盖，但也不能退化成“任意一点交集”。这里前景
+// 只覆盖目标旧框的一半，目标在有手阶段有 HAND/POSSIBLE_MOVED 线索却没有
+// 自己的唯一终点；前景完成既有自匹配确认后，应采用 causal proof 而不是 OUT。
+void test_causal_front_missing_accepts_substantial_partial_cover() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));  // moved front
+    initial.push_back(item(2, 2, 300, 100, 400, 200));  // hand-affected target
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 300, 100, 400, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(70, 70, 430, 230)),
+               &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 170, 100, 270, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(140, 70, 500, 230)),
+               &frame);
+    send_frame(&session, std::vector<fridge::Detection>(1,
+               det(0, 240, 100, 340, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(210, 70, 570, 230)),
+               &frame);
+    const fridge::Detection final_front = det(0, 350, 100, 450, 200);
+    send_frame(&session, std::vector<fridge::Detection>(1, final_front),
+               std::vector<fridge::BBox>(1, fridge::BBox(270, 70, 430, 240)),
+               &frame);
+
+    fridge::FrameProcessResult first = session.process_frame(
+        std::vector<fridge::Detection>(1, final_front),
+        std::vector<fridge::BBox>(), frame, frame);
+    ++frame;
+    assert(first.no_hand_frame_processed);
+    assert(first.settlement.committed);
+    assert(session.inventory().size() == 2);
+    assert(has_event(first.settlement, fridge::EventKind::MOVED, 1));
+    assert(has_event(first.settlement, fridge::EventKind::OCCLUDED, 2));
+    assert(!has_event(first.settlement, fridge::EventKind::OUT, 2));
+    assert_event_before(first.settlement, fridge::EventKind::MOVED, 1,
+                        fridge::EventKind::OCCLUDED, 2);
+    const fridge::InventoryItem* target = session.inventory().find_by_item(2);
+    assert(target != 0);
+    assert(target->status == fridge::ItemStatus::OCCLUDED);
+    assert(target->occlusion_proof.kind ==
+           fridge::OcclusionProofKind::CAUSAL_FRONT_MISSING);
+    assert(target->occlusion_proof.witness_blocker_ids.size() == 1);
+    assert(target->occlusion_proof.witness_blocker_ids.count(1));
+}
+
 // A 移到新位置时，A 在旧位置曾被 B 遮挡这一历史关系不能自动迁移到
 // 新位置。二维重叠本身不提供 B 仍在 A 前方的深度证据。
 void test_moved_target_drops_stale_historical_blocker() {

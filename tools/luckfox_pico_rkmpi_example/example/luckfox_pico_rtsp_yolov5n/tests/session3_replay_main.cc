@@ -32,6 +32,8 @@ int main() {
     test_identity_ambiguity_does_not_block_confirmed_full_occlusion();
     test_confirmed_target_exit_blocks_causal_front_missing();
     test_confirmed_moved_orange_occludes_reserved_same_class_apple();
+    test_visible_count_survivors_preserve_causal_missing_apple();
+    test_causal_front_missing_accepts_substantial_partial_cover();
     test_moved_target_drops_stale_historical_blocker();
     test_inventory_rejects_invalid_formal_occlusion_proof();
     test_pending_out_candidates_converge_monotonically();

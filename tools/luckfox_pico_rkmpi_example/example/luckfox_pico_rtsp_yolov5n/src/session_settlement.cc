@@ -113,6 +113,7 @@ void SessionManager::clear_visible_count_settlement_(bool restore_uncommitted_ou
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
     visible_count_out_candidate_ids_.clear();
+    visible_count_identity_relaxed_ids_.clear();
     visible_count_missing_counts_.clear();
     visible_count_confirmed_out_ids_.clear();
     visible_count_continuity_reset_item_ids_.clear();
@@ -478,6 +479,13 @@ void SessionManager::prepare_visible_count_settlement_(
     }
 
     visible_count_out_candidate_ids_.swap(next_out_candidates);
+    // This is an identity result for the current frame, not an OUT decision.
+    // Keep it available while the lifecycle plan is recomputed after missing
+    // evidence; a held candidate must not recreate a same-class conflict.
+    visible_count_identity_relaxed_ids_ = visible_count_survivor_ids_;
+    visible_count_identity_relaxed_ids_.insert(
+        visible_count_out_candidate_ids_.begin(),
+        visible_count_out_candidate_ids_.end());
     // Missing evidence and pending OUT are intentionally applied by
     // apply_visible_count_missing_evidence_ after the occlusion plan exists.
 }
@@ -756,26 +764,6 @@ void SessionManager::refresh_confirmed_blockers_(
             !plan.added_blocker_ids.empty() || !plan.moved_blocker_ids.empty() ||
             !plan.removed_blocker_ids.empty();
 
-        // A causal proof must be backed by a front event that is already
-        // reliable enough to be formal and by a substantial overlap.  The
-        // existing disappearance ratio is deliberately reused as a
-        // conservative lower bound: unlike the old route, causal proof does
-        // not require an outer residual or a second missing frame.  A small
-        // partial front remains subject to the existing cover-union behavior.
-        std::set<int> causal_event_witnesses;
-        for (std::set<int>::const_iterator witness =
-                 causal_front_witnesses.begin();
-             witness != causal_front_witnesses.end(); ++witness) {
-            if (plan.coverage_after.covered_ratio <
-                    FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO) {
-                continue;
-            }
-            if (confirmed_moved_ids_.count(*witness) ||
-                pending_in_ids_.count(*witness)) {
-                causal_event_witnesses.insert(*witness);
-            }
-        }
-
         const OperationTrack* target_runtime = find_runtime_for_item_(target_id);
         const bool target_observed = observed_working_ids.count(target_id) > 0;
         const bool target_observation_conflict = target_runtime &&
@@ -789,7 +777,8 @@ void SessionManager::refresh_confirmed_blockers_(
         // 传入 lifecycle plan 并暂停 OUT/遮挡证据。
         const bool visible_count_final_observability =
             visible_count_survivor_ids_.count(target_id) > 0 ||
-            visible_count_out_candidate_ids_.count(target_id) > 0;
+            visible_count_out_candidate_ids_.count(target_id) > 0 ||
+            visible_count_identity_relaxed_ids_.count(target_id) > 0;
         const bool lifecycle_observation_conflict = target_observation_conflict &&
             !visible_count_final_observability;
         plan.valid_target_observed = target_observed && !lifecycle_observation_conflict;
@@ -832,7 +821,7 @@ void SessionManager::refresh_confirmed_blockers_(
             confirmed_moved_ids_.count(target_id) > 0 ||
             pending_out_ids_.count(target_id) > 0;
         if (target_runtime && !target_runtime->is_suspect_new &&
-            !target_observation_conflict) {
+            !lifecycle_observation_conflict) {
             plan.target_has_confirmed_independent_exit =
                 plan.target_has_confirmed_independent_exit ||
                 target_runtime->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
@@ -845,6 +834,7 @@ void SessionManager::refresh_confirmed_blockers_(
                 target_runtime->state != OperationTrackState::NORMAL &&
                 (target_runtime->hold_and_move ||
                  has_meaningful_hand_move(*target_runtime));
+            plan.target_has_unconfirmed_hand_move_evidence = hand_exit;
             plan.target_has_independent_exit_evidence =
                 plan.target_has_independent_exit_evidence || contact_exit || hand_exit;
         }
@@ -858,9 +848,31 @@ void SessionManager::refresh_confirmed_blockers_(
             plan.coverage_after.covered_ratio >=
                 FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO &&
             plan.coverage_after.residual_is_outer_boundary_only;
+        const bool allow_causal_partial_overlap =
+            plan.target_has_unconfirmed_hand_move_evidence &&
+            !plan.target_has_confirmed_independent_exit;
         const bool causal_route_needed = !legacy_disappearance_geometry ||
-            (plan.target_has_independent_exit_evidence &&
-             !plan.target_has_confirmed_independent_exit);
+            allow_causal_partial_overlap;
+        // The ordinary disappearance route keeps its existing 0.85 lower
+        // bound.  A target with an explicitly unresolved HAND/POSSIBLE_MOVED
+        // path is different: once a confirmed front event explains its
+        // missing direct observation, even a smaller visible overlap can be
+        // the causal explanation.  Confirmed target MOVED/OUT still vetoes it.
+        std::set<int> causal_event_witnesses;
+        for (std::set<int>::const_iterator witness = causal_front_witnesses.begin();
+             witness != causal_front_witnesses.end(); ++witness) {
+            if (plan.coverage_after.covered_ratio <
+                    FLOW3_CAUSAL_OCCLUSION_MIN_COVER_RATIO ||
+                (!allow_causal_partial_overlap &&
+                plan.coverage_after.covered_ratio <
+                    FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO)) {
+                continue;
+            }
+            if (confirmed_moved_ids_.count(*witness) ||
+                pending_in_ids_.count(*witness)) {
+                causal_event_witnesses.insert(*witness);
+            }
+        }
         plan.causal_front_missing_candidate =
             causal_route_needed && original->second.status == ItemStatus::VISIBLE &&
             !plan.valid_target_observed && !plan.observation_conflict &&

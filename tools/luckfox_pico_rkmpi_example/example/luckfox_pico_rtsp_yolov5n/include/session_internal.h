@@ -105,6 +105,7 @@ struct BlockerTransitionPlan {
     OutDisposition out = OutDisposition::NORMAL_OUT_EVIDENCE;
     bool target_has_independent_exit_evidence = false;
     bool target_has_confirmed_independent_exit = false;
+    bool target_has_unconfirmed_hand_move_evidence = false;
     bool causal_front_missing_candidate = false;
     bool disappearance_candidate = false;
     int matching_missing_frames = 0;

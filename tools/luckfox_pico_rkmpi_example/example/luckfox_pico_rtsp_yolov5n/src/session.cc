@@ -203,6 +203,7 @@ void SessionManager::reset_operation_runtime_() {
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
     visible_count_out_candidate_ids_.clear();
+    visible_count_identity_relaxed_ids_.clear();
     visible_count_missing_counts_.clear();
     visible_count_confirmed_out_ids_.clear();
     visible_count_continuity_reset_item_ids_.clear();

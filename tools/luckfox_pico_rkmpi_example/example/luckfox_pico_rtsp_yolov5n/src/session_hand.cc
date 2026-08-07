@@ -61,6 +61,7 @@ void SessionManager::begin_working_operation_(const BBox& hand_box,
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
     visible_count_out_candidate_ids_.clear();
+    visible_count_identity_relaxed_ids_.clear();
     visible_count_missing_counts_.clear();
     visible_count_confirmed_out_ids_.clear();
     visible_count_continuity_reset_item_ids_.clear();

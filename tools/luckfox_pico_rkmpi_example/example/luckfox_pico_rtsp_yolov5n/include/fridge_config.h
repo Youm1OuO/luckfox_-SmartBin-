@@ -257,6 +257,11 @@ constexpr float FLOW3_CONFIRMED_OCCLUSION_EDGE_RESIDUAL_PX = 8.0f;
 // Dedicated threshold for DISAPPEARANCE_SUPPORTED.  It does not participate
 // in identity, D/MOVED confirmation, ordinary OUT, or blocker creation.
 constexpr float FLOW3_CONFIRMED_OCCLUSION_DISAPPEARANCE_MIN_COVER_RATIO = 0.85f;
+// Causal front-missing may accept a visibly partial front only when the
+// overlap is still substantial enough to be a plausible blocker.  This lower
+// bound applies only with unresolved HAND/POSSIBLE_MOVED target evidence; it
+// does not weaken ordinary geometric disappearance or OUT.
+constexpr float FLOW3_CAUSAL_OCCLUSION_MIN_COVER_RATIO = 0.30f;
 // 3.0 的 D→C 遮挡在 D 已确认放下时才写入 block_ids。新 D 只部分覆盖
 // C 但 C 已处于 HAND_* 时，达到该比例可以作为“先保留 C，不判 OUT”的证据。
 constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
