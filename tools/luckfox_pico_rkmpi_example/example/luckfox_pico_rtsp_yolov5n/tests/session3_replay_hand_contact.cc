@@ -441,6 +441,172 @@ void test_merged_hand_detection_suspends_item_deltas() {
     assert(right.carrier_hand_ambiguous);
 }
 
+// 两只手先各自覆盖 C，下一帧被合并成一个手框。此时每个 C 都必须保留
+// hand delta 已中断的历史，而不是借另一只手的位移。手离开后，两个不同
+// 类别的终点均连续、唯一地直接可见时，应在同一事务内一起确认 MOVED。
+void test_interrupted_two_hand_recovery_commits_both_moves() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 500, 100, 600, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::BBox> separate_hands;
+    separate_hands.push_back(fridge::BBox(80, 80, 220, 220));
+    separate_hands.push_back(fridge::BBox(480, 80, 620, 220));
+    // 首帧仍保留 C 自己的直接框，建立 strict first_hand_block_box；随后
+    // 才用合并手框制造 hand_id/delta 中断。
+    send_frame(&session, stable, separate_hands, &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 620, 220)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& interrupted =
+        session.operation_tracks();
+    const fridge::OperationTrack& left = interrupted.find(1)->second;
+    const fridge::OperationTrack& right = interrupted.find(2)->second;
+    assert(left.hand_delta_interrupted);
+    assert(right.hand_delta_interrupted);
+    assert(left.has_first_hand_block_box);
+    assert(right.has_first_hand_block_box);
+    assert(left.move_values.empty());
+    assert(right.move_values.empty());
+
+    std::vector<fridge::Detection> endpoints;
+    endpoints.push_back(det(0, 180, 100, 280, 200));
+    endpoints.push_back(det(2, 420, 100, 520, 200));
+    fridge::SettlementResult result = settle_after_hand(&session, endpoints, &frame);
+
+    assert(result.committed);
+    assert(!session.operation_pending());
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(has_event(result, fridge::EventKind::MOVED, 1));
+    assert(has_event(result, fridge::EventKind::MOVED, 2));
+}
+
+// 有手阶段已唯一看到两个旧 C 各自贴手地离开原位，但手框随后合并，因而
+// 两条 delta 都被保护性暂停。两个 C 消失后仍只能经过原有连续无手缺失
+// 窗口，最后在一个原子事务里一起 OUT，不能因“同时不见”而单帧直接 OUT。
+void test_interrupted_two_hand_exit_commits_both_outs_after_missing_window() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 500, 100, 600, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::BBox> separate_hands;
+    separate_hands.push_back(fridge::BBox(80, 80, 220, 220));
+    separate_hands.push_back(fridge::BBox(480, 80, 620, 220));
+    send_frame(&session, stable, separate_hands, &frame);
+
+    std::vector<fridge::Detection> moving_while_merged;
+    moving_while_merged.push_back(det(0, 180, 100, 280, 200));
+    moving_while_merged.push_back(det(2, 420, 100, 520, 200));
+    send_frame(&session, moving_while_merged,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 620, 220)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& before_exit =
+        session.operation_tracks();
+    const fridge::OperationTrack& left = before_exit.find(1)->second;
+    const fridge::OperationTrack& right = before_exit.find(2)->second;
+    assert(left.hand_delta_interrupted);
+    assert(right.hand_delta_interrupted);
+    assert(left.has_direct_exit_evidence);
+    assert(right.has_direct_exit_evidence);
+    assert(left.move_values.empty());
+    assert(right.move_values.empty());
+
+    const int first_no_hand = frame++;
+    fridge::FrameProcessResult first = session.process_frame(
+        std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+        first_no_hand, first_no_hand);
+    assert(first.no_hand_frame_processed);
+    assert(!first.settlement.committed);
+    assert(session.operation_pending());
+    assert(!has_event(first.settlement, fridge::EventKind::OUT, 1));
+    assert(!has_event(first.settlement, fridge::EventKind::OUT, 2));
+
+    fridge::SettlementResult result;
+    for (int i = 0; i < 4; ++i) {
+        const int no_hand_frame = frame++;
+        fridge::FrameProcessResult next = session.process_frame(
+            std::vector<fridge::Detection>(), std::vector<fridge::BBox>(),
+            no_hand_frame, no_hand_frame);
+        if (next.no_hand_frame_processed) result = next.settlement;
+        if (result.committed) break;
+    }
+
+    assert(result.committed);
+    assert(!session.operation_pending());
+    assert(session.inventory().size() == 0);
+    assert(has_event(result, fridge::EventKind::OUT, 1));
+    assert(has_event(result, fridge::EventKind::OUT, 2));
+}
+
+// hand_id 中断本身绝不是移动证据。两个 C 先留下离开候选、再在手仍存在时
+// 回到原位置，最后无手稳定看到原位时，必须沿已有静态收尾提交，不产生
+// MOVED 或 OUT。
+void test_interrupted_two_hand_return_to_original_stays_static() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 200, 200));
+    initial.push_back(item(2, 2, 500, 100, 600, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::BBox> separate_hands;
+    separate_hands.push_back(fridge::BBox(80, 80, 220, 220));
+    separate_hands.push_back(fridge::BBox(480, 80, 620, 220));
+    send_frame(&session, stable, separate_hands, &frame);
+
+    std::vector<fridge::Detection> moved;
+    moved.push_back(det(0, 180, 100, 280, 200));
+    moved.push_back(det(2, 420, 100, 520, 200));
+    send_frame(&session, moved,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 620, 220)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& interrupted =
+        session.operation_tracks();
+    const fridge::OperationTrack& left = interrupted.find(1)->second;
+    const fridge::OperationTrack& right = interrupted.find(2)->second;
+    assert(left.hand_delta_interrupted);
+    assert(right.hand_delta_interrupted);
+    assert(left.has_direct_exit_evidence);
+    assert(right.has_direct_exit_evidence);
+
+    send_frame(&session, stable,
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 620, 220)), &frame);
+
+    fridge::SettlementResult result = settle_after_hand(&session, stable, &frame);
+    assert(result.committed);
+    assert(!session.operation_pending());
+    assert(session.inventory().size() == 2);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(session.inventory().find_by_item(2) != 0);
+    assert(!has_event(result, fridge::EventKind::MOVED, 1));
+    assert(!has_event(result, fridge::EventKind::MOVED, 2));
+    assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::OUT, 2));
+}
+
 // 两条旧手轨迹都能几何接上同一个当前框时，即使 H1 的代价显著更低，
 // 当前框仍可能是合并框。不能让 H1 继续把这个框的位移写给左侧物品。
 void test_skewed_merged_hand_detection_suspends_all_item_deltas() {

@@ -1,7 +1,7 @@
 # .pt → .ONNX (正常的训练与转模型, 在wls中)
-# export.py 在 yolov5 中
+# export.py 在 yolov5n 中
 
-cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5
+cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5n
 
 python export.py \
     --rknpu \
@@ -13,15 +13,16 @@ python export.py \
 
 
 // 改矫正用的图片 (在wls中)
-    cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5/fridge_project/scripts/
+    cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5n/fridge_project/scripts/
     python build_calib_set.py --num 200
 
 冰箱数据集时：
-    cd /home/muyou/Projects/workspace/luckfox_demo
+    cd /home/muyou/Projects/workspace/luckfox_demo/tools/yolov5n
 
-    python3 tools/yolov5/fridge_project/scripts/build_calib_set.py \
-        --num 300 \
-        --datasets-root tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5/dataset
+    python fridge_project/scripts/build_calib_set.py \
+        --num 400 \
+        --splits train \
+        --datasets-root /home/muyou/Projects/workspace/luckfox_demo/tools/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_yolov5n/dataset
 
 ---------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------
@@ -72,9 +73,9 @@ python3 convert.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文�
 python3 convert_fridge.py <输入的.onnx文件的路径> rv1106 i8 <输出的.rknn文件的路径>
 即:
 python3 convert_fridge.py \
-    /workspace/tools/yolov5/runs/train/fridge_self_s1_704_unfreeze/weights/best.onnx \
+    /workspace/tools/yolov5n/runs/train/fridge_new_class49_704/weights/best.onnx \
     rv1106 i8 \
-    /workspace/tools/yolov5/runs/train/fridge_self_s1_704_unfreeze/weights/best.rknn
+    /workspace/tools/yolov5n/runs/train/fridge_new_class49_704/weights/best.rknn
 
 
 

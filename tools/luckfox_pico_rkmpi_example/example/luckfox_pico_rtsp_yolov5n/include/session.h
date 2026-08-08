@@ -211,6 +211,16 @@ struct OperationTrack {
     // 手来源；ambiguous 时保留已有路径但不追加任意手的 delta。
     int carrier_hand_id = -1;
     bool carrier_hand_ambiguous = false;
+    // carrier_hand_ambiguous 只描述当前帧能否安全使用 hand delta；一旦某条
+    // 旧 C 因 hand_id 暂失、合并或接手歧义而跳过 delta，本标记在本轮事务内
+    // 保留该历史，以便无手阶段只凭严格的物品直接证据恢复，而不借用别的手。
+    bool hand_delta_interrupted = false;
+    // 没有最终可见框的 OUT 不能从 hand_delta_interrupted 本身推导。这里只
+    // 保存该旧 C 在有手阶段唯一、贴手且已离开原位置的最后直接候选；无手
+    // 阶段仍必须经过原有连续缺失、alias 和遮挡仲裁才能使用它。
+    bool has_direct_exit_evidence = false;
+    BBox direct_exit_box;
+    int direct_exit_frame = -1;
     // 仅 POST_HAND_REVEAL_D 使用：它在第几张无手帧首次出现。
     // 后续一张有效无手帧若不能自匹配，就丢弃该候选而不产生事件。
     int post_hand_reveal_no_hand_streak = -1;
@@ -380,6 +390,10 @@ private:
                                        MoveValue* delta) const;
     int hand_history_size_(int hand_id) const;
     bool any_current_hand_moved_() const;
+    void mark_hand_delta_interrupted_(OperationTrack* track, const char* reason);
+    void record_direct_exit_evidence_from_reappear_candidate_(
+        OperationTrack* track, const std::vector<BBox>& hand_boxes,
+        const char* source);
     void append_move_to_existing_hand_tracks_();
     void update_existing_contact_tracks_(
         const std::vector<BBox>& hand_boxes,
@@ -452,6 +466,12 @@ private:
         std::set<int>* claimed_detection_indices);
     SettlementResult settle_no_hand_frame_(const std::vector<Detection>& detections,
                                            int frame_id);
+    // 只在无手阶段全局一对一归属完成后使用。它不是普通 MOVED 门槛的替代，
+    // 仅补偿 hand_id 保护性中断造成的 delta 空档。
+    bool can_confirm_direct_recovered_move_(const OperationTrack& track,
+                                            const InventoryItem& original,
+                                            const Detection& endpoint,
+                                            int detection_index) const;
     bool has_unresolved_no_hand_state_(
         const std::vector<Detection>& detections,
         const std::set<int>& observed_item_ids,

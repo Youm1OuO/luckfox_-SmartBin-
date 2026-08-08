@@ -291,6 +291,41 @@ void test_hand_visible_d_does_not_confirm_from_strict_static_old_c() {
     assert(!has_event(result, fridge::EventKind::OCCLUDED, 1));
 }
 
+// 手边同一实体偶发一个低分异类重复框时，它不能被登记成新的 HAND_VISIBLE_D，
+// 更不能留下 C-D alias。高分橙子框已由 operation-start 旧 C 唯一拥有，
+// 低分苹果框则只作为跨类别重复提示保留给诊断。
+void test_low_score_cross_class_duplicate_does_not_create_hand_visible_d() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 2, 500, 100, 600, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    const std::vector<fridge::Detection> stable(
+        1, det(2, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> duplicated = stable;
+    duplicated.push_back(det(0, 500, 100, 600, 200, 0.25f));
+    send_frame(&session, duplicated,
+               std::vector<fridge::BBox>(1, fridge::BBox(480, 80, 620, 220)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    std::map<int, fridge::OperationTrack>::const_iterator old = tracks.find(1);
+    assert(old != tracks.end());
+    assert(old->second.conflicting_suspect_keys.empty());
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        assert(!(it->second.is_suspect_new && it->second.cls_id == 0));
+    }
+
+    fridge::SettlementResult result = settle_after_hand(&session, stable, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
 // 旧物品刚被手遮住时，YOLO 常给出与完整框只部分重叠的局部框。它必须优先
 // 认领给已有 item，而不是被 scan_or_update_suspects_ 误建成新的 D。
 void test_partial_existing_item_is_not_registered_as_new_d() {

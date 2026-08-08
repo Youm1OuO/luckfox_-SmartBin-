@@ -46,3 +46,4 @@ green_beans
 lettuce
 cabbage
 bitter_gourd
+hairy_gourd

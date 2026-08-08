@@ -18,6 +18,7 @@ int main() {
     test_post_hand_reveal_requires_continuous_no_hand_confirmation();
     test_d_reappearance_does_not_claim_strict_existing_inventory();
     test_hand_visible_d_does_not_confirm_from_strict_static_old_c();
+    test_low_score_cross_class_duplicate_does_not_create_hand_visible_d();
     test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
     test_partial_existing_item_is_not_registered_as_new_d();
     test_fast_same_class_b_becomes_c_candidate_not_d();
@@ -59,6 +60,9 @@ int main() {
     test_one_hand_moves_two_items_with_one_hand_id();
     test_two_hands_keep_opposite_item_deltas_when_detection_order_changes();
     test_merged_hand_detection_suspends_item_deltas();
+    test_interrupted_two_hand_recovery_commits_both_moves();
+    test_interrupted_two_hand_exit_commits_both_outs_after_missing_window();
+    test_interrupted_two_hand_return_to_original_stays_static();
     test_skewed_merged_hand_detection_suspends_all_item_deltas();
     test_second_hand_overlap_suspends_existing_item_delta();
     test_temporarily_lost_hand_recovers_without_gap_delta();

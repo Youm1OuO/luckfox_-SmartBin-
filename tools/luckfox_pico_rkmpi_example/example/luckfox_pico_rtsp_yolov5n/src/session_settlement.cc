@@ -76,6 +76,53 @@ const char* occlusion_plan_reason(const BlockerTransitionPlan& plan) {
 
 }  // namespace
 
+bool SessionManager::can_confirm_direct_recovered_move_(
+        const OperationTrack& track, const InventoryItem& original,
+        const Detection& endpoint, int detection_index) const {
+    const bool operation_start_old = !track.is_suspect_new && track.item_id > 0 &&
+        operation_start_inventory_.count(track.item_id);
+    const bool active_hand_path = is_active_existing_hand_track(track) &&
+        track.contact_state == ContactState::NONE &&
+        track.resolution == ExistingItemResolution::NONE;
+    const bool identity_clear = !is_claim_protected(track) &&
+        !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
+        !track.no_hand_candidate_ambiguous &&
+        !track.no_hand_candidate_reserved_by_stronger_owner &&
+        !old_track_has_unresolved_alias_(track);
+    const bool endpoint_matches_candidate =
+        track_match_box(track.cls_id, track.reappear_candidate_box,
+                        endpoint.cls_id, endpoint.box);
+    const bool endpoint_moved = boxes_differ_as_move(original.base_box, endpoint.box);
+    if (!operation_start_old || !track.hand_delta_interrupted ||
+        !track.has_first_hand_block_box || !active_hand_path || !identity_clear ||
+        endpoint.cls_id != track.cls_id || endpoint.cls_id != original.cls_id ||
+        !reappear_candidate_is_confirmed(track) || !endpoint_matches_candidate ||
+        !endpoint_moved) {
+        if (track.hand_delta_interrupted) {
+            trace_(
+                "DIRECT-RECOVERY",
+                "item=%d detection=%d action=reject start-old=%d interrupted=%d first-hand=%d "
+                "active-hand=%d identity-clear=%d cls-match=%d candidate-ready=%d "
+                "endpoint-match=%d moved=%d",
+                track.item_id, detection_index, operation_start_old ? 1 : 0,
+                track.hand_delta_interrupted ? 1 : 0,
+                track.has_first_hand_block_box ? 1 : 0, active_hand_path ? 1 : 0,
+                identity_clear ? 1 : 0,
+                endpoint.cls_id == track.cls_id && endpoint.cls_id == original.cls_id ? 1 : 0,
+                reappear_candidate_is_confirmed(track) ? 1 : 0,
+                endpoint_matches_candidate ? 1 : 0, endpoint_moved ? 1 : 0);
+        }
+        return false;
+    }
+    const std::map<int, std::set<int> >::const_iterator excluded =
+        cross_class_duplicate_identity_exclusions_.find(track.item_id);
+    if (excluded != cross_class_duplicate_identity_exclusions_.end() &&
+        excluded->second.count(detection_index)) {
+        return false;
+    }
+    return true;
+}
+
 void SessionManager::mark_pending_out_(int item_id) {
     pending_out_ids_.insert(item_id);
     OperationTrack* track = find_runtime_for_item_(item_id);
@@ -1331,12 +1378,26 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         else if (!runtime_in_claim_grace && runtime && !runtime->track.empty()) {
             references[it->first] = runtime->track.back();
         }
+        const bool interrupted_direct_recovery_candidate =
+            !runtime_in_claim_grace && runtime && !runtime->is_suspect_new &&
+            operation_start_inventory_.count(it->first) &&
+            runtime->hand_delta_interrupted &&
+            runtime->contact_state == ContactState::NONE &&
+            runtime->resolution == ExistingItemResolution::NONE &&
+            is_active_existing_hand_track(*runtime) &&
+            runtime->has_first_hand_block_box &&
+            !runtime_has_ambiguous_b &&
+            !runtime->no_hand_candidate_ambiguous &&
+            !runtime->no_hand_candidate_reserved_by_stronger_owner &&
+            !old_track_has_unresolved_alias_(*runtime) &&
+            reappear_candidate_is_confirmed(*runtime);
         if (!runtime_has_ambiguous_b &&
             (pending_in_ids_.count(it->first) || confirmed_moved_ids_.count(it->first) ||
-            (!runtime_in_claim_grace && runtime && (runtime->hold_and_move ||
-                         runtime->contact_state != ContactState::NONE ||
-                         (has_meaningful_hand_move(*runtime) &&
-                          runtime->state != OperationTrackState::NORMAL))))) {
+             interrupted_direct_recovery_candidate ||
+             (!runtime_in_claim_grace && runtime && (runtime->hold_and_move ||
+                          runtime->contact_state != ContactState::NONE ||
+                          (has_meaningful_hand_move(*runtime) &&
+                           runtime->state != OperationTrackState::NORMAL))))) {
             track_priority_ids.insert(it->first);
         }
     }
@@ -1417,7 +1478,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     // 不把普通未匹配框当作移动终点。
     for (std::map<int, int>::const_iterator it = item_to_observation.begin();
          it != item_to_observation.end(); ++it) {
-        const OperationTrack* runtime = find_runtime_for_item_(it->first);
+        OperationTrack* runtime = find_runtime_for_item_(it->first);
         std::map<int, InventoryItem>::const_iterator original =
             operation_start_inventory_.find(it->first);
         if (!runtime || original == operation_start_inventory_.end() ||
@@ -1444,6 +1505,8 @@ SettlementResult SessionManager::settle_no_hand_frame_(
                    runtime->no_hand_candidate_reserved_by_stronger_owner ? 1 : 0);
             continue;
         }
+        const bool direct_recovered_move = can_confirm_direct_recovered_move_(
+            *runtime, original->second, observed[it->second], it->second);
         // CONTACT_CANDIDATE 必须先凑够两次有效 B 才能确认整理；仅有一条
         // observed_move_values 不能绕过 CONTACT_MOVING 门槛。普通 HAND_*
         // 仍保留原有的 move_values/hold_and_move 收尾规则。
@@ -1452,11 +1515,12 @@ SettlementResult SessionManager::settle_no_hand_frame_(
             runtime->hold_and_move;
         const bool has_hand_confirmation = runtime->contact_state == ContactState::NONE &&
             (runtime->hold_and_move || has_meaningful_hand_move(*runtime));
-        if (!has_contact_confirmation && !has_hand_confirmation &&
+        if (!direct_recovered_move &&
+            !has_contact_confirmation && !has_hand_confirmation &&
             runtime->observed_move_values.empty()) {
             continue;
         }
-        if (runtime->contact_state != ContactState::NONE &&
+        if (!direct_recovered_move && runtime->contact_state != ContactState::NONE &&
             !has_contact_confirmation) {
             continue;
         }
@@ -1466,8 +1530,18 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         const bool matches_any_path = track_path_match_cost(
             original->second, *runtime, observed[it->second]) <
             std::numeric_limits<float>::infinity();
-        if ((matches_endpoint || matches_any_path) &&
-            boxes_differ_as_move(original->second.base_box, observed[it->second].box)) {
+        if (direct_recovered_move) {
+            trace_("DIRECT-RECOVERY",
+                   "item=%d detection=%d action=confirm-moved frame=%d",
+                   it->first, it->second, frame_id);
+            confirm_rearrange_(*runtime, observed[it->second].box,
+                               observed[it->second].score, frame_id);
+        } else if ((matches_endpoint || matches_any_path) &&
+                   boxes_differ_as_move(original->second.base_box,
+                                        observed[it->second].box)) {
+            // 保持原有 HAND/CONTACT 路径的确认时机不变。它可能仍需等自身的
+            // reappear 候选完成连续确认；本次只为 hand delta 已中断的严格
+            // direct_recovered_move 新路径调用 confirm_rearrange_。
             confirmed_moved_ids_.insert(it->first);
         }
     }

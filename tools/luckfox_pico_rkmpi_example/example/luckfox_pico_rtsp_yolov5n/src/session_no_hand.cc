@@ -1490,6 +1490,21 @@ bool SessionManager::has_unresolved_no_hand_state_(
                 trace_track_("NO-HAND", track, "reappear-candidate-needs-second-frame");
                 continue;
             }
+            // 只有本轮因 hand_id 保护而丢失过 delta 的 HAND_* 旧 C，才
+            // 必须在这里等直接恢复路径结案，避免同伴的 MOVED/IN 先提交并
+            // 清空整轮 operation runtime。CONTACT_*、静态收尾等既有路径
+            // 仍按原来的结算时机放行，不能被这个联合提交门永久挡住。
+            const bool requires_interrupted_direct_recovery_barrier =
+                track.hand_delta_interrupted &&
+                track.contact_state == ContactState::NONE &&
+                is_active_existing_hand_track(track);
+            if (requires_interrupted_direct_recovery_barrier &&
+                existing_item_needs_settlement(track)) {
+                unresolved = true;
+                trace_track_("SETTLE", track,
+                             "defer-directly-observed-still-unresolved");
+                continue;
+            }
             track.no_hand_missing_count = 0;
             trace_track_("NO-HAND", track, "directly-observed");
             continue;
@@ -1569,10 +1584,30 @@ bool SessionManager::has_unresolved_no_hand_state_(
             track.contact_state == ContactState::NONE &&
             track.state != OperationTrackState::NORMAL &&
             (track.hold_and_move || has_meaningful_hand_move(track));
-        if (!contact_out_evidence && !hand_out_evidence) {
+        const bool interrupted_direct_exit_evidence =
+            track.contact_state == ContactState::NONE &&
+            track.state != OperationTrackState::NORMAL &&
+            track.hand_delta_interrupted && track.has_direct_exit_evidence &&
+            track.has_first_hand_block_box && track.direct_exit_frame >= 0 &&
+            track.direct_exit_box.area() > 0.0f &&
+            boxes_differ_as_move(track.original_box, track.direct_exit_box) &&
+            !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
+            !track.no_hand_candidate_ambiguous &&
+            !track.no_hand_candidate_reserved_by_stronger_owner &&
+            !old_track_has_unresolved_alias_(track);
+        if (!contact_out_evidence && !hand_out_evidence &&
+            !interrupted_direct_exit_evidence) {
             unresolved = true;
             trace_track_("NO-HAND", track, "missing-without-sufficient-out-evidence");
             continue;
+        }
+        if (interrupted_direct_exit_evidence && !contact_out_evidence &&
+            !hand_out_evidence) {
+            trace_("DIRECT-EXIT",
+                   "item=%d action=accept-for-existing-missing-chain evidence-frame=%d "
+                   "missing=%d/%d",
+                   track.item_id, track.direct_exit_frame, track.no_hand_missing_count,
+                   FLOW3_NO_HAND_OUT_MISSING_FRAMES);
         }
 
         const int old_missing_count = track.no_hand_missing_count;

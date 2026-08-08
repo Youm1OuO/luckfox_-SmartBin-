@@ -39,6 +39,7 @@ void test_new_item_replacing_c_old_position_is_registered_without_hand_contact()
 void test_post_hand_reveal_requires_continuous_no_hand_confirmation();
 void test_d_reappearance_does_not_claim_strict_existing_inventory();
 void test_hand_visible_d_does_not_confirm_from_strict_static_old_c();
+void test_low_score_cross_class_duplicate_does_not_create_hand_visible_d();
 void test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
 void test_partial_existing_item_is_not_registered_as_new_d();
 void test_fast_same_class_b_becomes_c_candidate_not_d();
@@ -80,6 +81,9 @@ void test_stationary_hand_frame_does_not_change_hand_evidence();
 void test_one_hand_moves_two_items_with_one_hand_id();
 void test_two_hands_keep_opposite_item_deltas_when_detection_order_changes();
 void test_merged_hand_detection_suspends_item_deltas();
+void test_interrupted_two_hand_recovery_commits_both_moves();
+void test_interrupted_two_hand_exit_commits_both_outs_after_missing_window();
+void test_interrupted_two_hand_return_to_original_stays_static();
 void test_skewed_merged_hand_detection_suspends_all_item_deltas();
 void test_second_hand_overlap_suspends_existing_item_delta();
 void test_temporarily_lost_hand_recovers_without_gap_delta();
