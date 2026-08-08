@@ -41,9 +41,12 @@ constexpr int COLOR_MIN_VALUE = 35;
 // 其他情况 -> orange。
 constexpr float SIZE_REFERENCE_WIDTH = 1280.0f;
 constexpr float SIZE_REFERENCE_HEIGHT = 720.0f;
-constexpr float EGG_MAX_BOX_WIDTH = 155.0f;
-constexpr float EGG_MAX_BOX_HEIGHT = 235.0f;
-constexpr float EGG_MAX_BOX_AREA = 26000.0f;
+// 由当前 train + val 的真实标注框统计得到（原图基准 1280x720）：
+// egg 的中位数约为 103x101、面积 10399。这个阈值覆盖验证集约 98% 的
+// egg，同时避免仅因尺寸过宽而把较多 orange 改成 egg。
+constexpr float EGG_MAX_BOX_WIDTH = 140.0f;
+constexpr float EGG_MAX_BOX_HEIGHT = 150.0f;
+constexpr float EGG_MAX_BOX_AREA = 20000.0f;
 
 struct ColorStats {
     bool valid = false;
