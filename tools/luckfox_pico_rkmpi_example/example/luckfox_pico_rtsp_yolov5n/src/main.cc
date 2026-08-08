@@ -45,6 +45,7 @@
 #include "app_preprocess.h"
 #include "app_door_state.h"
 #include "app_display.h"
+#include "color_postprocess.h"
 
 // 1280*720, 1920*1080
 #define DISP_WIDTH  1280
@@ -388,6 +389,11 @@ int main(int argc, char *argv[]) {
 					}
 				}
 			}
+
+			// 演示专用颜色二次判别：只修改 apple/onion、egg/orange 的 cls_id。
+			// bbox、score、检测数量和所有非目标类别保持 YOLO 原结果。
+			// hand_boxes 已收集完成后再调用，手部遮挡会自动禁止颜色覆盖。
+			fridge::apply_color_postprocess(frame, detections, hand_boxes);
 
 			// ============================================================
 			//  获取时间戳（手检测和事件上报都需要）
