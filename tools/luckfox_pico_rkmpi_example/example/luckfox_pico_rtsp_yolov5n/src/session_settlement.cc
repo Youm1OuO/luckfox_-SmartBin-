@@ -123,6 +123,61 @@ bool SessionManager::can_confirm_direct_recovered_move_(
     return true;
 }
 
+bool SessionManager::can_confirm_direct_object_recovered_move_(
+        const OperationTrack& track, const InventoryItem& original,
+        const Detection& endpoint, int detection_index,
+        bool has_exact_global_owner) const {
+    const bool operation_start_old = !track.is_suspect_new && track.item_id > 0 &&
+        operation_start_inventory_.count(track.item_id);
+    const bool active_hand_path = is_active_existing_hand_track(track) &&
+        track.contact_state == ContactState::NONE &&
+        track.resolution == ExistingItemResolution::NONE;
+    // local reserved-by-stronger-old-c 只是全局计划缺席时的 fallback；当前已经由 forced
+    // 一对一对关系指定本 C 的终点时，不应再用它反向拒绝。真实的模糊、alias 和 shadow
+    // 仍然不可通过。
+    const bool identity_clear = !is_claim_protected(track) &&
+        !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
+        !track.no_hand_candidate_ambiguous &&
+        !old_track_has_unresolved_alias_(track);
+    const bool endpoint_matches_object_path = track.has_direct_object_last_box &&
+        track_match_box(track.cls_id, track.direct_object_last_box,
+                        endpoint.cls_id, endpoint.box);
+    const bool endpoint_matches_candidate = reappear_candidate_is_confirmed(track) &&
+        track_match_box(track.cls_id, track.reappear_candidate_box,
+                        endpoint.cls_id, endpoint.box);
+    const bool endpoint_moved = boxes_differ_as_move(original.base_box, endpoint.box);
+    const bool capture_context = track.carrier_capture_context ||
+        track.reappear_candidate_started_touching_hand ||
+        track.contact_started_touching_hand;
+    const bool fresh_object_path = track.direct_object_last_frame >= 0 &&
+        trace_frame_id_ - track.direct_object_last_frame <= 1;
+    const bool not_shadow = !shadow_detection_indices_.count(detection_index);
+    const std::map<int, std::set<int> >::const_iterator excluded =
+        cross_class_duplicate_identity_exclusions_.find(track.item_id);
+    const bool not_cross_class_duplicate =
+        excluded == cross_class_duplicate_identity_exclusions_.end() ||
+        !excluded->second.count(detection_index);
+    const bool accepted = operation_start_old && active_hand_path && identity_clear &&
+        has_exact_global_owner && track.has_direct_object_move_evidence &&
+        track.direct_object_path_streak >= FLOW3_NO_HAND_D_CONFIRM_FRAMES &&
+        fresh_object_path && endpoint.cls_id == track.cls_id &&
+        endpoint.cls_id == original.cls_id && endpoint_matches_object_path &&
+        endpoint_matches_candidate && endpoint_moved && capture_context && not_shadow &&
+        not_cross_class_duplicate;
+    if (!accepted && track.has_direct_object_move_evidence) {
+        trace_("MOVED-RECOVERY",
+               "item=%d detection=%d source=direct-object action=defer start-old=%d "
+               "active-hand=%d identity-clear=%d global-owner=%d path=%d candidate=%d "
+               "moved=%d capture=%d shadow=%d",
+               track.item_id, detection_index, operation_start_old ? 1 : 0,
+               active_hand_path ? 1 : 0, identity_clear ? 1 : 0,
+               has_exact_global_owner ? 1 : 0, endpoint_matches_object_path ? 1 : 0,
+               endpoint_matches_candidate ? 1 : 0, endpoint_moved ? 1 : 0,
+               capture_context ? 1 : 0, not_shadow ? 0 : 1);
+    }
+    return accepted;
+}
+
 void SessionManager::mark_pending_out_(int item_id) {
     pending_out_ids_.insert(item_id);
     OperationTrack* track = find_runtime_for_item_(item_id);
@@ -1536,16 +1591,28 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         const bool unresolved_alias_before_confirmation =
             old_track_has_unresolved_alias_(*runtime) &&
             runtime->alias_no_hand_match_count < FLOW3_NO_HAND_D_CONFIRM_FRAMES;
+        const std::map<int, int>::const_iterator global_forced =
+            global_ownership_plan.forced_detection_by_item.find(it->first);
+        const bool has_exact_global_owner =
+            global_forced != global_ownership_plan.forced_detection_by_item.end() &&
+            global_forced->second == it->second &&
+            !global_ownership_plan.ambiguous_item_ids.count(it->first);
+        const bool direct_object_recovered_move =
+            can_confirm_direct_object_recovered_move_(
+                *runtime, original->second, observed[it->second], it->second,
+                has_exact_global_owner);
         const bool unresolved_no_hand_identity =
             runtime->no_hand_candidate_ambiguous ||
-            runtime->no_hand_candidate_reserved_by_stronger_owner;
+            (runtime->no_hand_candidate_reserved_by_stronger_owner &&
+             !direct_object_recovered_move);
         if (unresolved_alias_before_confirmation || unresolved_no_hand_identity) {
             trace_("SETTLE",
                    "item=%d skip-path-moved-confirmation alias-wait=%d "
-                   "candidate-ambiguous=%d reserved=%d",
+                   "candidate-ambiguous=%d reserved=%d direct-object=%d",
                    it->first, unresolved_alias_before_confirmation ? 1 : 0,
                    runtime->no_hand_candidate_ambiguous ? 1 : 0,
-                   runtime->no_hand_candidate_reserved_by_stronger_owner ? 1 : 0);
+                   runtime->no_hand_candidate_reserved_by_stronger_owner ? 1 : 0,
+                   direct_object_recovered_move ? 1 : 0);
             continue;
         }
         const bool direct_recovered_move = can_confirm_direct_recovered_move_(
@@ -1558,12 +1625,13 @@ SettlementResult SessionManager::settle_no_hand_frame_(
             runtime->hold_and_move;
         const bool has_hand_confirmation = runtime->contact_state == ContactState::NONE &&
             (runtime->hold_and_move || has_meaningful_hand_move(*runtime));
-        if (!direct_recovered_move &&
+        if (!direct_recovered_move && !direct_object_recovered_move &&
             !has_contact_confirmation && !has_hand_confirmation &&
             runtime->observed_move_values.empty()) {
             continue;
         }
-        if (!direct_recovered_move && runtime->contact_state != ContactState::NONE &&
+        if (!direct_recovered_move && !direct_object_recovered_move &&
+            runtime->contact_state != ContactState::NONE &&
             !has_contact_confirmation) {
             continue;
         }
@@ -1573,10 +1641,12 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         const bool matches_any_path = track_path_match_cost(
             original->second, *runtime, observed[it->second]) <
             std::numeric_limits<float>::infinity();
-        if (direct_recovered_move) {
+        if (direct_recovered_move || direct_object_recovered_move) {
+            const char* source = direct_object_recovered_move
+                ? "direct-object" : "hand-delta";
             trace_("DIRECT-RECOVERY",
-                   "item=%d detection=%d action=confirm-moved frame=%d",
-                   it->first, it->second, frame_id);
+                   "item=%d detection=%d source=%s action=confirm-moved frame=%d",
+                   it->first, it->second, source, frame_id);
             confirm_rearrange_(*runtime, observed[it->second].box,
                                observed[it->second].score, frame_id);
         } else if ((matches_endpoint || matches_any_path) &&

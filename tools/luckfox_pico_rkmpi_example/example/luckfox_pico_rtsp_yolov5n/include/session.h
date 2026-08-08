@@ -244,7 +244,9 @@ struct OperationTrack {
     int direct_exit_frame = -1;
     // 物品自身的局部可见路径。它与 hand delta 分开保存：即使 hand_id
     // 因合并/漏检而暂停位移，只要当前 B 在全局一对一归属中连续属于本 C，
-    // 仍可作为后续无手缺失链的受限入口，绝不单帧直接 OUT。
+    // 就可以导出两个不同的受限资格：move-ready 只能进入现有 MOVED
+    // 确认；exit-ready 只能作为既有无手缺失 OUT 链的入口。任何一项都不能单帧产生事件。
+    bool has_direct_object_move_evidence = false;
     bool has_direct_object_exit_evidence = false;
     int direct_object_path_streak = 0;
     int direct_object_last_frame = -1;
@@ -430,14 +432,20 @@ private:
                                        MoveValue* delta) const;
     int hand_history_size_(int hand_id) const;
     bool any_current_hand_moved_() const;
+    // 只决定原本会被静止手跳过的帧是否需要为旧 C 补建捕获事实。
+    // 它不作为 D/IN 或事件的创建入口。
+    bool should_bootstrap_capture_start_frame_(
+        const std::vector<BBox>& hand_boxes,
+        const std::vector<Detection>& detections) const;
+    void bootstrap_capture_start_tracks_(const std::vector<BBox>& hand_boxes,
+                                         const std::vector<Detection>& detections);
     void mark_hand_delta_interrupted_(OperationTrack* track, const char* reason);
     void record_direct_exit_evidence_from_reappear_candidate_(
         OperationTrack* track, const std::vector<BBox>& hand_boxes,
         const char* source);
     void record_direct_object_exit_evidence_(
         const std::vector<BBox>& hand_boxes,
-        const std::vector<Detection>& detections,
-        const std::map<int, int>& known_item_owner);
+        const std::vector<Detection>& detections);
     void update_hand_group_exit_witnesses_(
         const std::vector<Detection>& detections,
         const std::map<int, int>& known_item_owner);
@@ -519,6 +527,12 @@ private:
                                             const InventoryItem& original,
                                             const Detection& endpoint,
                                             int detection_index) const;
+    // 独立于 hand delta 的物品路径恢复入口。只接受当前全局图已强制确认的 C -> B 关系，
+    // 并复用 confirm_rearrange_ 和原有原子结算，不会直接生成 MOVED/OUT。
+    bool can_confirm_direct_object_recovered_move_(
+        const OperationTrack& track, const InventoryItem& original,
+        const Detection& endpoint, int detection_index,
+        bool has_exact_global_owner) const;
     bool has_unresolved_no_hand_state_(
         const std::vector<Detection>& detections,
         const std::set<int>& observed_item_ids,

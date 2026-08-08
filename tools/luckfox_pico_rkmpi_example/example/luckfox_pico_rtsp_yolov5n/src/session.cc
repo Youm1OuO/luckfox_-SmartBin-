@@ -504,6 +504,15 @@ FrameProcessResult SessionManager::process_frame(
             }
         }
         if (!has_active_runtime && !any_current_hand_moved_()) {
+            // 手的内部身份正在合并、拆分或漏检时，不能因为本帧没有可靠 delta
+            // 就跳过对旧 C 的捕获观察。下面的补建分支只写入旧 C runtime，不扫描 D、不产生事件。
+            if (should_bootstrap_capture_start_frame_(hand_boxes, food_detections)) {
+                trace_("CAPTURE-START",
+                       "action=bootstrap-stationary-hand-frame hands=%zu detections=%zu",
+                       hand_boxes.size(), food_detections.size());
+                bootstrap_capture_start_tracks_(hand_boxes, food_detections);
+                return output;
+            }
             trace_("FRAME", "skip-stationary-hand-no-active-track");
             return output;
         }

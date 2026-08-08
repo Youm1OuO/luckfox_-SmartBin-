@@ -228,6 +228,7 @@ bool hand_box_reaches_frame_exit(const BBox& hand) {
 
 void clear_direct_object_exit_evidence(OperationTrack* track) {
     if (!track) return;
+    track->has_direct_object_move_evidence = false;
     track->has_direct_object_exit_evidence = false;
     track->direct_object_path_streak = 0;
     track->direct_object_last_frame = -1;
@@ -604,6 +605,106 @@ bool SessionManager::any_current_hand_moved_() const {
     return false;
 }
 
+bool SessionManager::should_bootstrap_capture_start_frame_(
+        const std::vector<BBox>& hand_boxes,
+        const std::vector<Detection>& detections) const {
+    if (hand_boxes.empty() || !working_inventory_active_) return false;
+
+    int visible_start_old_count = 0;
+    bool has_count_deficit = false;
+    bool has_capture_context = false;
+    bool has_hand_affected_old_c = false;
+    bool has_partial_old_path = false;
+
+    for (std::map<int, InventoryItem>::const_iterator original =
+             operation_start_inventory_.begin();
+         original != operation_start_inventory_.end(); ++original) {
+        if (original->second.status == ItemStatus::OCCLUDED ||
+            !working_inventory_.count(original->first)) {
+            continue;
+        }
+        ++visible_start_old_count;
+        const BBox reference = original->second.base_box.area() > 0.0f
+            ? original->second.base_box : original->second.box;
+        if (reference.area() <= 0.0f) continue;
+
+        const OperationTrack* runtime = find_runtime_for_item_(original->first);
+        if (runtime && runtime->carrier_capture_context) has_capture_context = true;
+        if (any_hand_affects_box(hand_boxes, reference)) {
+            has_hand_affected_old_c = true;
+        }
+        for (size_t detection_index = 0; detection_index < detections.size();
+             ++detection_index) {
+            const Detection& detection = detections[detection_index];
+            if (detection.cls_id != original->second.cls_id) continue;
+            if (boxes_differ_as_move(reference, detection.box) &&
+                (partial_match_box(original->second.cls_id, reference,
+                                   detection.cls_id, detection.box) ||
+                 track_match_box(original->second.cls_id, reference,
+                                 detection.cls_id, detection.box))) {
+                has_partial_old_path = true;
+                break;
+            }
+        }
+    }
+    has_count_deficit = static_cast<int>(detections.size()) < visible_start_old_count;
+    return has_hand_affected_old_c || has_count_deficit || has_partial_old_path ||
+        has_capture_context;
+}
+
+void SessionManager::bootstrap_capture_start_tracks_(
+        const std::vector<BBox>& hand_boxes,
+        const std::vector<Detection>& detections) {
+    // 这一个窄分支只复用旧 C 的预约、CONTACT 和 HAND_* 建轨逻辑。故意不调用
+    // scan_or_update_suspects_ ：捕获启动证据不得借机新建 D 或进入 IN 链路。
+    std::set<int> claimed;
+    std::map<int, int> known_item_owner;
+    std::set<int> new_existing_track_ids;
+    reserve_visible_known_detections_(hand_boxes, detections, &claimed,
+                                      &known_item_owner);
+    mark_new_contact_candidates_(hand_boxes, detections, &claimed,
+                                 &known_item_owner, &new_existing_track_ids);
+    mark_newly_hand_blocked_items_(hand_boxes, detections, &claimed,
+                                   &known_item_owner, &new_existing_track_ids);
+
+    for (std::map<int, InventoryItem>::const_iterator original =
+             operation_start_inventory_.begin();
+         original != operation_start_inventory_.end(); ++original) {
+        if (original->second.status == ItemStatus::OCCLUDED) continue;
+        const BBox reference = original->second.base_box.area() > 0.0f
+            ? original->second.base_box : original->second.box;
+        if (reference.area() <= 0.0f ||
+            !any_hand_affects_box(hand_boxes, reference)) {
+            continue;
+        }
+        OperationTrack* track = find_runtime_for_item_(original->first);
+        if (!track || track->is_suspect_new || !is_active_runtime_track(*track)) {
+            trace_("CAPTURE-START",
+                   "item=%d trigger=hand-affects action=skip-no-safe-old-c-runtime",
+                   original->first);
+            continue;
+        }
+
+        // 即使当前手框无法唯一对应 hand_id，也保留“这件 C 确实被手捕获”的对象级事实。
+        // 没有可靠 ID 时只禁用 delta 和 hand-group OUT witness，不借用其他手的位移。
+        track->carrier_capture_context = true;
+        if (track->carrier_hand_id < 0 || track->carrier_hand_ambiguous) {
+            track->carrier_hand_ambiguous = true;
+            track->hand_group_identity_invalid = true;
+            mark_hand_delta_interrupted_(track,
+                                         "capture-start-no-reliable-hand-id");
+        }
+        trace_("CAPTURE-START",
+               "item=%d trigger=hand-affects action=create-runtime state=%s "
+               "hand=%d identity=%s",
+               track->item_id, operation_track_state_name(track->state),
+               track->carrier_hand_id,
+               track->carrier_hand_ambiguous ? "ambiguous" : "stable");
+    }
+    advance_claim_grace_(new_existing_track_ids);
+    update_hand_live_states_();
+}
+
 void SessionManager::mark_hand_delta_interrupted_(OperationTrack* track,
                                                    const char* reason) {
     if (!track || track->is_suspect_new || track->item_id <= 0 ||
@@ -655,8 +756,7 @@ void SessionManager::record_direct_exit_evidence_from_reappear_candidate_(
 
 void SessionManager::record_direct_object_exit_evidence_(
         const std::vector<BBox>& hand_boxes,
-        const std::vector<Detection>& detections,
-        const std::map<int, int>& known_item_owner) {
+        const std::vector<Detection>& detections) {
     const GlobalOwnershipPlan ownership_plan = build_global_ownership_plan(
         detections, working_inventory_, operation_start_inventory_, pending_in_ids_,
         track_buffer_, shadow_detection_indices_);
@@ -669,31 +769,42 @@ void SessionManager::record_direct_object_exit_evidence_(
             !is_active_runtime_track(track)) {
             continue;
         }
+        // 当前已经有全局 forced C -> B 关系时，局部“更强旧 C 暂时预约”不再否定
+        // 这条对象自身的路径事实；真正的模糊、alias 或 shadow 仍会使它保持未决。
         const bool identity_clear = !is_claim_protected(track) &&
             !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
             !track.no_hand_candidate_ambiguous &&
-            !track.no_hand_candidate_reserved_by_stronger_owner &&
             !old_track_has_unresolved_alias_(track) &&
             !ownership_plan.ambiguous_item_ids.count(track.item_id);
         const std::map<int, int>::const_iterator forced =
             ownership_plan.forced_detection_by_item.find(track.item_id);
-        if (!identity_clear || forced == ownership_plan.forced_detection_by_item.end() ||
-            forced->second < 0 ||
-            static_cast<size_t>(forced->second) >= detections.size() ||
-            shadow_detection_indices_.count(forced->second)) {
+        // 真正的 identity 反证（模糊、alias、claim 或 shadow）必须立即撤销两种
+        // object-path 资格。只有“当前完全看不到 B”才可以暂存上一张合法路径，
+        // 供既有无手缺失链在后续帧另行验证；它不能被用于当前 MOVED。
+        if (!identity_clear) {
+            clear_direct_object_exit_evidence(&track);
+            trace_("OBJECT-PATH",
+                   "item=%d action=clear reason=identity-conflict frame=%d",
+                   track.item_id, trace_frame_id_);
+            continue;
+        }
+        if (forced == ownership_plan.forced_detection_by_item.end()) {
             if (track.direct_object_last_frame >= 0 &&
                 trace_frame_id_ - track.direct_object_last_frame > 1) {
                 clear_direct_object_exit_evidence(&track);
             }
             continue;
         }
-
-        const std::map<int, int>::const_iterator local_owner =
-            known_item_owner.find(track.item_id);
-        if (local_owner != known_item_owner.end() && local_owner->second != forced->second) {
+        if (forced->second < 0 ||
+            static_cast<size_t>(forced->second) >= detections.size() ||
+            shadow_detection_indices_.count(forced->second)) {
             clear_direct_object_exit_evidence(&track);
+            trace_("OBJECT-PATH",
+                   "item=%d action=clear reason=invalid-or-shadow-owner frame=%d",
+                   track.item_id, trace_frame_id_);
             continue;
         }
+
         const Detection& detection = detections[static_cast<size_t>(forced->second)];
         if (detection.cls_id != track.cls_id ||
             !boxes_differ_as_move(track.original_box, detection.box)) {
@@ -721,17 +832,19 @@ void SessionManager::record_direct_object_exit_evidence_(
             any_hand_touches_detection_box(hand_boxes, detection.box) ||
             track.reappear_candidate_started_touching_hand ||
             track.contact_started_touching_hand || track.carrier_capture_context;
-        track.has_direct_object_exit_evidence = legal_hand_context &&
+        const bool path_ready = legal_hand_context &&
             track.direct_object_path_streak >= FLOW3_NO_HAND_D_CONFIRM_FRAMES;
-        if (track.has_direct_object_exit_evidence) {
-            trace_("DIRECT-OBJECT",
-                   "item=%d detection=%d action=record-for-missing-chain streak=%d/%d "
-                   "frame=%d box=(%.1f,%.1f,%.1f,%.1f)",
-                   track.item_id, forced->second, track.direct_object_path_streak,
-                   FLOW3_NO_HAND_D_CONFIRM_FRAMES, trace_frame_id_,
-                   detection.box.x1, detection.box.y1,
-                   detection.box.x2, detection.box.y2);
-        }
+        track.has_direct_object_move_evidence = path_ready;
+        // 保留旧的 OUT 缺失链入口，但它和 move-ready 由独立字段表达，
+        // 后续各自只能进入对应的确认门。
+        track.has_direct_object_exit_evidence = path_ready;
+        trace_("OBJECT-PATH",
+               "item=%d detection=%d owner=forced streak=%d/%d move-ready=%d "
+               "exit-ready=%d frame=%d",
+               track.item_id, forced->second, track.direct_object_path_streak,
+               FLOW3_NO_HAND_D_CONFIRM_FRAMES,
+               track.has_direct_object_move_evidence ? 1 : 0,
+               track.has_direct_object_exit_evidence ? 1 : 0, trace_frame_id_);
     }
 }
 
@@ -1349,6 +1462,7 @@ void SessionManager::confirm_rearrange_(OperationTrack& track,
     track.stable_near_original_box = BBox();
     track.b_claim_ambiguous = false;
     track.no_hand_candidate_ambiguous = false;
+    track.no_hand_candidate_reserved_by_stronger_owner = false;
     track.claim_grace_remaining = 0;
     track.no_hand_missing_count = 0;
     track.has_tentative_b_box = false;
@@ -3048,7 +3162,7 @@ void SessionManager::process_effective_hand_frame_(
         record_direct_exit_evidence_from_reappear_candidate_(
             &it->second, hand_boxes, "hand-phase-reappear-candidate");
     }
-    record_direct_object_exit_evidence_(hand_boxes, detections, known_item_owner);
+    record_direct_object_exit_evidence_(hand_boxes, detections);
     update_hand_group_exit_witnesses_(detections, known_item_owner);
     apply_suspect_cover_evidence_(hand_boxes, detections, any_hand_moved);
     advance_claim_grace_(new_existing_track_ids);

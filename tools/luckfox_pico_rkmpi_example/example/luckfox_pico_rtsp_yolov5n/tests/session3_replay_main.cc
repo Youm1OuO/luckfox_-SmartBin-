@@ -59,10 +59,14 @@ int main() {
     test_low_coverage_contact_candidate_releases_at_original();
     test_contact_to_hand_transition_keeps_observed_anchor();
     test_stationary_hand_frame_does_not_change_hand_evidence();
+    test_capture_start_bootstrap_builds_old_c_runtime();
     test_one_hand_moves_two_items_with_one_hand_id();
     test_two_hands_keep_opposite_item_deltas_when_detection_order_changes();
     test_merged_hand_detection_suspends_item_deltas();
     test_interrupted_two_hand_recovery_commits_both_moves();
+    test_direct_object_path_recovers_same_class_without_first_hand_box();
+    test_direct_object_path_recovers_cross_class_without_first_hand_box();
+    test_symmetric_direct_object_path_stays_unresolved();
     test_interrupted_two_hand_exit_commits_both_outs_after_missing_window();
     test_interrupted_two_hand_return_to_original_stays_static();
     test_skewed_merged_hand_detection_suspends_all_item_deltas();
