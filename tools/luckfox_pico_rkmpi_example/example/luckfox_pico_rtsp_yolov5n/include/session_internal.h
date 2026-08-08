@@ -339,6 +339,30 @@ GlobalOwnershipPlan build_global_ownership_plan(
         const std::set<int>& pending_in_ids,
         const std::map<int, OperationTrack>& tracks,
         const std::set<int>& ignored_detection_indices);
+
+// A pending D is an independent explanation only after it has completed its
+// own direct no-hand path and has a placed/working-inventory endpoint.  A
+// shared hand-visible frame or the alias counter itself is not enough to
+// disqualify the old C path.
+bool pending_alias_has_independent_path(const OperationTrack& suspect);
+
+// A forced C->B assignment may continue the C object path while a pending D
+// shares the same explanation.  Ambiguous owners, shadows, and an independent
+// D path must still reject it.
+bool object_path_owner_is_safe(
+        const OperationTrack& track, const GlobalOwnershipPlan& ownership_plan,
+        int detection_index, const std::vector<Detection>& detections,
+        const std::map<int, OperationTrack>& tracks);
+
+// After the hand disappears, preserve only an already-confirmed object path
+// while its pending D alias has no independent path.  This is a narrow alias
+// exception for the existing missing-OUT chain; it never creates an event by
+// itself.
+bool object_path_alias_is_safe_for_no_hand(
+        const OperationTrack& track,
+        const std::map<int, OperationTrack>& tracks,
+        int current_frame);
+
 SameClassCandidateContext build_same_class_candidate_context(
         const Detection& detection, int detection_index,
         const std::map<int, InventoryItem>& working,

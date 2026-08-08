@@ -710,8 +710,23 @@ void SessionManager::update_pending_occlusion_evidence_(
 
 bool SessionManager::reconcile_pending_out_with_occlusion_plan_(
         const std::map<int, BlockerTransitionPlan>& transition_plans) {
-    const std::set<int> retained_ids = retain_pending_out_candidates(
+    std::set<int> retained_ids = retain_pending_out_candidates(
         pending_out_ids_, transition_plans);
+    // A confirmed C-owned object path is an independent exit witness.  When a
+    // quarantined D has no independent path, the pending alias must not turn
+    // that already-confirmed OUT back into an endless occlusion wait.
+    for (std::set<int>::const_iterator candidate = pending_out_ids_.begin();
+         candidate != pending_out_ids_.end(); ++candidate) {
+        const OperationTrack* track = find_runtime_for_item_(*candidate);
+        if (track && object_path_alias_is_safe_for_no_hand(
+                *track, track_buffer_, trace_frame_id_)) {
+            if (!retained_ids.count(*candidate)) {
+                retained_ids.insert(*candidate);
+                trace_track_("C-D-ALIAS", *track,
+                             "retain-confirmed-object-path-out-through-occlusion-plan");
+            }
+        }
+    }
     std::set<int> retract_ids;
     for (std::set<int>::const_iterator candidate = pending_out_ids_.begin();
          candidate != pending_out_ids_.end(); ++candidate) {
@@ -1717,7 +1732,12 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     update_pending_occlusion_evidence_(transition_plans);
     for (std::map<int, BlockerTransitionPlan>::const_iterator plan =
              transition_plans.begin(); plan != transition_plans.end(); ++plan) {
-        if (plan->second.out == OutDisposition::HOLD_FOR_PENDING_OCCLUSION) {
+        const OperationTrack* runtime = find_runtime_for_item_(plan->first);
+        const bool object_path_alias_safe = runtime &&
+            object_path_alias_is_safe_for_no_hand(
+                *runtime, track_buffer_, trace_frame_id_);
+        if (plan->second.out == OutDisposition::HOLD_FOR_PENDING_OCCLUSION &&
+            !object_path_alias_safe) {
             has_unresolved_state = true;
             break;
         }

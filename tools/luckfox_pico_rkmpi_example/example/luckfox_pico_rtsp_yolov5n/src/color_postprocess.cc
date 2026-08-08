@@ -36,9 +36,19 @@ constexpr float MIN_VALID_PIXEL_RATIO = 0.55f;
 constexpr int COLOR_MIN_SATURATION = 45;
 constexpr int COLOR_MIN_VALUE = 35;
 
+// egg/orange 的颜色阈值。比例都是“有效像素（V >= COLOR_MIN_VALUE）中的
+// 比例”，不是把画面边缘的黑色/暗色背景也算进分母。阈值只决定是否有足够
+// 强的证据，证据不足时仍回退原始 YOLO 类别。
+constexpr int ORANGE_PIXEL_MIN_SATURATION = 100;
+constexpr int ORANGE_PIXEL_MIN_VALUE = 50;
+constexpr float EGG_COLOR_MIN_RATIO = 0.35f;
+constexpr float ORANGE_COLOR_MIN_RATIO = 0.30f;
+constexpr float EGG_MAX_MEAN_SATURATION = 130.0f;
+constexpr float ORANGE_MIN_MEAN_SATURATION = 60.0f;
+constexpr float COLOR_DECISION_MARGIN = 0.08f;
+
 // egg / orange 的大小以原图 bbox 的真实像素尺寸判定，不再使用笼统的
-// "全画面面积百分比"。这一对的规则就是：小框且偏黄/白/棕黄 -> egg；
-// 其他情况 -> orange。
+// "全画面面积百分比"。它只在两类颜色证据接近时作为辅助，不单独决定类别。
 constexpr float SIZE_REFERENCE_WIDTH = 1280.0f;
 constexpr float SIZE_REFERENCE_HEIGHT = 720.0f;
 // 由当前 train + val 的真实标注框统计得到（原图基准 1280x720）：
@@ -50,6 +60,7 @@ constexpr float EGG_MAX_BOX_AREA = 20000.0f;
 
 struct ColorStats {
     bool valid = false;
+    float valid_pixel_ratio = 0.0f;
     float red_ratio = 0.0f;
     float purple_ratio = 0.0f;
     float orange_ratio = 0.0f;
@@ -158,14 +169,16 @@ static ColorStats extract_color_stats(const cv::Mat& frame, const cv::Rect& roi)
 
             const bool colorful = s >= COLOR_MIN_SATURATION && v >= COLOR_MIN_VALUE;
             const bool red = colorful && (h <= 10 || h >= 170);
-            const bool orange = colorful && h >= 8 && h <= 25;
+            const bool orange = s >= ORANGE_PIXEL_MIN_SATURATION &&
+                                v >= ORANGE_PIXEL_MIN_VALUE && h >= 5 && h <= 25;
             const bool purple = colorful && h >= 125 && h <= 170;
-            // 鸡蛋可能是白、米黄、黄褐或棕黄色。这里保留一套较严格的
-            // yellow_white，同时增加 egg_tone，供“小框 + 偏黄”规则使用。
-            const bool yellow_white = v >= 80 &&
+            // 鸡蛋可能是白、米黄、黄褐或棕黄色。先排除高饱和橙色，再
+            // 统计黄白/低饱和亮色，避免橙子的色相落入宽泛的 egg_tone。
+            const bool yellow_white = v >= 80 && !orange &&
                 ((h >= 15 && h <= 50 && s <= 190) || (s <= 65 && v >= 115));
-            const bool egg_tone = v >= 55 &&
-                ((h >= 4 && h <= 55) || (s <= 95 && v >= 80));
+            const bool egg_tone = v >= 65 && !orange &&
+                ((h >= 15 && h <= 55 && s <= 125) ||
+                 (s <= 65 && v >= 110));
 
             if (red) ++red_pixels;
             if (orange) ++orange_pixels;
@@ -177,12 +190,14 @@ static ColorStats extract_color_stats(const cv::Mat& frame, const cv::Rect& roi)
 
     if (valid_pixels < static_cast<int>(total * MIN_VALID_PIXEL_RATIO)) return stats;
 
+    const float valid_denominator = static_cast<float>(valid_pixels);
     stats.valid = true;
-    stats.red_ratio = static_cast<float>(red_pixels) / static_cast<float>(total);
-    stats.purple_ratio = static_cast<float>(purple_pixels) / static_cast<float>(total);
-    stats.orange_ratio = static_cast<float>(orange_pixels) / static_cast<float>(total);
-    stats.yellow_white_ratio = static_cast<float>(yellow_white_pixels) / static_cast<float>(total);
-    stats.egg_tone_ratio = static_cast<float>(egg_tone_pixels) / static_cast<float>(total);
+    stats.valid_pixel_ratio = valid_denominator / static_cast<float>(total);
+    stats.red_ratio = static_cast<float>(red_pixels) / valid_denominator;
+    stats.purple_ratio = static_cast<float>(purple_pixels) / valid_denominator;
+    stats.orange_ratio = static_cast<float>(orange_pixels) / valid_denominator;
+    stats.yellow_white_ratio = static_cast<float>(yellow_white_pixels) / valid_denominator;
+    stats.egg_tone_ratio = static_cast<float>(egg_tone_pixels) / valid_denominator;
     stats.mean_saturation = static_cast<float>(saturation_sum / valid_pixels);
     stats.mean_value = static_cast<float>(value_sum / valid_pixels);
     return stats;
@@ -224,17 +239,37 @@ static ClassificationResult classify_egg_orange(int original_cls_id,
     result.cls_id = original_cls_id;
     if (!stats.valid) return result;
 
-    // 黄色鸡蛋在现场光源下可能偏白、黄、米黄或棕黄，不能要求低饱和。
-    // 使用宽松的 egg_tone，实际类别仍由“小框”这个必要条件保护。
+    // 颜色是主要证据，框大小只在两类颜色证据都接近时作为辅助。
     result.egg_color_like =
-        stats.egg_tone_ratio >= 0.08f;
+        stats.egg_tone_ratio >= EGG_COLOR_MIN_RATIO &&
+        stats.mean_value >= 65.0f &&
+        stats.mean_saturation <= EGG_MAX_MEAN_SATURATION;
+    result.orange_color_like =
+        stats.orange_ratio >= ORANGE_COLOR_MIN_RATIO &&
+        stats.mean_saturation >= ORANGE_MIN_MEAN_SATURATION &&
+        stats.mean_value >= 50.0f;
 
-    if (size.egg_sized && result.egg_color_like) {
+    const float egg_score = stats.egg_tone_ratio;
+    const float orange_score = stats.orange_ratio;
+    const bool egg_wins = result.egg_color_like &&
+        (!result.orange_color_like ||
+         egg_score >= orange_score + COLOR_DECISION_MARGIN);
+    const bool orange_wins = result.orange_color_like &&
+        (!result.egg_color_like ||
+         orange_score >= egg_score + COLOR_DECISION_MARGIN);
+
+    if (egg_wins) {
         result.cls_id = CLASS_EGG;
-    } else {
-        // 与原始需求一致：egg/orange 这一对中，不满足“小框且偏黄”的
-        // 结果都显示为 orange，不保留这两类中的原始 YOLO cls_id。
+    } else if (orange_wins) {
         result.cls_id = CLASS_ORANGE;
+    } else if (result.egg_color_like && result.orange_color_like) {
+        // 两类都像且颜色分数接近时，大小只作为 tie-breaker；仍然没有
+        // 足够优势时返回原始 cls_id（UNKNOWN），不强行翻转。
+        if (size.egg_sized && egg_score > orange_score) {
+            result.cls_id = CLASS_EGG;
+        } else if (!size.egg_sized && orange_score > egg_score) {
+            result.cls_id = CLASS_ORANGE;
+        }
     }
     return result;
 }
@@ -262,7 +297,7 @@ static ClassificationResult classify_apple_onion(int original_cls_id,
 
 static bool should_log(int original_cls_id) {
     return ENABLE_COLOR_POSTPROCESS_DEBUG_LOG &&
-           (original_cls_id == CLASS_ORANGE || original_cls_id == CLASS_ONION);
+           is_target_pair_class(original_cls_id);
 }
 
 static void log_skip(int original_cls_id, const BBox& box, const char* reason) {
@@ -275,10 +310,12 @@ static void log_decision(int original_cls_id, int final_cls_id, const BoxSize& s
                          const ColorStats& stats, const ClassificationResult& result) {
     if (!should_log(original_cls_id)) return;
     printf("[COLOR] raw_cls=%d final_cls=%d box=%.0fx%.0f area=%.0f egg_size=%d "
-           "yellow=%.2f egg_tone=%.2f orange=%.2f red=%.2f purple=%.2f sat=%.0f value=%.0f "
+           "valid=%.2f yellow=%.2f egg_tone=%.2f orange=%.2f red=%.2f purple=%.2f "
+           "sat=%.0f value=%.0f "
            "egg_color=%d orange_color=%d apple=%d onion=%d\n",
            original_cls_id, final_cls_id, size.width, size.height, size.area,
-           size.egg_sized ? 1 : 0, stats.yellow_white_ratio, stats.egg_tone_ratio,
+           size.egg_sized ? 1 : 0, stats.valid_pixel_ratio,
+           stats.yellow_white_ratio, stats.egg_tone_ratio,
            stats.orange_ratio,
            stats.red_ratio, stats.purple_ratio, stats.mean_saturation, stats.mean_value,
            result.egg_color_like ? 1 : 0, result.orange_color_like ? 1 : 0,
@@ -297,11 +334,9 @@ void apply_color_postprocess(const cv::Mat& frame,
         const int original_cls_id = detection.cls_id;
         if (!is_target_pair_class(original_cls_id)) continue;
 
-        const bool is_egg_orange =
-            original_cls_id == CLASS_EGG || original_cls_id == CLASS_ORANGE;
-        // egg/orange 的展示规则需要在手持时也生效；apple/onion 仍保留手部
-        // 保护，避免肤色覆盖使苹果和洋葱的颜色判断失真。
-        if (!is_egg_orange && overlaps_hand(detection.box, hand_boxes)) {
+        // 手部覆盖会把肤色、反光和背景混进 ROI；四个目标类统一保留
+        // YOLO 原类别，符合“证据不足时 UNKNOWN 回退”的约定。
+        if (overlaps_hand(detection.box, hand_boxes)) {
             log_skip(original_cls_id, detection.box, "hand_overlap");
             continue;
         }
@@ -322,7 +357,7 @@ void apply_color_postprocess(const cv::Mat& frame,
         BoxSize size = measure_box_size(detection.box, frame);
         if (original_cls_id == CLASS_APPLE || original_cls_id == CLASS_ONION) {
             result = classify_apple_onion(original_cls_id, stats);
-        } else if (is_egg_orange) {
+        } else if (original_cls_id == CLASS_EGG || original_cls_id == CLASS_ORANGE) {
             result = classify_egg_orange(original_cls_id, size, stats);
         }
         const int corrected_cls_id = result.cls_id;

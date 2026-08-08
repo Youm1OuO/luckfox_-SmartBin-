@@ -1390,10 +1390,13 @@ bool SessionManager::has_unresolved_no_hand_state_(
 
         const std::map<int, BlockerTransitionPlan>::const_iterator lifecycle_plan =
             transition_plans.find(track.item_id);
+        const bool object_path_alias_safe =
+            object_path_alias_is_safe_for_no_hand(track, track_buffer_,
+                                                  trace_frame_id_);
         const bool hold_for_pending_occlusion = lifecycle_plan !=
             transition_plans.end() && lifecycle_plan->second.out ==
                 OutDisposition::HOLD_FOR_PENDING_OCCLUSION;
-        if (hold_for_pending_occlusion) {
+        if (hold_for_pending_occlusion && !object_path_alias_safe) {
             const bool ordinary_direct_pending_out =
                 pending_out_ids_.count(track.item_id) &&
                 !visible_count_confirmed_out_ids_.count(track.item_id) &&
@@ -1502,11 +1505,16 @@ bool SessionManager::has_unresolved_no_hand_state_(
             continue;
         }
         if (!fully_occluded_item_ids.count(track.item_id) &&
-            old_track_has_unresolved_alias_(track)) {
+            old_track_has_unresolved_alias_(track) &&
+            !object_path_alias_safe) {
             unresolved = true;
             trace_track_("C-D-ALIAS", track,
                          "old-c-awaits-quarantined-pending-d-no-hand-arbitration");
             continue;
+        }
+        if (old_track_has_unresolved_alias_(track) && object_path_alias_safe) {
+            trace_track_("C-D-ALIAS", track,
+                         "old-c-uses-confirmed-object-path-for-no-hand-missing-chain");
         }
         if (observed_item_ids.count(track.item_id)) {
             // 手离开后首次重新出现的同类 B 仍要在下一张直接无手帧中和
@@ -1633,7 +1641,7 @@ bool SessionManager::has_unresolved_no_hand_state_(
             !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
             !track.no_hand_candidate_ambiguous &&
             !track.no_hand_candidate_reserved_by_stronger_owner &&
-            !old_track_has_unresolved_alias_(track);
+            (!old_track_has_unresolved_alias_(track) || object_path_alias_safe);
         const bool hand_group_exit_evidence =
             track.contact_state == ContactState::NONE &&
             track.state != OperationTrackState::NORMAL &&

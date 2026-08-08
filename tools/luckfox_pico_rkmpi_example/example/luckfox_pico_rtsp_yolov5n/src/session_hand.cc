@@ -769,15 +769,34 @@ void SessionManager::record_direct_object_exit_evidence_(
             !is_active_runtime_track(track)) {
             continue;
         }
-        // 当前已经有全局 forced C -> B 关系时，局部“更强旧 C 暂时预约”不再否定
-        // 这条对象自身的路径事实；真正的模糊、alias 或 shadow 仍会使它保持未决。
-        const bool identity_clear = !is_claim_protected(track) &&
-            !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
-            !track.no_hand_candidate_ambiguous &&
-            !old_track_has_unresolved_alias_(track) &&
-            !ownership_plan.ambiguous_item_ids.count(track.item_id);
         const std::map<int, int>::const_iterator forced =
             ownership_plan.forced_detection_by_item.find(track.item_id);
+        const bool forced_owner_valid = forced !=
+            ownership_plan.forced_detection_by_item.end() &&
+            forced->second >= 0 &&
+            static_cast<size_t>(forced->second) < detections.size() &&
+            !shadow_detection_indices_.count(forced->second);
+        const bool object_path_alias_exception = forced_owner_valid &&
+            object_path_owner_is_safe(track, ownership_plan, forced->second,
+                                      detections, track_buffer_);
+        // 当前已经有全局 forced C -> B 关系时，局部“更强旧 C 暂时预约”不再否定
+        // 这条对象自身的路径事实。claim grace 或 pending D alias 只要满足
+        // forced、连续、非 shadow 且 D 没有独立路径，就保留这条可撤销路径；
+        // 真正的模糊、独立 D 或其他身份冲突仍会清除它。
+        const bool identity_clear = !track.b_claim_ambiguous &&
+            !track.contact_path_ambiguous &&
+            !track.no_hand_candidate_ambiguous &&
+            ((!is_claim_protected(track) &&
+              !old_track_has_unresolved_alias_(track) &&
+              !ownership_plan.ambiguous_item_ids.count(track.item_id)) ||
+             object_path_alias_exception);
+        if (object_path_alias_exception &&
+            old_track_has_unresolved_alias_(track)) {
+            trace_("C-D-ALIAS",
+                   "old-item=%d phase=HAND relation=shared-path-owner "
+                   "action=keep-object-path reason=forced-c-owner-without-independent-d",
+                   track.item_id);
+        }
         // 真正的 identity 反证（模糊、alias、claim 或 shadow）必须立即撤销两种
         // object-path 资格。只有“当前完全看不到 B”才可以暂存上一张合法路径，
         // 供既有无手缺失链在后续帧另行验证；它不能被用于当前 MOVED。
@@ -845,6 +864,7 @@ void SessionManager::record_direct_object_exit_evidence_(
                FLOW3_NO_HAND_D_CONFIRM_FRAMES,
                track.has_direct_object_move_evidence ? 1 : 0,
                track.has_direct_object_exit_evidence ? 1 : 0, trace_frame_id_);
+
     }
 }
 
@@ -2960,6 +2980,16 @@ void SessionManager::mark_newly_hand_blocked_items_(
         track.reappearance_pending = observed_index < 0;
         if (observed_index >= 0) {
             const Detection& d = detections[observed_index];
+            // 首次建立 HAND_* C 时，当前食品框就是这条物品路径的起点。
+            // 它可能是手遮挡后露出的局部框，但不能因此让后续 hand delta
+            // 继续从 original_box 估计；original_box 保持不可变，只用于最终
+            // 的移动/原位比较。
+            track.hand_estimate_anchor_box = d.box;
+            track.has_hand_estimate_anchor_box = d.box.area() > 0.0f;
+            track.track.clear();
+            if (track.has_hand_estimate_anchor_box) {
+                track.track.push_back(track.hand_estimate_anchor_box);
+            }
             if (contact_detection_is_at_original(track, d) ||
                 !is_claim_protected(track)) {
                 track.last_seen_box = d.box;

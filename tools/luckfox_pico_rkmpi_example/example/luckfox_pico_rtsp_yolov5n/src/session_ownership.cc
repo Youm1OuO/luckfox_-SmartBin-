@@ -553,6 +553,95 @@ GlobalOwnershipPlan build_global_ownership_plan(
     return plan;
 }
 
+bool pending_alias_has_independent_path(const OperationTrack& suspect) {
+    return suspect.is_suspect_new && suspect.pending_d_quarantined_by_old_c &&
+           suspect.promoted_to_working_inventory && suspect.item_id > 0 &&
+           suspect.drop_confirmed && suspect.has_placed_box &&
+           suspect.no_hand_self_match_count >= FLOW3_NO_HAND_D_CONFIRM_FRAMES;
+}
+
+bool object_path_owner_is_safe(
+        const OperationTrack& track, const GlobalOwnershipPlan& ownership_plan,
+        int detection_index, const std::vector<Detection>& detections,
+        const std::map<int, OperationTrack>& tracks) {
+    if (track.is_suspect_new || track.item_id <= 0 || detection_index < 0 ||
+        static_cast<size_t>(detection_index) >= detections.size() ||
+        ownership_plan.ambiguous_item_ids.count(track.item_id) ||
+        ownership_plan.ambiguous_detection_indices.count(detection_index)) {
+        return false;
+    }
+    const std::map<int, int>::const_iterator forced =
+        ownership_plan.forced_detection_by_item.find(track.item_id);
+    const std::map<int, int>::const_iterator forced_owner =
+        ownership_plan.forced_item_by_detection.find(detection_index);
+    if (forced == ownership_plan.forced_detection_by_item.end() ||
+        forced->second != detection_index ||
+        forced_owner == ownership_plan.forced_item_by_detection.end() ||
+        forced_owner->second != track.item_id) {
+        return false;
+    }
+    bool has_pending_alias = false;
+    for (std::set<int>::const_iterator key = track.conflicting_suspect_keys.begin();
+         key != track.conflicting_suspect_keys.end(); ++key) {
+        const std::map<int, OperationTrack>::const_iterator suspect = tracks.find(*key);
+        if (suspect == tracks.end() || !suspect->second.is_suspect_new ||
+            !suspect->second.pending_d_quarantined_by_old_c ||
+            !suspect->second.conflicting_old_item_ids.count(track.item_id)) {
+            continue;
+        }
+        has_pending_alias = true;
+        if (pending_alias_has_independent_path(suspect->second)) return false;
+    }
+    return !has_pending_alias || track.carrier_capture_context ||
+           track.contact_started_touching_hand || track.has_first_hand_block_box;
+}
+
+bool object_path_alias_is_safe_for_no_hand(
+        const OperationTrack& track,
+        const std::map<int, OperationTrack>& tracks,
+        int current_frame) {
+    // Once the existing missing-object chain has formally confirmed OUT, the
+    // path is no longer a speculative witness.  Keep that conclusion through
+    // the remainder of this transaction so an unresolved C-D alias cannot
+    // retract it merely because the last visible path frame is now older than
+    // the ordinary freshness window.  Unconfirmed paths retain the original
+    // freshness guard below.
+    const bool confirmed_out =
+        track.resolution == ExistingItemResolution::OUT_CONFIRMED;
+    if (track.is_suspect_new || track.item_id <= 0 ||
+        !track.has_direct_object_exit_evidence ||
+        !track.has_direct_object_last_box ||
+        track.direct_object_path_streak < FLOW3_NO_HAND_D_CONFIRM_FRAMES ||
+        track.direct_object_last_frame < 0 ||
+        track.direct_object_last_frame > current_frame ||
+        (!confirmed_out &&
+         current_frame - track.direct_object_last_frame >
+             FLOW3_NO_HAND_OUT_MISSING_FRAMES) ||
+        track.direct_object_last_box.area() <= 0.0f ||
+        !boxes_differ_as_move(track.original_box, track.direct_object_last_box) ||
+        track.b_claim_ambiguous || track.contact_path_ambiguous ||
+        track.no_hand_candidate_ambiguous ||
+        track.no_hand_candidate_reserved_by_stronger_owner) {
+        return false;
+    }
+
+    bool has_pending_alias = false;
+    for (std::set<int>::const_iterator key = track.conflicting_suspect_keys.begin();
+         key != track.conflicting_suspect_keys.end(); ++key) {
+        const std::map<int, OperationTrack>::const_iterator suspect = tracks.find(*key);
+        if (suspect == tracks.end() || !suspect->second.is_suspect_new ||
+            !suspect->second.pending_d_quarantined_by_old_c ||
+            !suspect->second.conflicting_old_item_ids.count(track.item_id)) {
+            continue;
+        }
+        has_pending_alias = true;
+        if (pending_alias_has_independent_path(suspect->second)) return false;
+    }
+    if (!has_pending_alias) return false;
+    return track.carrier_capture_context || track.contact_started_touching_hand ||
+           track.has_first_hand_block_box;
+}
+
 int unique_detection_for_box(const std::vector<Detection>& detections,
                              const std::set<int>& claimed,
                              int cls_id, const BBox& reference,
