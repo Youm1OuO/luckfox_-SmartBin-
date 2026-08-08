@@ -1343,6 +1343,12 @@ SettlementResult SessionManager::settle_no_hand_frame_(
 
     std::map<int, InventoryItem> final_items = working_inventory_;
     const std::vector<Detection>& observed = detections;
+    // 统一的 C/D -> B 候选图在局部 bind 之前先求一次全局一对一计划。只有
+    // forced pair 才会写入本帧 observation；真正对称的图保持未决，绝不按
+    // item_id、检测数组顺序或左右位置选择一条路径。
+    const GlobalOwnershipPlan global_ownership_plan = build_global_ownership_plan(
+        observed, final_items, operation_start_inventory_, pending_in_ids_, track_buffer_,
+        shadow_detection_indices_);
     std::vector<int> observation_owner(observed.size(), -1);
     std::map<int, int> item_to_observation;
     std::map<int, BBox> references;
@@ -1402,12 +1408,49 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         }
     }
 
+    for (std::set<int>::const_iterator item =
+             global_ownership_plan.ambiguous_item_ids.begin();
+         item != global_ownership_plan.ambiguous_item_ids.end(); ++item) {
+        if (!final_items.count(*item)) continue;
+        ambiguous_ids.insert(*item);
+        OperationTrack* runtime = find_runtime_for_item_(*item);
+        if (runtime && !runtime->is_suspect_new) {
+            runtime->no_hand_candidate_ambiguous = true;
+            trace_("GLOBAL-OWNER",
+                   "item=%d action=keep-unresolved reason=symmetric-or-incomplete-plan",
+                   *item);
+        }
+    }
+
     // 同类 B 仍有多个成熟来源时，暂时把这些 C 从所有“动态/宽松”绑定
     // 阶段移出；后面的原位置/缺失处理会保留旧库存，不按 item_id 强选一个。
     for (std::set<int>::const_iterator it = ambiguous_ids.begin();
          it != ambiguous_ids.end(); ++it) {
         all_ids.erase(*it);
         track_priority_ids.erase(*it);
+    }
+
+    // Forced global pairs reserve their detection before the historical local
+    // passes.  This lets a graph such as C6->{B0,B1}, C7->{B0} settle as
+    // C6->B1/C7->B0 while leaving all event confirmation gates unchanged.
+    for (std::map<int, int>::const_iterator assignment =
+             global_ownership_plan.forced_detection_by_item.begin();
+         assignment != global_ownership_plan.forced_detection_by_item.end(); ++assignment) {
+        const int item_id = assignment->first;
+        const int detection_index = assignment->second;
+        if (ambiguous_ids.count(item_id) || !final_items.count(item_id) ||
+            pending_out_ids_.count(item_id) || detection_index < 0 ||
+            static_cast<size_t>(detection_index) >= observed.size() ||
+            item_to_observation.count(item_id) ||
+            observation_owner[static_cast<size_t>(detection_index)] >= 0 ||
+            final_items[item_id].cls_id != observed[static_cast<size_t>(detection_index)].cls_id) {
+            continue;
+        }
+        item_to_observation[item_id] = detection_index;
+        observation_owner[static_cast<size_t>(detection_index)] = item_id;
+        trace_("GLOBAL-OWNER",
+               "item=%d detection=%d action=force-global-one-to-one-observation",
+               item_id, detection_index);
     }
 
     // 已由可见数量结算保留给某个旧 C 的框必须先占用，不能让同一个框随后

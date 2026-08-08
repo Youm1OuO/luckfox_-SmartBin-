@@ -285,6 +285,28 @@ struct CrossClassDuplicateHint {
 CrossClassDuplicateHint find_cross_class_duplicate_hint(
         const std::vector<Detection>& detections, int detection_index);
 
+// 类别无关的重复观测计划。弱框被 shadow 后仍保留在原始 detection 列表中，
+// 只是当前帧不允许它新建 D、C-D alias 或抢占已确认 owner。下一帧重新计算，
+// 因此框分离、连续独立出现或得到独立路径后会自然恢复普通仲裁。
+struct DetectionShadowPlan {
+    std::set<int> detection_indices;
+    std::map<int, int> owner_item_by_detection;
+    std::map<int, DetectionShadowHint> hint_by_detection;
+
+    bool contains(int detection_index) const {
+        return detection_indices.count(detection_index) > 0;
+    }
+};
+
+DetectionShadowPlan build_detection_shadow_plan(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner,
+        int frame_id);
+
 const char* strict_owner_kind_name(StrictOwnerKind kind);
 const OperationTrack* runtime_for_working_item(
         int item_id, const std::map<int, OperationTrack>& tracks,
@@ -299,6 +321,24 @@ bool strict_owner_blocks_old_c(StrictOwnerKind kind);
 bool strict_owner_is_quarantined_alias_of_old_c(
         const StrictDetectionOwner& owner, int old_item_id,
         const std::map<int, OperationTrack>& tracks);
+
+// 全局一对一归属只回答“当前 B 可以稳定归谁”，不绕过任何 MOVED/OUT/IN
+// 的连续确认门。forced pair 在最大基数、最小代价的所有可行匹配中都成立；
+// 真正对称的匹配保留在 ambiguous_item_ids，调用方必须维持未决。
+struct GlobalOwnershipPlan {
+    std::map<int, int> forced_detection_by_item;
+    std::map<int, int> forced_item_by_detection;
+    std::set<int> ambiguous_item_ids;
+    std::set<int> ambiguous_detection_indices;
+};
+
+GlobalOwnershipPlan build_global_ownership_plan(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks,
+        const std::set<int>& ignored_detection_indices);
 SameClassCandidateContext build_same_class_candidate_context(
         const Detection& detection, int detection_index,
         const std::map<int, InventoryItem>& working,

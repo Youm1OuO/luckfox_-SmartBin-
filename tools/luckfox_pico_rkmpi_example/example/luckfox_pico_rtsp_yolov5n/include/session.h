@@ -20,6 +20,27 @@ namespace fridge {
 
 namespace session_internal {
 struct BlockerTransitionPlan;
+
+// 同一物理物品被重复检测时的运行时诊断。它不代表库存对象，也不拥有
+// detection；仅在当前操作中说明弱框为何暂时不进入 C/D 身份仲裁。
+struct DetectionShadowHint {
+    int detection_index = -1;
+    int owner_detection_index = -1;
+    int owner_item_id = -1;
+    int owner_runtime_key = 0;
+    int frame_id = -1;
+    float score = 0.0f;
+    float owner_score = 0.0f;
+    float iom_value = 0.0f;
+    float iou_value = 0.0f;
+    float center_norm = 0.0f;
+    float width_ratio = 0.0f;
+    float height_ratio = 0.0f;
+
+    bool valid() const {
+        return detection_index >= 0 && owner_detection_index >= 0;
+    }
+};
 }
 
 enum class EventKind { IN, OUT, MOVED, OCCLUDED, REVEALED };
@@ -221,6 +242,25 @@ struct OperationTrack {
     bool has_direct_exit_evidence = false;
     BBox direct_exit_box;
     int direct_exit_frame = -1;
+    // 物品自身的局部可见路径。它与 hand delta 分开保存：即使 hand_id
+    // 因合并/漏检而暂停位移，只要当前 B 在全局一对一归属中连续属于本 C，
+    // 仍可作为后续无手缺失链的受限入口，绝不单帧直接 OUT。
+    bool has_direct_object_exit_evidence = false;
+    int direct_object_path_streak = 0;
+    int direct_object_last_frame = -1;
+    BBox direct_object_last_box;
+    bool has_direct_object_last_box = false;
+
+    // 完全不可见时的物品级手组离场见证。候选 hand_id 只来自实际接触/覆盖
+    // 该 C 的唯一内部手轨迹；任何 hand 合并、漏检或不安全重绑都会使本轮
+    // witness 失效。它也只能开启既有无手缺失确认，不能直接生成 OUT/MOVED。
+    std::set<int> possible_carrier_hand_ids;
+    std::map<int, BBox> possible_carrier_last_boxes;
+    bool carrier_capture_context = false;
+    bool capture_was_fully_hidden = false;
+    bool hand_group_identity_invalid = false;
+    bool hand_group_exit_witness = false;
+    int hand_group_exit_frame = -1;
     // 仅 POST_HAND_REVEAL_D 使用：它在第几张无手帧首次出现。
     // 后续一张有效无手帧若不能自匹配，就丢弃该候选而不产生事件。
     int post_hand_reveal_no_hand_streak = -1;
@@ -394,6 +434,13 @@ private:
     void record_direct_exit_evidence_from_reappear_candidate_(
         OperationTrack* track, const std::vector<BBox>& hand_boxes,
         const char* source);
+    void record_direct_object_exit_evidence_(
+        const std::vector<BBox>& hand_boxes,
+        const std::vector<Detection>& detections,
+        const std::map<int, int>& known_item_owner);
+    void update_hand_group_exit_witnesses_(
+        const std::vector<Detection>& detections,
+        const std::map<int, int>& known_item_owner);
     void append_move_to_existing_hand_tracks_();
     void update_existing_contact_tracks_(
         const std::vector<BBox>& hand_boxes,
@@ -576,6 +623,12 @@ private:
     // 原位仲裁中暂时排除的跨类别低分重复 detection index。它不跨帧、
     // 不写入 InventoryItem，也不影响 OSD/原始 detection。
     std::map<int, std::set<int> > cross_class_duplicate_identity_exclusions_;
+    // 每张有手/无手帧的通用重复观测诊断。shadow 不删除 YOLO 输出，也不
+    // 建立 D、alias 或库存关系；它只让弱重复框暂时不参加当前帧身份仲裁。
+    std::set<int> shadow_detection_indices_;
+    std::map<int, int> shadow_owner_by_detection_;
+    std::map<int, session_internal::DetectionShadowHint>
+        shadow_hint_by_detection_;
     // 每张无手帧的同类“一框一物品”保留结果。key 是 detection index，
     // value 是唯一保留该框的旧 item_id；同一框绝不再同时阻止其他 C 的 OUT。
     std::map<int, int> visible_count_detection_owner_;

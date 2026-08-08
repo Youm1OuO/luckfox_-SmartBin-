@@ -878,4 +878,40 @@ void test_hand_front_cover_remains_provisional_until_no_hand_confirmation() {
     assert(session.operation_pending());
     assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
 }
+
+// 细节27：完全不可见物品的手组见证只应在同一条内部 hand_id 连续到达
+// 画面边界时成立；一旦 hand identity 失效或中途重绑，它就不能再作为 OUT
+// 的入口。
+void test_hand_group_exit_witness_requires_continuous_edge_hand() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 100, 100, 220, 220));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    initial_no_hand_frame(&session,
+        std::vector<fridge::Detection>(1, det(0, 100, 100, 220, 220)), &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 260, 260)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(260, 80, 440, 260)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(460, 80, 640, 260)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(660, 80, 840, 260)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(860, 80, 1040, 260)), &frame);
+    send_frame(&session, std::vector<fridge::Detection>(),
+               std::vector<fridge::BBox>(1, fridge::BBox(1080, 80, 1280, 260)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    const std::map<int, fridge::OperationTrack>::const_iterator target = tracks.find(1);
+    assert(target != tracks.end());
+    assert(target->second.carrier_capture_context);
+    assert(target->second.capture_was_fully_hidden);
+    assert(target->second.hand_group_exit_witness);
+    assert(!target->second.hand_group_identity_invalid);
+    assert(target->second.hand_group_exit_frame > 0);
+}
 }  // namespace session3_replay

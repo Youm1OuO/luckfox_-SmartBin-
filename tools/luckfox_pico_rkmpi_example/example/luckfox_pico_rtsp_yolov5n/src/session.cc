@@ -201,6 +201,9 @@ void SessionManager::reset_operation_runtime_() {
     pending_front_evidence_by_target_.clear();
     provisional_causal_occlusions_.clear();
     cross_class_duplicate_identity_exclusions_.clear();
+    shadow_detection_indices_.clear();
+    shadow_owner_by_detection_.clear();
+    shadow_hint_by_detection_.clear();
     visible_count_detection_owner_.clear();
     visible_count_survivor_ids_.clear();
     visible_count_out_candidate_ids_.clear();

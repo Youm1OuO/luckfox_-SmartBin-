@@ -1503,4 +1503,113 @@ void test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie() {
                candidate, tracks, no_known_owner) == -2);
 }
 
+// 细节27：低分重复框不能只因“类别相同”绕过重复保护。高分苹果框已经
+// 唯一属于旧 C 时，近同框低分苹果只应成为 shadow，不得创建 D 或 C-D alias。
+void test_low_score_same_class_duplicate_does_not_create_hand_visible_d() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> initial;
+    initial.push_back(item(1, 0, 500, 100, 600, 200));
+    session.init_from_backend(initial, true);
+    int frame = 1;
+    const std::vector<fridge::Detection> stable(
+        1, det(0, 500, 100, 600, 200));
+    initial_no_hand_frame(&session, stable, &frame);
+
+    std::vector<fridge::Detection> duplicated = stable;
+    duplicated.push_back(det(0, 502, 102, 598, 198, 0.25f));
+    send_frame(&session, duplicated,
+               std::vector<fridge::BBox>(1, fridge::BBox(480, 80, 620, 220)), &frame);
+
+    const std::map<int, fridge::OperationTrack>& tracks = session.operation_tracks();
+    std::map<int, fridge::OperationTrack>::const_iterator old = tracks.find(1);
+    assert(old != tracks.end());
+    assert(old->second.conflicting_suspect_keys.empty());
+    for (std::map<int, fridge::OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        assert(!it->second.is_suspect_new);
+    }
+
+    fridge::SettlementResult result = settle_after_hand(&session, stable, &frame);
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+}
+
+// 细节27：全局图必须能利用“另一个 C 只剩一个候选”推出唯一联合归属；
+// 真正对称的两组路径则必须继续保持未决，不能依赖 item_id 或检测顺序。
+void test_shadow_plan_and_global_assignment_are_identity_safe() {
+    using namespace fridge::session_internal;
+
+    std::map<int, fridge::InventoryItem> operation_start;
+    operation_start[1] = item(1, 0, 100, 100, 200, 200);
+    std::map<int, fridge::InventoryItem> working = operation_start;
+    std::vector<fridge::Detection> duplicate_detections;
+    duplicate_detections.push_back(det(0, 100, 100, 200, 200, 0.80f));
+    duplicate_detections.push_back(det(0, 102, 102, 198, 198, 0.25f));
+    std::map<int, int> direct_owner;
+    direct_owner[1] = 0;
+    const DetectionShadowPlan shadow = build_detection_shadow_plan(
+        duplicate_detections, working, operation_start, std::set<int>(),
+        std::map<int, fridge::OperationTrack>(), direct_owner, 17);
+    assert(shadow.contains(1));
+    assert(shadow.owner_item_by_detection.find(1)->second == 1);
+    assert(shadow.hint_by_detection.find(1)->second.owner_detection_index == 0);
+
+    std::vector<fridge::Detection> separated_detections;
+    separated_detections.push_back(det(0, 100, 100, 200, 200, 0.80f));
+    separated_detections.push_back(det(0, 340, 100, 440, 200, 0.25f));
+    const DetectionShadowPlan separated = build_detection_shadow_plan(
+        separated_detections, working, operation_start, std::set<int>(),
+        std::map<int, fridge::OperationTrack>(), direct_owner, 18);
+    assert(!separated.contains(1));
+
+    std::map<int, fridge::InventoryItem> joint_start;
+    joint_start[1] = item(1, 0, 100, 100, 200, 200);
+    joint_start[2] = item(2, 0, 300, 100, 400, 200);
+    std::map<int, fridge::InventoryItem> joint_working = joint_start;
+    std::vector<fridge::Detection> endpoints;
+    endpoints.push_back(det(0, 300, 100, 400, 200));  // C2 的唯一严格 B0。
+    endpoints.push_back(det(0, 500, 100, 600, 200));  // 只能留给 C1 的 B1。
+
+    fridge::OperationTrack c1;
+    c1.item_id = 1;
+    c1.cls_id = 0;
+    c1.original_box = joint_start[1].base_box;
+    c1.state = fridge::OperationTrackState::HAND_PARTIAL_BLOCKED;
+    c1.needs_no_hand_settlement = true;
+    c1.track.push_back(endpoints[0].box);
+    c1.track.push_back(endpoints[1].box);
+    std::map<int, fridge::OperationTrack> joint_tracks;
+    joint_tracks[1] = c1;
+
+    const GlobalOwnershipPlan joint = build_global_ownership_plan(
+        endpoints, joint_working, joint_start, std::set<int>(), joint_tracks,
+        std::set<int>());
+    assert(joint.forced_detection_by_item.find(1)->second == 1);
+    assert(joint.forced_detection_by_item.find(2)->second == 0);
+    assert(joint.ambiguous_item_ids.empty());
+
+    // 两个 C 只有完全相同的两条成熟路径时，二者都不能得到 forced pair。
+    std::map<int, fridge::InventoryItem> symmetric_start;
+    symmetric_start[1] = item(1, 0, 100, 100, 200, 200);
+    symmetric_start[2] = item(2, 0, 700, 100, 800, 200);
+    std::map<int, fridge::InventoryItem> symmetric_working = symmetric_start;
+    fridge::OperationTrack symmetric_c1 = c1;
+    symmetric_c1.original_box = symmetric_start[1].base_box;
+    fridge::OperationTrack symmetric_c2 = c1;
+    symmetric_c2.item_id = 2;
+    symmetric_c2.original_box = symmetric_start[2].base_box;
+    std::map<int, fridge::OperationTrack> symmetric_tracks;
+    symmetric_tracks[1] = symmetric_c1;
+    symmetric_tracks[2] = symmetric_c2;
+    const GlobalOwnershipPlan symmetric = build_global_ownership_plan(
+        endpoints, symmetric_working, symmetric_start, std::set<int>(),
+        symmetric_tracks, std::set<int>());
+    assert(symmetric.forced_detection_by_item.empty());
+    assert(symmetric.ambiguous_item_ids.count(1));
+    assert(symmetric.ambiguous_item_ids.count(2));
+}
+
 }  // namespace session3_replay

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <queue>
 #include <set>
 #include <utility>
 #include <vector>
@@ -85,6 +86,471 @@ CrossClassDuplicateHint find_cross_class_duplicate_hint(
     result.width_ratio = best_width;
     result.height_ratio = best_height;
     return result;
+}
+
+namespace {
+
+struct ShadowOwner {
+    int item_id = -1;
+    int runtime_key = 0;
+    bool valid = false;
+};
+
+bool duplicate_observation_geometry(const Detection& weak,
+                                    const Detection& strong,
+                                    DetectionShadowHint* hint) {
+    if (!is_food(weak.cls_id) || !is_food(strong.cls_id) ||
+        weak.box.area() <= 0.0f || strong.box.area() <= 0.0f ||
+        weak.score > FLOW3_CROSS_CLASS_DUPLICATE_LOW_SCORE_MAX ||
+        strong.score - weak.score < FLOW3_CROSS_CLASS_DUPLICATE_SCORE_GAP_MIN) {
+        return false;
+    }
+    const float iom_value = iom(weak.box, strong.box);
+    const float iou_value = iou(weak.box, strong.box);
+    const float center_norm = normalized_nearby_distance(weak.box, strong.box);
+    const float width_ratio = ratio_difference(weak.box.w(), strong.box.w());
+    const float height_ratio = ratio_difference(weak.box.h(), strong.box.h());
+    if (iom_value < FLOW3_CROSS_CLASS_DUPLICATE_IOM_MIN ||
+        center_norm > FLOW3_CROSS_CLASS_DUPLICATE_CENTER_NORM_MAX ||
+        width_ratio > FLOW3_CROSS_CLASS_DUPLICATE_SIZE_RATIO_MAX ||
+        height_ratio > FLOW3_CROSS_CLASS_DUPLICATE_SIZE_RATIO_MAX) {
+        return false;
+    }
+    if (hint) {
+        hint->score = weak.score;
+        hint->owner_score = strong.score;
+        hint->iom_value = iom_value;
+        hint->iou_value = iou_value;
+        hint->center_norm = center_norm;
+        hint->width_ratio = width_ratio;
+        hint->height_ratio = height_ratio;
+    }
+    return true;
+}
+
+ShadowOwner unique_shadow_owner_for_detection(
+        const std::vector<Detection>& detections, int detection_index,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner) {
+    ShadowOwner result;
+    if (detection_index < 0 ||
+        static_cast<size_t>(detection_index) >= detections.size()) {
+        return result;
+    }
+
+    std::set<int> explicitly_owned_items;
+    for (std::map<int, int>::const_iterator it = known_item_owner.begin();
+         it != known_item_owner.end(); ++it) {
+        if (it->second == detection_index) explicitly_owned_items.insert(it->first);
+    }
+    if (explicitly_owned_items.size() == 1) {
+        result.item_id = *explicitly_owned_items.begin();
+        int runtime_key = 0;
+        runtime_for_working_item(result.item_id, tracks, &runtime_key);
+        result.runtime_key = runtime_key != 0 ? runtime_key : result.item_id;
+        result.valid = true;
+        return result;
+    }
+    if (explicitly_owned_items.size() > 1) return result;
+
+    std::set<int> strict_items;
+    for (std::map<int, InventoryItem>::const_iterator item = working.begin();
+         item != working.end(); ++item) {
+        if (strict_match(item->second, detections[static_cast<size_t>(detection_index)])) {
+            strict_items.insert(item->first);
+        }
+    }
+    if (strict_items.size() != 1) return result;
+    result.item_id = *strict_items.begin();
+    int runtime_key = 0;
+    runtime_for_working_item(result.item_id, tracks, &runtime_key);
+    result.runtime_key = runtime_key != 0 ? runtime_key : result.item_id;
+    result.valid = true;
+    return result;
+}
+
+bool detection_has_independent_shadow_history(
+        const std::vector<Detection>& detections, int detection_index,
+        const ShadowOwner& owner, const std::map<int, InventoryItem>& working,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner) {
+    for (std::map<int, int>::const_iterator it = known_item_owner.begin();
+         it != known_item_owner.end(); ++it) {
+        if (it->second == detection_index && it->first != owner.item_id) return true;
+    }
+    const ShadowOwner direct_owner = unique_shadow_owner_for_detection(
+        detections, detection_index, working, tracks, known_item_owner);
+    if (direct_owner.valid && direct_owner.item_id != owner.item_id) return true;
+
+    const Detection& detection = detections[static_cast<size_t>(detection_index)];
+    for (std::map<int, OperationTrack>::const_iterator it = tracks.begin();
+         it != tracks.end(); ++it) {
+        const OperationTrack& track = it->second;
+        const bool same_owner = (track.item_id > 0 && track.item_id == owner.item_id) ||
+            it->first == owner.runtime_key;
+        if (same_owner || !is_active_runtime_track(track) ||
+            track.cls_id != detection.cls_id) {
+            continue;
+        }
+        if (detection_can_belong_to_active_track(detection, track)) return true;
+    }
+    return false;
+}
+
+struct AssignmentEdge {
+    int item_id = -1;
+    int detection_index = -1;
+    int cost = 0;
+};
+
+int scaled_assignment_cost(int source_rank, float geometry_cost) {
+    const float bounded = std::min(geometry_cost, 1000.0f);
+    return source_rank + static_cast<int>(bounded * 1000.0f + 0.5f);
+}
+
+float box_assignment_geometry_cost(const BBox& reference,
+                                   const Detection& detection) {
+    return normalized_nearby_distance(reference, detection.box) +
+        0.35f * ratio_difference(reference.w(), detection.box.w()) +
+        0.35f * ratio_difference(reference.h(), detection.box.h());
+}
+
+void record_assignment_edge(std::map<std::pair<int, int>, int>* edge_costs,
+                            int item_id, int detection_index, int cost) {
+    if (!edge_costs || item_id <= 0 || detection_index < 0) return;
+    const std::pair<int, int> key = std::make_pair(item_id, detection_index);
+    std::map<std::pair<int, int>, int>::iterator existing = edge_costs->find(key);
+    if (existing == edge_costs->end() || cost < existing->second) {
+        (*edge_costs)[key] = cost;
+    }
+}
+
+void record_reference_assignment_edges(
+        std::map<std::pair<int, int>, int>* edge_costs, int item_id, int cls_id,
+        const BBox& reference, const std::vector<Detection>& detections,
+        const std::set<int>& ignored_detection_indices, int strict_rank,
+        int track_rank, bool allow_partial) {
+    if (reference.area() <= 0.0f) return;
+    for (size_t di = 0; di < detections.size(); ++di) {
+        const int detection_index = static_cast<int>(di);
+        if (ignored_detection_indices.count(detection_index) ||
+            detections[di].cls_id != cls_id) {
+            continue;
+        }
+        if (strict_match_box(cls_id, reference, detections[di].cls_id,
+                             detections[di].box)) {
+            record_assignment_edge(edge_costs, item_id, detection_index,
+                                   scaled_assignment_cost(
+                                       strict_rank,
+                                       box_assignment_geometry_cost(reference,
+                                                                    detections[di])));
+        } else if (track_match_box(cls_id, reference, detections[di].cls_id,
+                                   detections[di].box)) {
+            record_assignment_edge(edge_costs, item_id, detection_index,
+                                   scaled_assignment_cost(
+                                       track_rank,
+                                       box_assignment_geometry_cost(reference,
+                                                                    detections[di])));
+        } else if (allow_partial &&
+                   partial_match_box(cls_id, reference, detections[di].cls_id,
+                                     detections[di].box)) {
+            record_assignment_edge(edge_costs, item_id, detection_index,
+                                   scaled_assignment_cost(
+                                       track_rank + 10000,
+                                       1.0f - iom(reference, detections[di].box)));
+        }
+    }
+}
+
+struct FlowEdge {
+    int to = -1;
+    int reverse = -1;
+    int capacity = 0;
+    int cost = 0;
+};
+
+void add_flow_edge(std::vector<std::vector<FlowEdge> >* graph,
+                   int from, int to, int capacity, int cost) {
+    FlowEdge forward;
+    forward.to = to;
+    forward.reverse = static_cast<int>((*graph)[to].size());
+    forward.capacity = capacity;
+    forward.cost = cost;
+    FlowEdge backward;
+    backward.to = from;
+    backward.reverse = static_cast<int>((*graph)[from].size());
+    backward.capacity = 0;
+    backward.cost = -cost;
+    (*graph)[from].push_back(forward);
+    (*graph)[to].push_back(backward);
+}
+
+struct AssignmentSolution {
+    int cardinality = 0;
+    long long cost = 0;
+    std::map<int, int> detection_by_item;
+};
+
+AssignmentSolution solve_global_assignment(
+        const std::vector<int>& item_ids, int detection_count,
+        const std::map<std::pair<int, int>, int>& edge_costs,
+        int forbidden_item_id, int forbidden_detection_index) {
+    AssignmentSolution result;
+    const int source = 0;
+    const int item_offset = 1;
+    const int detection_offset = item_offset + static_cast<int>(item_ids.size());
+    const int sink = detection_offset + detection_count;
+    std::vector<std::vector<FlowEdge> > graph(static_cast<size_t>(sink + 1));
+    std::map<int, int> item_node;
+    for (size_t i = 0; i < item_ids.size(); ++i) {
+        item_node[item_ids[i]] = item_offset + static_cast<int>(i);
+        add_flow_edge(&graph, source, item_offset + static_cast<int>(i), 1, 0);
+    }
+    for (int di = 0; di < detection_count; ++di) {
+        add_flow_edge(&graph, detection_offset + di, sink, 1, 0);
+    }
+    for (std::map<std::pair<int, int>, int>::const_iterator edge = edge_costs.begin();
+         edge != edge_costs.end(); ++edge) {
+        if (edge->first.first == forbidden_item_id &&
+            edge->first.second == forbidden_detection_index) {
+            continue;
+        }
+        std::map<int, int>::const_iterator item = item_node.find(edge->first.first);
+        if (item == item_node.end() || edge->first.second < 0 ||
+            edge->first.second >= detection_count) {
+            continue;
+        }
+        add_flow_edge(&graph, item->second,
+                      detection_offset + edge->first.second, 1, edge->second);
+    }
+
+    for (;;) {
+        const long long inf = std::numeric_limits<long long>::max() / 4;
+        std::vector<long long> distance(graph.size(), inf);
+        std::vector<int> previous_node(graph.size(), -1);
+        std::vector<int> previous_edge(graph.size(), -1);
+        std::vector<bool> queued(graph.size(), false);
+        std::queue<int> queue;
+        distance[source] = 0;
+        queue.push(source);
+        queued[source] = true;
+        while (!queue.empty()) {
+            const int node = queue.front();
+            queue.pop();
+            queued[node] = false;
+            for (size_t ei = 0; ei < graph[node].size(); ++ei) {
+                const FlowEdge& edge = graph[node][ei];
+                if (edge.capacity <= 0 || distance[node] == inf) continue;
+                const long long candidate = distance[node] + edge.cost;
+                if (candidate >= distance[edge.to]) continue;
+                distance[edge.to] = candidate;
+                previous_node[edge.to] = node;
+                previous_edge[edge.to] = static_cast<int>(ei);
+                if (!queued[edge.to]) {
+                    queue.push(edge.to);
+                    queued[edge.to] = true;
+                }
+            }
+        }
+        if (previous_node[sink] < 0) break;
+        for (int node = sink; node != source; node = previous_node[node]) {
+            FlowEdge& edge = graph[previous_node[node]][previous_edge[node]];
+            --edge.capacity;
+            ++graph[node][edge.reverse].capacity;
+        }
+        ++result.cardinality;
+        result.cost += distance[sink];
+    }
+
+    for (size_t item_index = 0; item_index < item_ids.size(); ++item_index) {
+        const int node = item_offset + static_cast<int>(item_index);
+        for (size_t ei = 0; ei < graph[node].size(); ++ei) {
+            const FlowEdge& edge = graph[node][ei];
+            if (edge.to < detection_offset || edge.to >= sink || edge.capacity != 0) {
+                continue;
+            }
+            result.detection_by_item[item_ids[item_index]] = edge.to - detection_offset;
+            break;
+        }
+    }
+    return result;
+}
+
+}  // namespace
+
+DetectionShadowPlan build_detection_shadow_plan(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks,
+        const std::map<int, int>& known_item_owner,
+        int frame_id) {
+    (void)operation_start;
+    (void)pending_in_ids;
+    DetectionShadowPlan plan;
+    for (size_t weak_index = 0; weak_index < detections.size(); ++weak_index) {
+        const Detection& weak = detections[weak_index];
+        int selected_strong_index = -1;
+        ShadowOwner selected_owner;
+        DetectionShadowHint selected_hint;
+        bool tied_strong_owner = false;
+        for (size_t strong_index = 0; strong_index < detections.size(); ++strong_index) {
+            if (strong_index == weak_index) continue;
+            DetectionShadowHint hint;
+            if (!duplicate_observation_geometry(weak, detections[strong_index], &hint)) {
+                continue;
+            }
+            const ShadowOwner owner = unique_shadow_owner_for_detection(
+                detections, static_cast<int>(strong_index), working, tracks,
+                known_item_owner);
+            if (!owner.valid || detection_has_independent_shadow_history(
+                                    detections, static_cast<int>(weak_index), owner,
+                                    working, tracks, known_item_owner)) {
+                continue;
+            }
+            if (selected_strong_index >= 0 &&
+                std::fabs(detections[strong_index].score -
+                          detections[static_cast<size_t>(selected_strong_index)].score) <=
+                    0.0001f) {
+                tied_strong_owner = true;
+                continue;
+            }
+            if (selected_strong_index >= 0 &&
+                detections[strong_index].score <=
+                    detections[static_cast<size_t>(selected_strong_index)].score) {
+                continue;
+            }
+            selected_strong_index = static_cast<int>(strong_index);
+            selected_owner = owner;
+            selected_hint = hint;
+            tied_strong_owner = false;
+        }
+        if (selected_strong_index < 0 || tied_strong_owner) continue;
+        selected_hint.detection_index = static_cast<int>(weak_index);
+        selected_hint.owner_detection_index = selected_strong_index;
+        selected_hint.owner_item_id = selected_owner.item_id;
+        selected_hint.owner_runtime_key = selected_owner.runtime_key;
+        selected_hint.frame_id = frame_id;
+        plan.detection_indices.insert(static_cast<int>(weak_index));
+        plan.owner_item_by_detection[static_cast<int>(weak_index)] = selected_owner.item_id;
+        plan.hint_by_detection[static_cast<int>(weak_index)] = selected_hint;
+    }
+    return plan;
+}
+
+GlobalOwnershipPlan build_global_ownership_plan(
+        const std::vector<Detection>& detections,
+        const std::map<int, InventoryItem>& working,
+        const std::map<int, InventoryItem>& operation_start,
+        const std::set<int>& pending_in_ids,
+        const std::map<int, OperationTrack>& tracks,
+        const std::set<int>& ignored_detection_indices) {
+    (void)pending_in_ids;
+    GlobalOwnershipPlan plan;
+    std::vector<int> item_ids;
+    std::map<std::pair<int, int>, int> edge_costs;
+    for (std::map<int, InventoryItem>::const_iterator item = working.begin();
+         item != working.end(); ++item) {
+        if (item->second.status == ItemStatus::OCCLUDED) continue;
+        const OperationTrack* runtime = find_track_for_item(tracks, item->first);
+        if (runtime && runtime->is_suspect_new &&
+            runtime->pending_d_quarantined_by_old_c) {
+            continue;
+        }
+        const BBox base_reference = item->second.base_box.area() > 0.0f
+            ? item->second.base_box : item->second.box;
+        if (base_reference.area() <= 0.0f) continue;
+        item_ids.push_back(item->first);
+        record_reference_assignment_edges(&edge_costs, item->first, item->second.cls_id,
+                                          base_reference, detections,
+                                          ignored_detection_indices,
+                                          1000, 12000, !runtime);
+
+        if (!runtime) continue;
+        if (runtime->has_placed_box) {
+            record_reference_assignment_edges(&edge_costs, item->first, item->second.cls_id,
+                                              runtime->placed_box, detections,
+                                              ignored_detection_indices,
+                                              500, 9000, false);
+        }
+        if (runtime->has_last_seen_box) {
+            record_reference_assignment_edges(&edge_costs, item->first, item->second.cls_id,
+                                              runtime->last_seen_box, detections,
+                                              ignored_detection_indices,
+                                              750, 10000, false);
+        }
+        if (reappear_candidate_is_confirmed(*runtime)) {
+            record_reference_assignment_edges(
+                &edge_costs, item->first, item->second.cls_id,
+                runtime->reappear_candidate_box, detections,
+                ignored_detection_indices, 250, 8000, false);
+        }
+        if (!runtime->observed_track.empty()) {
+            record_reference_assignment_edges(
+                &edge_costs, item->first, item->second.cls_id,
+                runtime->observed_track.back(), detections,
+                ignored_detection_indices, 500, 9000, false);
+        }
+        for (size_t di = 0; di < detections.size(); ++di) {
+            if (ignored_detection_indices.count(static_cast<int>(di))) continue;
+            const float path_cost = track_path_match_cost(item->second, *runtime,
+                                                          detections[di]);
+            if (path_cost < std::numeric_limits<float>::infinity()) {
+                record_assignment_edge(&edge_costs, item->first,
+                                       static_cast<int>(di),
+                                       scaled_assignment_cost(16000, path_cost));
+            }
+        }
+        // A track can originate from an operation-start C whose working base_box
+        // was already projected by a provisional move.  Keep its immutable
+        // start box as a strict-only fallback; it never makes a weak partial
+        // match win a global assignment.
+        const std::map<int, InventoryItem>::const_iterator original =
+            operation_start.find(item->first);
+        if (original != operation_start.end()) {
+            const BBox original_box = original->second.base_box.area() > 0.0f
+                ? original->second.base_box : original->second.box;
+            record_reference_assignment_edges(
+                &edge_costs, item->first, item->second.cls_id, original_box,
+                detections, ignored_detection_indices, 1500, 13000, false);
+        }
+    }
+    if (item_ids.empty() || edge_costs.empty()) return plan;
+
+    const AssignmentSolution baseline = solve_global_assignment(
+        item_ids, static_cast<int>(detections.size()), edge_costs, -1, -1);
+
+    for (std::map<int, int>::const_iterator selected =
+             baseline.detection_by_item.begin();
+         selected != baseline.detection_by_item.end(); ++selected) {
+        const AssignmentSolution without_pair = solve_global_assignment(
+            item_ids, static_cast<int>(detections.size()), edge_costs,
+            selected->first, selected->second);
+        const bool forced = without_pair.cardinality < baseline.cardinality ||
+            (without_pair.cardinality == baseline.cardinality &&
+             without_pair.cost > baseline.cost);
+        if (forced) {
+            plan.forced_detection_by_item[selected->first] = selected->second;
+            plan.forced_item_by_detection[selected->second] = selected->first;
+            continue;
+        }
+        plan.ambiguous_item_ids.insert(selected->first);
+        plan.ambiguous_detection_indices.insert(selected->second);
+        for (std::map<int, int>::const_iterator alternative =
+                 without_pair.detection_by_item.begin();
+             alternative != without_pair.detection_by_item.end(); ++alternative) {
+            std::map<int, int>::const_iterator baseline_pair =
+                baseline.detection_by_item.find(alternative->first);
+            if (baseline_pair == baseline.detection_by_item.end() ||
+                baseline_pair->second != alternative->second) {
+                plan.ambiguous_item_ids.insert(alternative->first);
+                plan.ambiguous_detection_indices.insert(alternative->second);
+            }
+        }
+    }
+    return plan;
 }
 
 int unique_detection_for_box(const std::vector<Detection>& detections,

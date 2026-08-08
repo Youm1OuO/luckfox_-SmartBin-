@@ -308,6 +308,33 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
     const std::map<int, int> independent_static_owner_by_detection =
         build_independent_no_hand_static_owner_by_detection(
             detections, working_inventory_, operation_start_inventory_, track_buffer_);
+    std::map<int, int> independent_static_owner_by_item;
+    for (std::map<int, int>::const_iterator owner =
+             independent_static_owner_by_detection.begin();
+         owner != independent_static_owner_by_detection.end(); ++owner) {
+        independent_static_owner_by_item[owner->second] = owner->first;
+    }
+    // 先隔离同类/异类的低分重复观测，再开始 C、D 的逐对象扫描。shadow 只
+    // 占用本帧临时 claimed 集合，弱框不会成为 D、alias 或某个 C 的替代终点；
+    // 下一帧完全重算，空间分离后的真实物品仍可进入原有 D 仲裁。
+    const DetectionShadowPlan shadow_plan = build_detection_shadow_plan(
+        detections, working_inventory_, operation_start_inventory_, pending_in_ids_,
+        track_buffer_, independent_static_owner_by_item, trace_frame_id_);
+    shadow_detection_indices_ = shadow_plan.detection_indices;
+    shadow_owner_by_detection_ = shadow_plan.owner_item_by_detection;
+    shadow_hint_by_detection_ = shadow_plan.hint_by_detection;
+    claimed.insert(shadow_detection_indices_.begin(), shadow_detection_indices_.end());
+    for (std::map<int, DetectionShadowHint>::const_iterator hint =
+             shadow_hint_by_detection_.begin();
+         hint != shadow_hint_by_detection_.end(); ++hint) {
+        trace_("SHADOW",
+               "phase=NO_HAND detection=%d owner-detection=%d owner=%d runtime=%d "
+               "score=%.3f owner-score=%.3f iom=%.3f center-norm=%.3f action=shadow",
+               hint->second.detection_index, hint->second.owner_detection_index,
+               hint->second.owner_item_id, hint->second.owner_runtime_key,
+               hint->second.score, hint->second.owner_score, hint->second.iom_value,
+               hint->second.center_norm);
+    }
 
     // “本帧存在无法唯一归属的路径候选”是瞬时证据；每张直接无手帧都重新
     // 计算，不能让上一帧歧义永久阻塞，也不能把本帧歧义拿去累计 OUT。
@@ -1595,8 +1622,33 @@ bool SessionManager::has_unresolved_no_hand_state_(
             !track.no_hand_candidate_ambiguous &&
             !track.no_hand_candidate_reserved_by_stronger_owner &&
             !old_track_has_unresolved_alias_(track);
+        const bool direct_object_exit_evidence =
+            track.contact_state == ContactState::NONE &&
+            track.state != OperationTrackState::NORMAL &&
+            track.has_direct_object_exit_evidence &&
+            track.direct_object_path_streak >= FLOW3_NO_HAND_D_CONFIRM_FRAMES &&
+            track.direct_object_last_frame >= 0 &&
+            track.has_direct_object_last_box &&
+            boxes_differ_as_move(track.original_box, track.direct_object_last_box) &&
+            !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
+            !track.no_hand_candidate_ambiguous &&
+            !track.no_hand_candidate_reserved_by_stronger_owner &&
+            !old_track_has_unresolved_alias_(track);
+        const bool hand_group_exit_evidence =
+            track.contact_state == ContactState::NONE &&
+            track.state != OperationTrackState::NORMAL &&
+            track.carrier_capture_context && track.capture_was_fully_hidden &&
+            !track.hand_group_identity_invalid && track.hand_group_exit_witness &&
+            track.hand_group_exit_frame >= 0 &&
+            !track.possible_carrier_hand_ids.empty() &&
+            old_position_is_clean(detections, track, working_inventory_) &&
+            !track.b_claim_ambiguous && !track.contact_path_ambiguous &&
+            !track.no_hand_candidate_ambiguous &&
+            !track.no_hand_candidate_reserved_by_stronger_owner &&
+            !old_track_has_unresolved_alias_(track);
         if (!contact_out_evidence && !hand_out_evidence &&
-            !interrupted_direct_exit_evidence) {
+            !interrupted_direct_exit_evidence && !direct_object_exit_evidence &&
+            !hand_group_exit_evidence) {
             unresolved = true;
             trace_track_("NO-HAND", track, "missing-without-sufficient-out-evidence");
             continue;
@@ -1607,6 +1659,24 @@ bool SessionManager::has_unresolved_no_hand_state_(
                    "item=%d action=accept-for-existing-missing-chain evidence-frame=%d "
                    "missing=%d/%d",
                    track.item_id, track.direct_exit_frame, track.no_hand_missing_count,
+                   FLOW3_NO_HAND_OUT_MISSING_FRAMES);
+        }
+        if (direct_object_exit_evidence && !contact_out_evidence &&
+            !hand_out_evidence && !interrupted_direct_exit_evidence) {
+            trace_("DIRECT-OBJECT",
+                   "item=%d action=accept-for-existing-missing-chain path-frame=%d "
+                   "streak=%d missing=%d/%d",
+                   track.item_id, track.direct_object_last_frame,
+                   track.direct_object_path_streak, track.no_hand_missing_count,
+                   FLOW3_NO_HAND_OUT_MISSING_FRAMES);
+        }
+        if (hand_group_exit_evidence && !contact_out_evidence && !hand_out_evidence &&
+            !interrupted_direct_exit_evidence && !direct_object_exit_evidence) {
+            trace_("HAND-GROUP-EXIT",
+                   "item=%d action=accept-for-existing-missing-chain witness-frame=%d "
+                   "candidates=%zu missing=%d/%d",
+                   track.item_id, track.hand_group_exit_frame,
+                   track.possible_carrier_hand_ids.size(), track.no_hand_missing_count,
                    FLOW3_NO_HAND_OUT_MISSING_FRAMES);
         }
 

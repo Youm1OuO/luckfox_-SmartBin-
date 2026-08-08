@@ -19,6 +19,8 @@ int main() {
     test_d_reappearance_does_not_claim_strict_existing_inventory();
     test_hand_visible_d_does_not_confirm_from_strict_static_old_c();
     test_low_score_cross_class_duplicate_does_not_create_hand_visible_d();
+    test_low_score_same_class_duplicate_does_not_create_hand_visible_d();
+    test_shadow_plan_and_global_assignment_are_identity_safe();
     test_new_item_dropped_before_hand_moves_away_keeps_its_identity();
     test_partial_existing_item_is_not_registered_as_new_d();
     test_fast_same_class_b_becomes_c_candidate_not_d();
@@ -65,6 +67,7 @@ int main() {
     test_interrupted_two_hand_return_to_original_stays_static();
     test_skewed_merged_hand_detection_suspends_all_item_deltas();
     test_second_hand_overlap_suspends_existing_item_delta();
+    test_hand_group_exit_witness_requires_continuous_edge_hand();
     test_temporarily_lost_hand_recovers_without_gap_delta();
     test_post_hand_reveal_commits_on_second_direct_frame();
     test_c_reappear_commits_after_second_direct_frame();
