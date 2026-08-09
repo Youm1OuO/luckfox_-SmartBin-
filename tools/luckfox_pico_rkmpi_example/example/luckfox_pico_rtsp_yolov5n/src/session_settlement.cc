@@ -913,6 +913,7 @@ void SessionManager::refresh_confirmed_blockers_(
                  (target_runtime->resolution == ExistingItemResolution::MOVED_CONFIRMED ||
                   target_runtime->resolution == ExistingItemResolution::OUT_CONFIRMED));
             const char* invalid_reason = 0;
+            // (1) 记录结构完整性：与几何无关的前置校验，先做。
             if (record.target_item_id != target_id ||
                 record.proof.kind != OcclusionProofKind::CAUSAL_FRONT_MISSING ||
                 record.proof.witness_blocker_ids.empty() ||
@@ -920,14 +921,13 @@ void SessionManager::refresh_confirmed_blockers_(
                 record.last_witness_boxes.empty() ||
                 record.required_coverage_ratio <= 0.0f) {
                 invalid_reason = "malformed-record";
-            } else if (target_observed) {
-                invalid_reason = "target-direct-observed";
-            } else if (target_has_strong_proof_conflict) {
-                invalid_reason = "strong-observation-conflict";
-            } else if (target_has_confirmed_exit_now) {
-                invalid_reason = "target-confirmed-independent-exit";
             }
 
+            // (2) 细节29 §3.1：先计算几何/连续性证据强度，再做真矛盾/歧义判定。
+            //     witness 必须是本 operation 内确认移动/确认入库、且当前仍严格覆盖
+            //     目标、且连续的前景物。这些检查原本排在真矛盾判定之后，现在提前，
+            //     用于判断这份因果证明是否强到可以对“归属歧义”免疫。它们都是纯读取
+            //     上文已算好的数据，无副作用，提前计算安全。
             std::map<int, BBox> current_witness_boxes;
             std::vector<BBox> current_witness_cover_boxes;
             if (!invalid_reason) {
@@ -949,6 +949,7 @@ void SessionManager::refresh_confirmed_blockers_(
                 }
             }
             CoverageEvaluation provisional_coverage;
+            bool geometry_strong = false;
             if (!invalid_reason) {
                 provisional_coverage = evaluate_full_coverage(
                     record.target_operation_start_box, current_witness_cover_boxes,
@@ -960,6 +961,28 @@ void SessionManager::refresh_confirmed_blockers_(
                                *final_items, record.last_witness_boxes,
                                current_witness_boxes)) {
                     invalid_reason = "front-box-discontinuous";
+                } else {
+                    // 记录结构、witness 前景性、覆盖率、连续性全部满足 → 几何足够强。
+                    geometry_strong = true;
+                }
+            }
+
+            // (3) 细节29 §3.1：真矛盾否决始终生效；归属歧义只有在几何不够强时才否决。
+            //   - target-direct-observed / target-confirmed-independent-exit 是真矛盾
+            //     （目标又被直接看到 / 目标有确认的独立离场证据），始终作废证明；
+            //   - strong-observation-conflict 里包含“同类归属歧义”，只回答“框归谁”，
+            //     与“目标是否被前景物遮挡而消失”正交。当因果证明几何足够强
+            //     (geometry_strong) 时对它免疫，解开单手同类遮挡的 defer-commit 死锁；
+            //     几何不够强时仍按原样作废，双手多同类的身份保护不被削弱。
+            const bool causal_proof_immune_to_ownership_ambiguity = geometry_strong;
+            if (!invalid_reason) {
+                if (target_observed) {
+                    invalid_reason = "target-direct-observed";
+                } else if (target_has_confirmed_exit_now) {
+                    invalid_reason = "target-confirmed-independent-exit";
+                } else if (target_has_strong_proof_conflict &&
+                           !causal_proof_immune_to_ownership_ambiguity) {
+                    invalid_reason = "strong-observation-conflict";
                 }
             }
 
