@@ -120,6 +120,10 @@ void test_hand_front_cover_remains_provisional_until_no_hand_confirmation();
 void test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
 void test_same_class_candidate_context_includes_unowned_viable_old_c();
 void test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie();
+// 细节31：无手期后手矫正（补登记）。
+void test_no_hand_correction_box_in_hand_region_gets_in();
+void test_no_hand_correction_box_out_hand_region_gets_out();
+void test_no_hand_correction_box_outside_hand_region_not_in();
 
 }  // namespace session3_replay
 

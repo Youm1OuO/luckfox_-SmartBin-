@@ -217,6 +217,8 @@ void SessionManager::reset_operation_runtime_() {
     pending_occlusion_missing_counts_.clear();
     pending_occlusion_witness_ids_.clear();
     pending_occlusion_witness_boxes_.clear();
+    nohand_correct_in_streak_.clear();
+    nohand_correct_out_streak_.clear();
     hand_track_.clear();
     old_hands_.clear();
     current_hand_boxes_.clear();

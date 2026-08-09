@@ -99,5 +99,8 @@ int main() {
     test_same_grade_local_old_owners_remain_ambiguous_despite_center_distance();
     test_same_class_candidate_context_includes_unowned_viable_old_c();
     test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie();
+    test_no_hand_correction_box_in_hand_region_gets_in();
+    test_no_hand_correction_box_out_hand_region_gets_out();
+    test_no_hand_correction_box_outside_hand_region_not_in();
     return 0;
 }

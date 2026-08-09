@@ -2192,4 +2192,90 @@ void test_cover_union_keeps_multiple_tiny_residuals_until_total_area_check() {
     assert(session.inventory().find_by_item(1) != 0);
     assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
 }
+
+// 细节31：整盒放入。手在中间一大片活动过（拿透明盒），无手后 3 个互不重叠、
+// 都落在手活动区域内的同类框稳定 3 帧 → 补出 3 个 IN。
+void test_no_hand_correction_box_in_hand_region_gets_in() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    session.init_from_backend(std::vector<fridge::InventoryItem>(), true);
+    int frame = 1;
+    initial_no_hand_frame(&session, std::vector<fridge::Detection>(), &frame);
+
+    std::vector<fridge::Detection> none;
+    send_frame(&session, none, std::vector<fridge::BBox>(1, fridge::BBox(300, 420, 620, 720)), &frame);
+    send_frame(&session, none, std::vector<fridge::BBox>(1, fridge::BBox(360, 410, 700, 720)), &frame);
+    send_frame(&session, none, std::vector<fridge::BBox>(1, fridge::BBox(300, 420, 760, 720)), &frame);
+
+    std::vector<fridge::Detection> eggs;
+    eggs.push_back(det(18, 380, 470, 500, 570));
+    eggs.push_back(det(18, 520, 470, 640, 570));
+    eggs.push_back(det(18, 450, 590, 570, 690));
+    fridge::SettlementResult result = settle_after_hand(&session, eggs, &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 3);
+    int in_events = 0;
+    for (size_t i = 0; i < result.events.size(); ++i) {
+        if (result.events[i].kind == fridge::EventKind::IN) ++in_events;
+    }
+    assert(in_events == 3);
+}
+
+// 细节31：整盒取走。初始 3 个鸡蛋在库，手在那片活动过，之后无手快照持续为空
+// → 补出 3 个 OUT，库存清零。
+void test_no_hand_correction_box_out_hand_region_gets_out() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> init;
+    init.push_back(item(1, 18, 380, 470, 500, 570));
+    init.push_back(item(2, 18, 520, 470, 640, 570));
+    init.push_back(item(3, 18, 450, 590, 570, 690));
+    session.init_from_backend(init, true);
+    int frame = 1;
+    std::vector<fridge::Detection> eggs;
+    eggs.push_back(det(18, 380, 470, 500, 570));
+    eggs.push_back(det(18, 520, 470, 640, 570));
+    eggs.push_back(det(18, 450, 590, 570, 690));
+    initial_no_hand_frame(&session, eggs, &frame);
+
+    std::vector<fridge::Detection> none;
+    send_frame(&session, none, std::vector<fridge::BBox>(1, fridge::BBox(360, 440, 660, 720)), &frame);
+    send_frame(&session, none, std::vector<fridge::BBox>(1, fridge::BBox(360, 440, 660, 720)), &frame);
+    send_frame(&session, none, std::vector<fridge::BBox>(1, fridge::BBox(360, 440, 660, 720)), &frame);
+    fridge::SettlementResult result = settle_after_hand(&session, none, &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 0);
+    int out_events = 0;
+    for (size_t i = 0; i < result.events.size(); ++i) {
+        if (result.events[i].kind == fridge::EventKind::OUT) ++out_events;
+    }
+    assert(out_events == 3);
+}
+
+// 细节31 反向守护：手只在左侧碰旧苹果；右侧远处稳定出现一个高分框（手从没去过）
+// → 绝不补 IN。这正是旧 test_unbound_no_hand_box_never_auto_in 想保护的红线，
+// 现在由"手活动区域"这把更精确的钥匙来守护。
+void test_no_hand_correction_box_outside_hand_region_not_in() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> init;
+    init.push_back(item(1, 0, 100, 100, 200, 200));
+    session.init_from_backend(init, true);
+    int frame = 1;
+    initial_no_hand_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)), &frame);
+
+    send_frame(&session, std::vector<fridge::Detection>(1, det(0, 100, 100, 200, 200)),
+               std::vector<fridge::BBox>(1, fridge::BBox(80, 80, 180, 220)), &frame);
+    std::vector<fridge::Detection> stable;
+    stable.push_back(det(0, 100, 100, 200, 200));
+    stable.push_back(det(2, 900, 100, 1000, 200));  // 远在右侧，手从没去过
+    fridge::SettlementResult result = settle_after_hand(&session, stable, &frame);
+
+    assert(result.committed);
+    assert(session.inventory().size() == 1);
+    assert(!has_event(result, fridge::EventKind::IN, 2));
+    assert(session.inventory().find_by_item(2) == 0);
+}
 }  // namespace session3_replay

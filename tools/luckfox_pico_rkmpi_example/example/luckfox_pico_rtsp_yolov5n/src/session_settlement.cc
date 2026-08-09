@@ -1681,15 +1681,25 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         final_items.erase(*out);
     }
 
-    if (has_unresolved_state) {
+    // 细节31：无手期后手矫正（补登记）第 (1) 步——更新补 IN/补 OUT 的连续计数。
+    // 它只统计"落在本轮手活动区域内 + 严格准入"的残余候选；若有候选仍在攒证据
+    // （连续帧数还没到 FLOW3_NOHAND_CORRECT_FRAMES），返回 true 要求再等一帧。
+    // 这样"整盒鸡蛋"的未绑定框能攒够 3 帧后一起补 IN，而不涉及补登记的场景由于
+    // 没有任何合法候选，此函数不产生任何 defer，既有提交时机完全不变。
+    const bool correction_wants_more_frames = update_no_hand_correction_streaks_(
+        detections, observation_owner, observed_ids, final_items, transition_plans);
+
+    if (has_unresolved_state || correction_wants_more_frames) {
         trace_("SETTLE",
-               "defer-commit inventory=%zu tracks=%zu pending-in=%zu pending-out=%zu",
+               "defer-commit inventory=%zu tracks=%zu pending-in=%zu pending-out=%zu "
+               "correction-pending=%d",
                final_items.size(), track_buffer_.size(), pending_in_ids_.size(),
-               pending_out_ids_.size());
+               pending_out_ids_.size(), correction_wants_more_frames ? 1 : 0);
         return result;
     }
 
-    // 最后才生成正式事件；整个过程中没有任何“未绑定无手框自动 IN”。
+    // 最后才生成正式事件。既有路径不产生任何“未绑定无手框自动 IN”；补登记在下面
+    // 第 (2) 步以严格准入单独处理残余。
     std::vector<InventoryEvent> events;
     // 第一组只发布前景物品自身的结算结果。遮挡/揭示事件统一放到后面，
     // 这样事件顺序天然满足 MOVED/OUT/IN -> visibility 的因果依赖。
@@ -1735,6 +1745,12 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         }
     }
 
+    // 细节31：无手期后手矫正（补登记）第 (2) 步——对连续计数已达标的残余执行
+    // 补 IN / 补 OUT。它在既有 IN/OUT/MOVED/遮挡事件之后运行，只处理"谁都没解释"
+    // 的残余，纯增量。补出的 IN/OUT 追加进 events、改动写进 final_items。
+    apply_no_hand_correction_(detections, observation_owner, transition_plans,
+                              &final_items, &events);
+
     for (size_t si = 0; si < observation_owner.size(); ++si) {
         if (observation_owner[si] < 0) {
             printf("[3.0] 无手直接帧出现未绑定检测 cls=%d；没有 D 证据链，不自动 IN\n",
@@ -1777,6 +1793,252 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     result.events.swap(events);
     clear_runtime_after_commit_();
     return result;
+}
+
+// ===========================================================================
+//  细节31：无手期后手矫正（补登记）
+// ===========================================================================
+
+bool SessionManager::update_no_hand_correction_streaks_(
+        const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
+        const std::set<int>& observed_ids,
+        const std::map<int, InventoryItem>& final_items,
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans) {
+    if (!fridge::FLOW3_NOHAND_CORRECTION_ENABLED) {
+        nohand_correct_in_streak_.clear();
+        nohand_correct_out_streak_.clear();
+        return false;
+    }
+
+    bool wants_more_frames = false;
+
+    // ---- 补 IN 候选连续计数 ----
+    // 本帧所有合法补 IN 候选框。
+    std::vector<int> in_candidates;
+    for (size_t di = 0; di < detections.size(); ++di) {
+        if (is_correction_in_candidate_(static_cast<int>(di), detections,
+                                        observation_owner, final_items)) {
+            in_candidates.push_back(static_cast<int>(di));
+        }
+    }
+    // 将本帧候选与已有连续记录按"同类 + 位置可匹配"接续；匹配上则 ++，
+    // 否则作为新候选起始。逻辑与既有 reappear 候选同型，只累计不跨物体混淆。
+    std::vector<NoHandCorrectInStreak> next_streaks;
+    std::vector<char> used(nohand_correct_in_streak_.size(), 0);
+    for (size_t k = 0; k < in_candidates.size(); ++k) {
+        const Detection& d = detections[in_candidates[k]];
+        int matched = -1;
+        for (size_t s = 0; s < nohand_correct_in_streak_.size(); ++s) {
+            if (used[s]) continue;
+            if (nohand_correct_in_streak_[s].cls_id != d.cls_id) continue;
+            if (track_match_box(d.cls_id, nohand_correct_in_streak_[s].box,
+                                d.cls_id, d.box)) {
+                matched = static_cast<int>(s);
+                break;
+            }
+        }
+        NoHandCorrectInStreak entry;
+        entry.cls_id = d.cls_id;
+        entry.box = d.box;
+        if (matched >= 0) {
+            used[matched] = 1;
+            entry.frames = nohand_correct_in_streak_[matched].frames + 1;
+        } else {
+            entry.frames = 1;
+        }
+        if (entry.frames < fridge::FLOW3_NOHAND_CORRECT_FRAMES) {
+            wants_more_frames = true;  // 还在攒证据，需再等一帧
+        }
+        next_streaks.push_back(entry);
+    }
+    nohand_correct_in_streak_.swap(next_streaks);
+
+    // ---- 补 OUT 候选连续计数 ----
+    std::map<int, int> next_out;
+    for (std::map<int, InventoryItem>::const_iterator it =
+             operation_start_inventory_.begin();
+         it != operation_start_inventory_.end(); ++it) {
+        if (!is_correction_out_candidate_(it->first, final_items, observed_ids,
+                                          transition_plans)) {
+            continue;
+        }
+        std::map<int, int>::const_iterator prev =
+            nohand_correct_out_streak_.find(it->first);
+        const int frames = (prev == nohand_correct_out_streak_.end())
+            ? 1 : prev->second + 1;
+        next_out[it->first] = frames;
+        if (frames < fridge::FLOW3_NOHAND_CORRECT_FRAMES) {
+            wants_more_frames = true;
+        }
+    }
+    nohand_correct_out_streak_.swap(next_out);
+
+    return wants_more_frames;
+}
+
+void SessionManager::apply_no_hand_correction_(
+        const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans,
+        std::map<int, InventoryItem>* final_items,
+        std::vector<InventoryEvent>* events) {
+    if (!fridge::FLOW3_NOHAND_CORRECTION_ENABLED) return;
+    (void)transition_plans;
+
+    // ---- 补 IN：对连续计数已达标的候选逐个登记 ----
+    // 同一帧可能有多个已达标候选（整盒鸡蛋）；它们互不重叠，各自补一个。
+    for (size_t di = 0; di < detections.size(); ++di) {
+        // 必须仍是本帧合法候选（防止上一帧达标、本帧已被其它机制解释）。
+        if (!is_correction_in_candidate_(static_cast<int>(di), detections,
+                                         observation_owner, *final_items)) {
+            continue;
+        }
+        const Detection& d = detections[di];
+        // 找到它的连续记录，确认已达标。
+        bool ready = false;
+        for (size_t s = 0; s < nohand_correct_in_streak_.size(); ++s) {
+            if (nohand_correct_in_streak_[s].cls_id == d.cls_id &&
+                track_match_box(d.cls_id, nohand_correct_in_streak_[s].box,
+                                d.cls_id, d.box) &&
+                nohand_correct_in_streak_[s].frames >=
+                    fridge::FLOW3_NOHAND_CORRECT_FRAMES) {
+                ready = true;
+                break;
+            }
+        }
+        if (!ready) continue;
+        // 分配新 item_id，以当前框为 base_box、VISIBLE 登记，生成 IN 事件。
+        const int new_id = working_next_item_id_++;
+        InventoryItem item = make_inventory_item(new_id, d, trace_frame_id_,
+                                                 current_time_ms_);
+        (*final_items)[new_id] = item;
+        events->push_back(make_event(EventKind::IN, item));
+        trace_("SETTLE",
+               "no-hand-correction=IN item=%d cls=%d score=%.3f "
+               "box=(%.1f,%.1f,%.1f,%.1f) reason=hand-region-stable",
+               new_id, d.cls_id, d.score,
+               d.box.x1, d.box.y1, d.box.x2, d.box.y2);
+    }
+
+    // ---- 补 OUT：对连续缺失已达标的旧 C 逐个移除并发 OUT ----
+    std::vector<int> out_ids;
+    for (std::map<int, int>::const_iterator it = nohand_correct_out_streak_.begin();
+         it != nohand_correct_out_streak_.end(); ++it) {
+        if (it->second < fridge::FLOW3_NOHAND_CORRECT_FRAMES) continue;
+        out_ids.push_back(it->first);
+    }
+    for (size_t i = 0; i < out_ids.size(); ++i) {
+        const int item_id = out_ids[i];
+        std::map<int, InventoryItem>::iterator now = final_items->find(item_id);
+        if (now == final_items->end()) continue;
+        events->push_back(make_event(EventKind::OUT, now->second));
+        trace_("SETTLE",
+               "no-hand-correction=OUT item=%d cls=%d reason=hand-region-missing",
+               item_id, now->second.cls_id);
+        final_items->erase(now);
+    }
+}
+
+bool SessionManager::box_in_hand_activity_region_(const BBox& box) const {
+    if (box.area() <= 0.0f) return false;
+    const float m = fridge::FLOW3_NOHAND_CORRECT_HAND_MARGIN_RATIO;
+    // hand_track_ 累积了本轮每帧出现过的所有手框。逐个按比例外扩后与 box 取 IoM，
+    // 命中任意一个即算"落在手活动区域内"。
+    for (size_t i = 0; i < hand_track_.size(); ++i) {
+        const BBox& h = hand_track_[i];
+        if (h.area() <= 0.0f) continue;
+        const float ex = h.w() * m;
+        const float ey = h.h() * m;
+        const BBox grown(h.x1 - ex, h.y1 - ey, h.x2 + ex, h.y2 + ey);
+        if (iom(grown, box) >= fridge::FLOW3_NOHAND_CORRECT_REGION_IOM) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SessionManager::is_correction_in_candidate_(
+        int detection_index, const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
+        const std::map<int, InventoryItem>& final_items) const {
+    if (detection_index < 0 ||
+        static_cast<size_t>(detection_index) >= detections.size()) {
+        return false;
+    }
+    // 只处理"既有机制谁都没解释"的残余框：本帧未被任何 item 绑定。
+    if (static_cast<size_t>(detection_index) < observation_owner.size() &&
+        observation_owner[detection_index] >= 0) {
+        return false;
+    }
+    // shadow（重复观测诊断）框不参与。
+    if (shadow_detection_indices_.count(detection_index)) return false;
+
+    const Detection& d = detections[detection_index];
+    // 条件3：高分（复用既有物品阈值，不额外放宽）。
+    if (d.score < fridge::YOLO_OBJECT_SCORE_THRESH) return false;
+    // 条件1：落在本轮手活动区域内（核心钥匙）。
+    if (!box_in_hand_activity_region_(d.box)) return false;
+    // 条件4：无法归属任何已有物品/D，也不与任何活动 runtime 冲突（含"遮挡露出"，
+    // 那些会先被既有匹配/REVEALED 逻辑接管）。
+    if (detection_matches_old_working_inventory(d, working_inventory_,
+                                                operation_start_inventory_)) {
+        return false;
+    }
+    if (detection_conflicts_with_active_track(d, track_buffer_)) return false;
+    // 条件5：不与任何"已被绑定的观察框"高度重叠（排除同一物体的重复/误分类框）。
+    for (size_t si = 0; si < observation_owner.size(); ++si) {
+        if (observation_owner[si] < 0) continue;
+        if (static_cast<size_t>(si) >= detections.size()) continue;
+        if (iom(d.box, detections[si].box) >= fridge::RECLS_DEDUP_IOM_THRESH) {
+            return false;
+        }
+    }
+    (void)final_items;
+    return true;
+}
+
+bool SessionManager::is_correction_out_candidate_(
+        int item_id, const std::map<int, InventoryItem>& final_items,
+        const std::set<int>& observed_ids,
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans) const {
+    // 只处理本轮开始就在库的旧 C。
+    std::map<int, InventoryItem>::const_iterator start =
+        operation_start_inventory_.find(item_id);
+    if (start == operation_start_inventory_.end()) return false;
+    // 必须仍在 final_items 里（还没被任何既有机制移除）。
+    std::map<int, InventoryItem>::const_iterator now = final_items.find(item_id);
+    if (now == final_items.end()) return false;
+    // 本帧被直接观察到 → 不是消失。
+    if (observed_ids.count(item_id)) return false;
+    // 条件4：不在既有 OUT / MOVED 流程内。
+    if (pending_out_ids_.count(item_id) || confirmed_moved_ids_.count(item_id)) {
+        return false;
+    }
+    // 条件3：无遮挡解释——当前不是 OCCLUDED、且没有任何遮挡/HOLD 计划、
+    // 也不在 pending_occlusion_* 证据链里。被遮挡的物品绝不能补 OUT。
+    if (now->second.status == ItemStatus::OCCLUDED) return false;
+    if (pending_occlusion_missing_counts_.count(item_id) ||
+        pending_occlusion_witness_ids_.count(item_id)) {
+        return false;
+    }
+    std::map<int, session_internal::BlockerTransitionPlan>::const_iterator plan =
+        transition_plans.find(item_id);
+    if (plan != transition_plans.end()) {
+        const session_internal::BlockerTransitionPlan& p = plan->second;
+        if (p.allow_occluded_transition ||
+            p.out == session_internal::OutDisposition::HOLD_FOR_PENDING_OCCLUSION) {
+            return false;
+        }
+    }
+    // 条件1：消失位置在本轮手活动区域内（与补 IN 同一把尺）。
+    const BBox& gone = now->second.base_box.area() > 0.0f
+        ? now->second.base_box : now->second.box;
+    if (!box_in_hand_activity_region_(gone)) return false;
+    return true;
 }
 
 }  // namespace fridge

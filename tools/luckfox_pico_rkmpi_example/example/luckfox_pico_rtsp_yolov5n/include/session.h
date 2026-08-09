@@ -513,6 +513,44 @@ private:
         std::set<int>* claimed_detection_indices);
     SettlementResult settle_no_hand_frame_(const std::vector<Detection>& detections,
                                            int frame_id);
+    // 细节31：无手期后手矫正（补登记）。分两步，都只在 settle_no_hand_frame_ 里调用，
+    // 有手期逻辑完全不变，纯增量兜底：
+    //  (1) update：每张无手帧更新补 IN/补 OUT 的连续计数（落在手活动区域内 + 严格准入
+    //      的候选才计数）。若存在"已在累积、但还没到 FLOW3_NOHAND_CORRECT_FRAMES"的候选，
+    //      返回 true，表示应再等一帧（defer-commit）让它攒够证据。
+    //  (2) apply：在最终提交那一帧，对连续计数已达标的候选执行补 IN / 补 OUT，
+    //      事件追加进 *events、库存改动写进 *final_items。
+    // 判定候选是否"落在本轮手活动区域内"复用 box_in_hand_activity_region_。
+    bool update_no_hand_correction_streaks_(
+        const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
+        const std::set<int>& observed_ids,
+        const std::map<int, InventoryItem>& final_items,
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans);
+    void apply_no_hand_correction_(
+        const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans,
+        std::map<int, InventoryItem>* final_items,
+        std::vector<InventoryEvent>* events);
+    // 候选框/物品框是否落在"本轮手活动区域"内：hand_track_ 里任一手框按比例外扩后，
+    // 与 box 的 IoM >= FLOW3_NOHAND_CORRECT_REGION_IOM 即算命中。
+    bool box_in_hand_activity_region_(const BBox& box) const;
+    // 一个未绑定的无手框是否是"补 IN 的合法候选"（不含帧数条件）：落在手活动区域内、
+    // 高分、无法归属任何已有物品/D、不与任何已登记框或更优候选高度重叠。
+    bool is_correction_in_candidate_(
+        int detection_index, const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
+        const std::map<int, InventoryItem>& final_items) const;
+    // 一个旧 C 是否是"补 OUT 的合法候选"（不含帧数条件）：本帧未被观察到、消失位置在
+    // 手活动区域内、无遮挡解释、不在既有 OUT/MOVED 流程内。
+    bool is_correction_out_candidate_(
+        int item_id, const std::map<int, InventoryItem>& final_items,
+        const std::set<int>& observed_ids,
+        const std::map<int, session_internal::BlockerTransitionPlan>&
+            transition_plans) const;
     // 只在无手阶段全局一对一归属完成后使用。它不是普通 MOVED 门槛的替代，
     // 仅补偿 hand_id 保护性中断造成的 delta 空档。
     bool can_confirm_direct_recovered_move_(const OperationTrack& track,
@@ -671,6 +709,17 @@ private:
     int active_operation_id_ = 0;
     int trace_frame_id_ = -1;
     bool trace_hand_phase_ = false;
+
+    // 细节31：无手期补登记的跨帧连续计数（仅本 operation 内有效，
+    // reset_operation_runtime_ 处清空）。补 IN 候选按"上一帧框 + 类别"连续匹配累计；
+    // 补 OUT 按 item_id 累计连续缺失帧数。手活动区域直接复用已有的 hand_track_。
+    struct NoHandCorrectInStreak {
+        BBox box;        // 最近一帧的候选框
+        int cls_id = -1;
+        int frames = 0;  // 连续稳定帧数
+    };
+    std::vector<NoHandCorrectInStreak> nohand_correct_in_streak_;
+    std::map<int, int> nohand_correct_out_streak_;  // key=item_id, value=连续缺失帧数
 
     bool hand_present_ = false;
     bool session_active_ = false;

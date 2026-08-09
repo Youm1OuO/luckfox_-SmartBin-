@@ -277,7 +277,7 @@ constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
 // 可开关的 3.0 状态机诊断追踪。开启后会按操作号、帧号记录状态转换、
 // C->B 仲裁、D 防线和无手结算依据；它只输出日志，不参与任何业务判断。
-constexpr bool FLOW3_DEBUG_TRACE_LOG = true;
+constexpr bool FLOW3_DEBUG_TRACE_LOG = false;
 
 // 当前尚未对接后台，允许首张无手直接检测建立本地测试库存。
 // 接入可信后台后建议改为 false：此时冷启动画面只做只读校验，不负责建库。
@@ -467,6 +467,25 @@ constexpr int  RECLS_MERGE_TO   = CLS_CHINESE_CABBAGE;  // 替换成的类
 //  两个真实相邻的同类物体(如挨着的两个苹果)，造成漏检。
 constexpr bool  RECLS_DEDUP_ENABLED   = true;   // 是否启用纠正后同类去重
 constexpr float RECLS_DEDUP_IOM_THRESH = 0.75f; // IoM 超过此值且同类，去重(保留高分框)
+
+// =========================================================================
+//  无手期后手矫正（补登记）—— 细节31
+// -------------------------------------------------------------------------
+//  一次操作(开门→有手→无手)结束时，对"有手期因证据不足没能定论"的 IN/OUT 做
+//  一次严格准入的兜底。典型场景：透明蛋盒整盒放入/取走(YOLO 只看到手和鸡蛋)。
+//  核心钥匙：候选必须落在"本轮手实际活动过的区域"内——手没去过的地方一律不补。
+//  背景假框交给 YOLO 侧过滤，业务层相信 YOLO。有手期逻辑完全不受影响，纯增量。
+// =========================================================================
+// 总开关。置 false 立即回到"无手不补 IN/OUT"的原行为(排查/现场兜底用)。
+constexpr bool  FLOW3_NOHAND_CORRECTION_ENABLED = true;
+// 补 IN(连续稳定) / 补 OUT(连续缺失) 都要求的帧数。3 比 2 更能排除双帧幻影。
+constexpr int   FLOW3_NOHAND_CORRECT_FRAMES = 3;
+// "手活动区域"外扩比例：每个手框按自身宽/高各边外扩此比例(0.20=宽高各放大约40%)。
+// 用比例而非固定像素，手离相机远近都稳。放大覆盖盒边物品，过大则纳入过多背景。
+constexpr float FLOW3_NOHAND_CORRECT_HAND_MARGIN_RATIO = 0.20f;
+// 候选框与"手活动区域"的重叠判据(IoM)。>= 此值算"大部分落在手动过的地方"。
+// 补 IN 和补 OUT 用同一把尺。
+constexpr float FLOW3_NOHAND_CORRECT_REGION_IOM = 0.50f;
 
 }  // namespace fridge
 
