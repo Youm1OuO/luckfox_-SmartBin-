@@ -1187,7 +1187,18 @@ void SessionManager::observe_no_hand_frame_(const std::vector<Detection>& detect
                     if (!candidate_ready) continue;
                     track.last_seen_box = d.box;
                     track.has_last_seen_box = true;
-                    if ((track.hold_and_move || has_meaningful_hand_move(track)) &&
+                    // 细节30 §3.1：双手同时各移一物时，两手先被判 merged/ambiguous，
+                    // 手身份分离晚，物品在 CONTACT_* 下攒不出 hold_and_move /
+                    // move_values（CONTACT 的手位移只进 hand_move_values，不进
+                    // move_values），导致“有位移却不 MOVED”。这里把“reappear 候选
+                    // 已连续确认”补为等价的移动证据，和本文件 has_real_move_evidence
+                    // （约 1312~1317 行）已有先例对齐。位移仍必须过 boxes_differ_as_move
+                    // 正式门槛（静态回原位/YOLO 抖动不触发），alias 门槛也原样保留。
+                    const bool reappear_move_evidence =
+                        track.has_reappear_candidate_box &&
+                        reappear_candidate_is_confirmed(track);
+                    if ((track.hold_and_move || has_meaningful_hand_move(track) ||
+                         reappear_move_evidence) &&
                         boxes_differ_as_move(track.original_box, d.box) &&
                         (!shared_quarantined_alias ||
                          track.alias_no_hand_match_count >=
