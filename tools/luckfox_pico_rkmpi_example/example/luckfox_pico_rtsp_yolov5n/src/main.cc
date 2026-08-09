@@ -45,6 +45,7 @@
 #include "app_preprocess.h"
 #include "app_door_state.h"
 #include "app_display.h"
+#include "reclassify.h"
 
 // 1280*720, 1920*1080
 #define DISP_WIDTH  1280
@@ -396,6 +397,18 @@ int main(int argc, char *argv[]) {
 			long long now_ms = (long long)(now_us / 1000);
 
 			g_frame_id++;
+
+			// ============================================================
+			//  YOLO 输出后的手动纠正 (reclassify)
+			//  在业务层使用之前，对易混类别按框面积/颜色就地改 cls_id：
+			//    egg<->orange(面积)、apple<->onion(颜色)、lettuce->cabbage(合并)。
+			//  此时 frame 已翻转、det.box 为原图坐标，颜色采样与业务框同源，
+			//  因此业务判断、上云类别、OSD 显示三者全部使用纠正后的类别，
+			//  保证"所见即所得"。阈值全部在 fridge_config.h 的 reclassify 配置块。
+			//  手框(hand_boxes/hand_dets_for_display)已在上面的映射循环中分出，
+			//  不受影响（reclassify 只改食材类，从不触碰手类）。
+			// ============================================================
+			fridge::reclassify_detections(detections, frame);
 
 			// 只保留物品检测给业务层（手框单独传入）。
 			// 检测结果已通过 YOLO_OBJECT_SCORE_THRESH；3.0 逐帧状态机不能再用

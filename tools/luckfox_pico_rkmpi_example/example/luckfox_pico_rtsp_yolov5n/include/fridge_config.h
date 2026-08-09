@@ -100,9 +100,13 @@ inline const char* cls_id_to_chinese(int cls_id) {
         "盒装食品", "罐头", "玻璃罐", "保鲜膜",
         "保鲜盒", "手", "蘑菇", "南瓜", "大蒜",
         "姜", "萝卜", "红薯", "核桃", "香菜",
-        "秋葵", "白菜", "豆角", "生菜", "卷心菜", "苦瓜"
+        "秋葵", "白菜", "豆角", "生菜", "卷心菜", "苦瓜", "节瓜"
     };
-    if (cls_id >= 0 && cls_id < 48) return cn_names[cls_id];
+    // cn_names 的元素个数必须与 model/labels_list.txt 的行数一致。
+    // 新增类别时：labels_list.txt 末尾加英文名，这里 cn_names 末尾加对应中文即可，
+    // 边界 CN_NAMES_COUNT 用 sizeof 自动计算，无需手改。
+    constexpr int CN_NAMES_COUNT = (int)(sizeof(cn_names) / sizeof(cn_names[0]));
+    if (cls_id >= 0 && cls_id < CN_NAMES_COUNT) return cn_names[cls_id];
     return "未知";
 }
 
@@ -386,6 +390,62 @@ constexpr int   OPEN_REFERENCE_WINDOW_SIZE = 20;
 // =========================================================================
 constexpr float FRAME_W = 1280.0f;
 constexpr float FRAME_H = 720.0f;
+
+// =========================================================================
+//  YOLO 输出后的手动纠正 (reclassify)
+// -------------------------------------------------------------------------
+//  背景：egg/orange 外形接近、apple/onion 颜色接近，未重训模型前在这里对
+//  YOLO 的 cls_id 做基于"框面积"和"框内颜色"的启发式纠正。所有阈值集中在此，
+//  调参只改这里，不用动 reclassify.cc 的逻辑。
+//
+//  相关类别 ID（必须与 model/labels_list.txt 行号一致，0 起）：
+//    apple=0  orange=2  onion=15  egg=18  chinese_cabbage=43  lettuce=45
+// =========================================================================
+
+// 总开关：置 false 可完全关闭纠正层，回到 YOLO 原始输出（排查问题时用）。
+constexpr bool RECLASSIFY_ENABLED = true;
+
+// ---- 相关类别 ID（若 labels_list.txt 行号变化，改这里即可） ----
+constexpr int CLS_APPLE           = 0;
+constexpr int CLS_ORANGE          = 2;
+constexpr int CLS_ONION           = 15;
+constexpr int CLS_EGG             = 18;
+constexpr int CLS_CHINESE_CABBAGE = 43;
+constexpr int CLS_LETTUCE         = 45;
+
+// ---- egg <-> orange：按"框面积占整幅画面比例"判断 ----
+//  逻辑：egg 框够大 → 其实是 orange；orange 框够小 → 其实是 egg。
+//  用面积比例(相对 FRAME_W*FRAME_H)而非绝对像素，物体远近更稳。
+//  例：0.020 约等于 1280*720 的 2%，即约 18432 像素²。
+//  分成两个阈值，避免同一物体在边界处来回翻。建议 EGG->ORANGE 略大于
+//  ORANGE->EGG，留一段"谁都不改"的缓冲区。
+constexpr float RECLS_EGG_TO_ORANGE_AREA_RATIO = 0.020f;  // egg 面积比 > 此值 → 改 orange
+constexpr float RECLS_ORANGE_TO_EGG_AREA_RATIO = 0.015f;  // orange 面积比 < 此值 → 改 egg
+
+// ---- apple <-> onion：按框内区域的平均颜色(HSV)判断 ----
+//  逻辑：apple 偏红偏亮 → 保持；若偏紫偏暗 → 改 onion。
+//        onion 偏紫偏暗 → 保持；若偏红偏亮 → 改 apple。
+//  采样：取框内中心区域(去掉边缘背景)转 HSV，算平均 H(色相) 和 V(亮度)。
+//  OpenCV 的 H 范围是 0~179，V 范围 0~255。
+//  "偏暗"：V < RECLS_DARK_V_MAX。"偏亮"：V > RECLS_BRIGHT_V_MIN。
+//  "偏紫"：H 落在 [PURPLE_H_MIN, PURPLE_H_MAX]（品红/紫，约 135~170）。
+//  "偏红"：H 落在红区间（约 <=10 或 >=170，红在 HSV 环两端）。
+constexpr float RECLS_DARK_V_MAX    = 90.0f;    // 平均亮度低于此 → 判为"暗"
+constexpr float RECLS_BRIGHT_V_MIN  = 110.0f;   // 平均亮度高于此 → 判为"亮"
+constexpr float RECLS_PURPLE_H_MIN  = 130.0f;   // 紫/品红色相下界
+constexpr float RECLS_PURPLE_H_MAX  = 170.0f;   // 紫/品红色相上界
+constexpr float RECLS_RED_H_LOW_MAX = 12.0f;    // 红色相下段上界 (H<=此值算红)
+constexpr float RECLS_RED_H_HIGH_MIN= 168.0f;   // 红色相高段下界 (H>=此值算红)
+// 颜色采样时框向内收缩的比例(各边)，避免采到背景。0.2 表示每边缩 20%。
+constexpr float RECLS_COLOR_INSET_RATIO = 0.20f;
+
+// ---- 类别归一化(合并难区分的类) ----
+//  例：把生菜(lettuce)统一记成白菜(chinese_cabbage)。
+//  要保留 lettuce、改并 chinese_cabbage，就把这两个常量对调；
+//  要新增其它合并关系，仿照 reclassify.cc 里 apply_class_merge() 再加一行。
+constexpr bool RECLS_MERGE_LETTUCE_CABBAGE = true;   // 是否启用该合并
+constexpr int  RECLS_MERGE_FROM = CLS_LETTUCE;          // 被替换掉的类
+constexpr int  RECLS_MERGE_TO   = CLS_CHINESE_CABBAGE;  // 替换成的类
 
 }  // namespace fridge
 

@@ -61,11 +61,13 @@ void draw_business_input_detection(cv::Mat& frame,
 	const int y2 = (int)det.box.y2;
 	cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 1);
 
+	// 只显示物品名与置信度；不再显示 H/F 序号前缀和 [BUSINESS]/[BUSINESS-LOW] 标签。
+	// 低置信度仍通过框和文字的颜色区分（见上面的 color），不占用文字。
+	// input_index 现已不参与显示，但保留形参以兼容调用点。
+	(void)input_index;
 	char label[128];
-	snprintf(label, sizeof(label), "%c#%zu %s %.0f%% %s",
-		         is_hand_input ? 'H' : 'F', input_index,
-		         coco_cls_to_name(det.cls_id), det.score * 100.0f,
-		         low_confidence ? "[BUSINESS-LOW]" : "[BUSINESS]");
+	snprintf(label, sizeof(label), "%s %.0f%%",
+		         coco_cls_to_name(det.cls_id), det.score * 100.0f);
 	cv::putText(frame, label, cv::Point(x1, std::max(14, y1 - 6)),
 	            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
 }
