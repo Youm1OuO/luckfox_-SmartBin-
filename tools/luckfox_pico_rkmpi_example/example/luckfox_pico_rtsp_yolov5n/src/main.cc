@@ -279,18 +279,10 @@ int main(int argc, char *argv[]) {
 						if (closing_confirm_count >= fridge::DOOR_CLOSE_CONFIRM_FRAME_COUNT) {
 							printf("\n\033[1;33m[DOOR]\033[0m 关门 (亮度=%.0f)\n", mean_y);
 							RK_U64 ts = TEST_COMM_GetNowUs() / 1000;
-							const bool may_upload_inventory = session.has_local_inventory();
 							session.finish_session((long long)ts);
-							if (may_upload_inventory && cloud_enabled) {
-								std::string json = session.inventory().to_json(
-									cloud.device_id.c_str(), (long long)ts, door_session_id);
-								printf("%s\n", json.c_str());
-								cloud.enqueue_inventory_snapshot(json, (long long)ts);
-							} else if (may_upload_inventory) {
-								printf("[CLOUD] 离线测试模式：关门库存只保留本地，不上传\n");
-							} else {
-								printf("[BACKEND] 本次没有可信本地库存，跳过空库存上传\n");
-							}
+							// 关门整柜快照已废弃：后端无对应端点，库存完全依赖逐帧
+							// ITEM_IN/OUT/MOVED 增量维护（已联调验证可正确落库）。
+							// 关门时仅结算本地会话，不再向后端上传整柜库存。
 							door_state = DoorState::CLOSED;
 							closing_confirm_count = 0;
 							no_event_last_gray_small.release();

@@ -139,22 +139,25 @@ inline bool has_label(int cls_id) {
 //  端云协同 — 云端服务默认配置（可被环境变量覆盖，见 cloud_uploader.cc）
 // -------------------------------------------------------------------------
 //  现场改 IP 不想重新编译时，直接设环境变量：
-//    export FRIDGE_CLOUD_HOST=192.168.5.6
+//    export FRIDGE_CLOUD_HOST=192.168.5.109
 //    export FRIDGE_CLOUD_PORT=8000
 //  上报端点：
 //    POST /api/v1/admin/device-ingest      单个事件 ITEM_IN/OUT/MOVED
 //    POST /api/v1/admin/events/heartbeat    设备心跳（每30秒）
 //  鉴权：所有接口均需 Authorization: Bearer <token> 请求头
 // =========================================================================
-constexpr const char* CLOUD_HOST       = "192.168.168.1";     // 板子通过 USB 网络访问宿主机，由宿主机转发到后端
+// 默认直连后端局域网地址；板子若走 USB 中转，用环境变量 FRIDGE_CLOUD_HOST 覆盖。
+constexpr const char* CLOUD_HOST       = "192.168.5.109";     // 后端服务地址（实测可连）
 constexpr int         CLOUD_PORT       = 8000;                // 端口
 constexpr const char* CLOUD_ITEM_PATH  = "/api/v1/admin/device-ingest"; // 出入库事件端点
 constexpr const char* CLOUD_HEARTBEAT_PATH = "/api/v1/admin/events/heartbeat"; // 心跳端点
 constexpr const char* CLOUD_LOGIN_PATH = "/api/v1/admin/auth/login"; // 登录端点
-constexpr const char* CLOUD_INVENTORY_PATH = "/inventory/close"; // 关门库存端点
+// [已废弃] 后端无 /inventory/close 端点（实测 404）。关门整柜快照已停用，
+// 库存完全依赖逐帧 ITEM_IN/OUT/MOVED 维护。保留常量仅为兼容旧签名，不再被使用。
+constexpr const char* CLOUD_INVENTORY_PATH = "/api/v1/admin/inventory/bulk"; // 保留：整柜批量库存端点（当前未使用）
 constexpr const char* CLOUD_DEVICE_ID  = "luckfox-001";       // 设备 ID
 constexpr const char* CLOUD_USERNAME   = "admin";              // 登录用户名
-constexpr const char* CLOUD_PASSWORD   = "admin123";           // 登录密码
+constexpr const char* CLOUD_PASSWORD   = "181511";             // 登录密码（实测有效）
 constexpr int         HEARTBEAT_INTERVAL_SEC = 30;             // 心跳间隔（秒）
 // 当前离线测试默认关闭登录、心跳和事件上传；接入后台后改为 true，或在运行时设置
 // FRIDGE_CLOUD_ENABLED=1 覆盖本默认值。
@@ -272,7 +275,7 @@ constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
 // 可开关的 3.0 状态机诊断追踪。开启后会按操作号、帧号记录状态转换、
 // C->B 仲裁、D 防线和无手结算依据；它只输出日志，不参与任何业务判断。
-constexpr bool FLOW3_DEBUG_TRACE_LOG = false;
+constexpr bool FLOW3_DEBUG_TRACE_LOG = true;
 
 // 当前尚未对接后台，允许首张无手直接检测建立本地测试库存。
 // 接入可信后台后建议改为 false：此时冷启动画面只做只读校验，不负责建库。
