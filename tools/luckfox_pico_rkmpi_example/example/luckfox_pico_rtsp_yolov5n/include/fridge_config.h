@@ -42,7 +42,7 @@ inline bool is_food(int cls_id) {
 //    3. 业务层手阈值：HAND_CONTEXT_SCORE_THRESH；检测到就停止无手收尾。
 // =========================================================================
 constexpr float YOLO_CANDIDATE_SCORE_THRESH = 0.01f;
-constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.25f;    // 物品的阈值
+constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.40f;    // 物品的阈值
 constexpr float YOLO_HAND_SCORE_THRESH      = 0.30f;    // 手的阈值
 
 inline float yolo_output_score_threshold(int cls_id) {
@@ -277,7 +277,7 @@ constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
 // 可开关的 3.0 状态机诊断追踪。开启后会按操作号、帧号记录状态转换、
 // C->B 仲裁、D 防线和无手结算依据；它只输出日志，不参与任何业务判断。
-constexpr bool FLOW3_DEBUG_TRACE_LOG = false;
+constexpr bool FLOW3_DEBUG_TRACE_LOG = true;
 
 // 当前尚未对接后台，允许首张无手直接检测建立本地测试库存。
 // 接入可信后台后建议改为 false：此时冷启动画面只做只读校验，不负责建库。
