@@ -146,8 +146,10 @@ inline bool has_label(int cls_id) {
 //    POST /api/v1/admin/events/heartbeat    设备心跳（每30秒）
 //  鉴权：所有接口均需 Authorization: Bearer <token> 请求头
 // =========================================================================
-// 默认直连后端局域网地址；板子若走 USB 中转，用环境变量 FRIDGE_CLOUD_HOST 覆盖。
-constexpr const char* CLOUD_HOST       = "192.168.5.109";     // 后端服务地址（实测可连）
+// 板子经 USB 网络(eth0, 192.168.168.x)访问宿主机 PC；后端绑 0.0.0.0，
+// 从 PC 的 USB 网卡地址 192.168.168.1:8000 即可访问到(实测两个网卡都返回200)。
+// 板子若改为同网段直连后端，用环境变量 FRIDGE_CLOUD_HOST=192.168.5.109 覆盖。
+constexpr const char* CLOUD_HOST       = "192.168.168.1";     // USB 对端 PC 地址（实测可连后端）
 constexpr int         CLOUD_PORT       = 8000;                // 端口
 constexpr const char* CLOUD_ITEM_PATH  = "/api/v1/admin/device-ingest"; // 出入库事件端点
 constexpr const char* CLOUD_HEARTBEAT_PATH = "/api/v1/admin/events/heartbeat"; // 心跳端点
