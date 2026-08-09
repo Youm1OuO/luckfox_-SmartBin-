@@ -43,18 +43,17 @@ static cv::Scalar display_color_for_class(int cls_id) {
 	return colors[idx];
 }
 
-// OSD 必须显示与 SessionManager 完全相同的业务输入。低分框仍然是业务证据，
-// 只改变颜色提示，不允许被第二个显示阈值隐藏。
+// OSD 必须显示与 SessionManager 完全相同的业务输入。所有进入业务层的框都要画，
+// 不允许被第二个显示阈值隐藏。颜色只表示"是哪一类"，与置信度高低无关：
+//   - 手：固定红色
+//   - 食材：按 cls_id 取固定颜色（同一类永远同色，避免用颜色区分置信度造成误会）
 void draw_business_input_detection(cv::Mat& frame,
                                           const fridge::Detection& det,
                                           size_t input_index,
                                           bool is_hand_input) {
-	const bool low_confidence =
-		det.score < fridge::OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH;
-	const cv::Scalar color = low_confidence
-		? cv::Scalar(0, 165, 255)  // 橙色：进入业务层的低分框
-		: (is_hand_input ? cv::Scalar(0, 0, 255)
-		                 : display_color_for_class(det.cls_id));
+	const cv::Scalar color = is_hand_input
+		? cv::Scalar(0, 0, 255)                    // 手：固定红色
+		: display_color_for_class(det.cls_id);     // 食材：按类别固定取色
 	const int x1 = (int)det.box.x1;
 	const int y1 = (int)det.box.y1;
 	const int x2 = (int)det.box.x2;
@@ -62,7 +61,6 @@ void draw_business_input_detection(cv::Mat& frame,
 	cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 1);
 
 	// 只显示物品名与置信度；不再显示 H/F 序号前缀和 [BUSINESS]/[BUSINESS-LOW] 标签。
-	// 低置信度仍通过框和文字的颜色区分（见上面的 color），不占用文字。
 	// input_index 现已不参与显示，但保留形参以兼容调用点。
 	(void)input_index;
 	char label[128];

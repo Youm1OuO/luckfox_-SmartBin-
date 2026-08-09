@@ -286,8 +286,9 @@ constexpr float HAND_CONTEXT_SCORE_THRESH = YOLO_HAND_SCORE_THRESH;
 // 强手框仅用于 OSD 状态提示，避免 UI 被普通小手框干扰。
 constexpr float OSD_STRONG_HAND_SCORE_THRESH = 0.45f;
 constexpr float OSD_STRONG_HAND_MIN_AREA_RATIO = 0.002f;
-// 所有进入业务层的食品/手框都必须绘制；这个值只决定低置信度业务框的
-// 视觉颜色，不再作为第二道显示过滤。
+// [已废弃] 曾用于按置信度给业务框换色（低分橙色）。因为颜色跳变容易被误认为
+// 识别出错，现已改为"一类一色、与置信度无关"，此阈值不再被引用。保留定义仅为
+// 历史参考，可安全删除。
 constexpr float OSD_LOW_CONFIDENCE_OBJECT_SCORE_THRESH = 0.50f;
 
 // =========================================================================
