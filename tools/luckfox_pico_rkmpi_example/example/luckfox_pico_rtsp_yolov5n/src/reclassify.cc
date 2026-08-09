@@ -143,11 +143,57 @@ bool reclassify_detection(Detection& det, const cv::Mat& frame) {
     return changed;
 }
 
+namespace {
+
+// 纠正后的同类去重（补一次 NMS）。做法 A：只处理"至少一个框被 reclassify 改过
+// 类别"的重叠对，绝不碰 YOLO 原生同类框。changed[i] 标记第 i 个框是否被改过。
+// 对同 cls_id、IoM 超阈值的一对，压制分数较低者（分数相同则压制后者，保持确定性）。
+// suppressed[i]=true 表示第 i 个框应被移除。
+void dedup_after_reclassify(const std::vector<Detection>& dets,
+                            const std::vector<char>& changed,
+                            std::vector<char>* suppressed) {
+    const size_t n = dets.size();
+    for (size_t i = 0; i < n; ++i) {
+        if ((*suppressed)[i]) continue;
+        for (size_t j = i + 1; j < n; ++j) {
+            if ((*suppressed)[j]) continue;
+            // 做法 A：跳过“两个框都不是我们改出来的”的原生对。
+            if (!changed[i] && !changed[j]) continue;
+            if (dets[i].cls_id != dets[j].cls_id) continue;
+            if (iom(dets[i].box, dets[j].box) < RECLS_DEDUP_IOM_THRESH) continue;
+            // 同类、且高度重叠：保留分数高者，压制另一个。
+            if (dets[j].score > dets[i].score) {
+                (*suppressed)[i] = 1;
+                break;  // i 已被压制，不再作为基准与后续比较。
+            } else {
+                (*suppressed)[j] = 1;
+            }
+        }
+    }
+}
+
+}  // namespace
+
 void reclassify_detections(std::vector<Detection>& dets, const cv::Mat& frame) {
     if (!RECLASSIFY_ENABLED) return;
-    for (auto& d : dets) {
-        reclassify_detection(d, frame);
+
+    // 第一步：逐框类别纠正，同时记录哪些框被改过（供做法 A 去重）。
+    std::vector<char> changed(dets.size(), 0);
+    for (size_t i = 0; i < dets.size(); ++i) {
+        changed[i] = reclassify_detection(dets[i], frame) ? 1 : 0;
     }
+
+    // 第二步：紧跟其后补做一次同类去重，清理纠正制造出的重叠同类框。
+    if (!RECLS_DEDUP_ENABLED || dets.size() < 2) return;
+    std::vector<char> suppressed(dets.size(), 0);
+    dedup_after_reclassify(dets, changed, &suppressed);
+
+    std::vector<Detection> kept;
+    kept.reserve(dets.size());
+    for (size_t i = 0; i < dets.size(); ++i) {
+        if (!suppressed[i]) kept.push_back(dets[i]);
+    }
+    dets.swap(kept);
 }
 
 }  // namespace fridge

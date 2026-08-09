@@ -25,7 +25,9 @@ namespace fridge {
 // 若纠正生效，返回 true（cls_id 被改动），否则返回 false。
 bool reclassify_detection(Detection& det, const cv::Mat& frame);
 
-// 便捷批处理：对一组检测逐个调用 reclassify_detection。
+// 便捷批处理：先对每个框做类别纠正，再对纠正后的结果补做一次"同类去重"
+// （见 fridge_config.h 的 RECLS_DEDUP_*）。去重会就地移除被压制的框，因此
+// 处理后 dets 的元素个数可能减少。
 void reclassify_detections(std::vector<Detection>& dets, const cv::Mat& frame);
 
 }  // namespace fridge

@@ -437,7 +437,7 @@ constexpr float RECLS_ORANGE_TO_EGG_AREA_RATIO = 0.015f;  // orange 面积比 < 
 //  "偏紫"：H 落在 [PURPLE_H_MIN, PURPLE_H_MAX]（品红/紫，约 135~170）。
 //  "偏红"：H 落在红区间（约 <=10 或 >=170，红在 HSV 环两端）。
 constexpr float RECLS_DARK_V_MAX    = 90.0f;    // 平均亮度低于此 → 判为"暗"
-constexpr float RECLS_BRIGHT_V_MIN  = 110.0f;   // 平均亮度高于此 → 判为"亮"
+constexpr float RECLS_BRIGHT_V_MIN  = 80.0f;   // 平均亮度高于此 → 判为"亮"
 constexpr float RECLS_PURPLE_H_MIN  = 130.0f;   // 紫/品红色相下界
 constexpr float RECLS_PURPLE_H_MAX  = 170.0f;   // 紫/品红色相上界
 constexpr float RECLS_RED_H_LOW_MAX = 12.0f;    // 红色相下段上界 (H<=此值算红)
@@ -452,6 +452,21 @@ constexpr float RECLS_COLOR_INSET_RATIO = 0.20f;
 constexpr bool RECLS_MERGE_LETTUCE_CABBAGE = true;   // 是否启用该合并
 constexpr int  RECLS_MERGE_FROM = CLS_LETTUCE;          // 被替换掉的类
 constexpr int  RECLS_MERGE_TO   = CLS_CHINESE_CABBAGE;  // 替换成的类
+
+// ---- 纠正后的同类去重(补做一次 NMS) ----
+//  背景：YOLO 的 NMS 是"逐类"进行的，只压制同类重叠框。所以 YOLO 会对同一个
+//  物体同时给出 apple 框和 onion 框（cls_id 不同，互不压制）。我们把 onion 改成
+//  apple 后，同一位置就出现两个 cls_id 相同、且高度重叠的框，而 NMS 早已在
+//  postprocess 阶段跑完，不会再清理。这里在纠正之后补做一次同类去重。
+//
+//  判据用 IoM(交集/较小框面积)而非纯 IoU：一个框基本被另一个框包住时 IoM 更敏感，
+//  正是"同一物体两个框"的典型形态。IoM 超过阈值且两框同 cls_id，只保留分数更高的。
+//
+//  安全边界(做法 A)：只在"这一对框里至少有一个是被 reclassify 改过类别的"时才去重，
+//  绝不碰 YOLO 原生就给出的同类框——那是 YOLO 自己的 NMS 已放行的，二次删除可能误伤
+//  两个真实相邻的同类物体(如挨着的两个苹果)，造成漏检。
+constexpr bool  RECLS_DEDUP_ENABLED   = true;   // 是否启用纠正后同类去重
+constexpr float RECLS_DEDUP_IOM_THRESH = 0.75f; // IoM 超过此值且同类，去重(保留高分框)
 
 }  // namespace fridge
 
