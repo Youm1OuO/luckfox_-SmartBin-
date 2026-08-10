@@ -187,23 +187,21 @@ bool reclassify_detection(Detection& det, const cv::Mat& frame) {
 
 namespace {
 
-// 纠正后的同类去重（补一次 NMS）。做法 A：只处理"至少一个框被 reclassify 改过
-// 类别"的重叠对，绝不碰 YOLO 原生同类框。changed[i] 标记第 i 个框是否被改过。
-// 对同 cls_id、IoM 超阈值的一对，压制分数较低者（分数相同则压制后者，保持确定性）。
+// 统一去重（最后一步，补一次 NMS）。判据：任意两个框（【不分类别、不分是否被改过】），
+// 若 IoU >= RECLS_OVERLAP_DEDUP_IOU（默认 0.90，很高）→ 判为“同一物体的重复框”，
+// 保留分数高者、压制低者（分数相同则压制后者，保持确定性）。
+// 用高 IoU 门槛：只杀“几乎完全重合、大小也相近”的真重复框（如同位置 apple+onion 双标签）；
+// 挨着但不重合的真实物体（IoU 达不到 0.90）不受影响，前后遮挡的大小框（IoU 低）也不误删。
 // suppressed[i]=true 表示第 i 个框应被移除。
-void dedup_after_reclassify(const std::vector<Detection>& dets,
-                            const std::vector<char>& changed,
-                            std::vector<char>* suppressed) {
+void dedup_overlapping(const std::vector<Detection>& dets,
+                       std::vector<char>* suppressed) {
     const size_t n = dets.size();
     for (size_t i = 0; i < n; ++i) {
         if ((*suppressed)[i]) continue;
         for (size_t j = i + 1; j < n; ++j) {
             if ((*suppressed)[j]) continue;
-            // 做法 A：跳过“两个框都不是我们改出来的”的原生对。
-            if (!changed[i] && !changed[j]) continue;
-            if (dets[i].cls_id != dets[j].cls_id) continue;
-            if (iom(dets[i].box, dets[j].box) < RECLS_DEDUP_IOM_THRESH) continue;
-            // 同类、且高度重叠：保留分数高者，压制另一个。
+            if (iou(dets[i].box, dets[j].box) < RECLS_OVERLAP_DEDUP_IOU) continue;
+            // 高度重合：保留分数高者，压制另一个。
             if (dets[j].score > dets[i].score) {
                 (*suppressed)[i] = 1;
                 break;  // i 已被压制，不再作为基准与后续比较。
@@ -219,34 +217,30 @@ void dedup_after_reclassify(const std::vector<Detection>& dets,
 void reclassify_detections(std::vector<Detection>& dets, const cv::Mat& frame) {
     if (!RECLASSIFY_ENABLED) return;
 
-    // 第一步：逐框类别纠正（含 egg<->orange 面积互转），记录哪些框被改过（供去重）。
-    std::vector<char> changed(dets.size(), 0);
+    // 第一步：逐框类别纠正（egg<->orange 面积、apple<->onion 颜色、bitter_gourd->cabbage
+    // 长宽比、类别合并）。
     for (size_t i = 0; i < dets.size(); ++i) {
-        changed[i] = reclassify_detection(dets[i], frame) ? 1 : 0;
+        reclassify_detection(dets[i], frame);
     }
 
     // 第二步：假 orange 过滤。【放在所有逐框转换之后】，因此对“最终是 orange 的框”都生效——
     // 无论它是 YOLO 原生 orange，还是两个 egg 拼成的大框被 egg->orange 面积规则转出来的假
-    // orange，都能被扫到并删除。判据(三条同时满足才删)：cls_id==orange + 分数<阈值 + 颜色不橙；
-    // 真橙子(颜色橙)与高分 orange 会被保住，不会误删。删框后同步移除其 changed 标记。
+    // orange，都能被扫到并删除。判据(三条同时满足才删)：cls_id==orange + 分数<阈值 + 颜色不橙。
     if (RECLS_ORANGE_FILTER_ENABLED && !dets.empty()) {
         std::vector<Detection> kept0;
-        std::vector<char> changed0;
         kept0.reserve(dets.size());
-        changed0.reserve(dets.size());
         for (size_t i = 0; i < dets.size(); ++i) {
             if (is_bogus_orange(dets[i], frame)) continue;  // 假 orange → 丢弃
             kept0.push_back(dets[i]);
-            changed0.push_back(changed[i]);
         }
         dets.swap(kept0);
-        changed.swap(changed0);
     }
 
-    // 第三步：补做一次同类去重，清理纠正制造出的重叠同类框。
+    // 第三步（最后）：统一去重——任意两框 IoU >= RECLS_OVERLAP_DEDUP_IOU 就留高分、删低分。
+    // 不分类别、不分是否改过。去重完直接交业务层。
     if (!RECLS_DEDUP_ENABLED || dets.size() < 2) return;
     std::vector<char> suppressed(dets.size(), 0);
-    dedup_after_reclassify(dets, changed, &suppressed);
+    dedup_overlapping(dets, &suppressed);
 
     std::vector<Detection> kept;
     kept.reserve(dets.size());

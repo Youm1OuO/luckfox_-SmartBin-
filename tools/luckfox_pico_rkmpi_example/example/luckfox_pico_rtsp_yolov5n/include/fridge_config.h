@@ -511,11 +511,17 @@ constexpr int RECLS_CLASS_MERGES_COUNT =
 //  判据用 IoM(交集/较小框面积)而非纯 IoU：一个框基本被另一个框包住时 IoM 更敏感，
 //  正是"同一物体两个框"的典型形态。IoM 超过阈值且两框同 cls_id，只保留分数更高的。
 //
-//  安全边界(做法 A)：只在"这一对框里至少有一个是被 reclassify 改过类别的"时才去重，
-//  绝不碰 YOLO 原生就给出的同类框——那是 YOLO 自己的 NMS 已放行的，二次删除可能误伤
-//  两个真实相邻的同类物体(如挨着的两个苹果)，造成漏检。
-constexpr bool  RECLS_DEDUP_ENABLED   = true;   // 是否启用纠正后同类去重
-constexpr float RECLS_DEDUP_IOM_THRESH = 0.75f; // IoM 超过此值且同类，去重(保留高分框)
+//  统一去重（当前做法）：作为过滤+转换之后的【最后一步】，对任意两框（不分类别、不分是否
+//  被改过）判断——IoU >= RECLS_OVERLAP_DEDUP_IOU（默认 0.90，很高）就判为“同一物体的重复
+//  框”，保留分数高者、删低者。用【IoU】而非 IoM：只杀“几乎完全重合、大小也相近”的真重复
+//  （如同位置 apple+onion 双标签、IoU≈0.95）；而“小物品在大物品前面”这类前后遮挡 IoU 低，
+//  不会被误删；挨着但不重合的相邻同类物体 IoU 达不到 0.90，也安全。
+//  阈值调节：调低=更激进(更多框被合并，可能误伤相邻物体)；调高=更保守。默认 0.90 起步。
+constexpr bool  RECLS_DEDUP_ENABLED     = true;   // 是否启用统一去重
+constexpr float RECLS_OVERLAP_DEDUP_IOU = 0.90f;  // 任意两框 IoU >= 此值 → 留高分删低分
+// 注：RECLS_DEDUP_IOM_THRESH 不再用于 reclassify 去重，但仍被 session_settlement.cc 的
+//     补 IN 候选“与已登记框重叠”判据复用，故保留。
+constexpr float RECLS_DEDUP_IOM_THRESH = 0.75f; // (补登记候选重叠判据复用，见 session_settlement)
 
 // =========================================================================
 //  无手期后手矫正（补登记）—— 细节31
