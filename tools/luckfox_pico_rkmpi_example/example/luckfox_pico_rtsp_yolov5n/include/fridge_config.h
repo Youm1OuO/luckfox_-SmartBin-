@@ -436,7 +436,7 @@ constexpr float RECLS_ORANGE_TO_EGG_AREA_RATIO = 0.015f;  // orange 面积比 < 
 //  "偏暗"：V < RECLS_DARK_V_MAX。"偏亮"：V > RECLS_BRIGHT_V_MIN。
 //  "偏紫"：H 落在 [PURPLE_H_MIN, PURPLE_H_MAX]（品红/紫，约 135~170）。
 //  "偏红"：H 落在红区间（约 <=10 或 >=170，红在 HSV 环两端）。
-constexpr float RECLS_DARK_V_MAX    = 90.0f;    // 平均亮度低于此 → 判为"暗"
+constexpr float RECLS_DARK_V_MAX    = 55.0f;    // 平均亮度低于此 → 判为"暗"
 constexpr float RECLS_BRIGHT_V_MIN  = 60.0f;   // 平均亮度高于此 → 判为"亮"
 constexpr float RECLS_PURPLE_H_MIN  = 130.0f;   // 紫/品红色相下界
 constexpr float RECLS_PURPLE_H_MAX  = 170.0f;   // 紫/品红色相上界

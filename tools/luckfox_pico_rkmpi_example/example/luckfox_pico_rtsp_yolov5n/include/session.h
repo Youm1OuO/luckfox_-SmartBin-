@@ -541,6 +541,10 @@ private:
     // 细节31 v3 闸门一：把本帧所有 track 的"仍在推进的计数"拼成一个签名。两帧签名相同
     // 说明一整帧零推进（静止死等）。只读 track_buffer_，无副作用。
     std::string no_hand_postprocess_progress_signature_() const;
+    // 细节31 v3：是否还有补登记候选正在"稳定攒帧但未达标"（frames 落在 [1, N)）。
+    // 用于在有手期已定论、但补 IN/OUT 候选差几帧时，多 defer 一两帧让它攒够再提交。
+    // 只读补登记 streak 状态，无副作用。
+    bool no_hand_correction_candidate_pending_() const;
     // 一个未绑定的无手框是否是"补 IN 的合法候选"（不含帧数条件）：落在手活动区域内、
     // 高分、无法归属任何已有物品/D、不与任何已登记框或更优候选高度重叠。
     bool is_correction_in_candidate_(

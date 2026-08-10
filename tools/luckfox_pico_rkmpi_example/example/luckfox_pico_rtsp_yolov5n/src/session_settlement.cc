@@ -1687,23 +1687,30 @@ SettlementResult SessionManager::settle_no_hand_frame_(
     update_no_hand_correction_streaks_(detections, observation_owner, observed_ids,
                                        final_items, transition_plans);
 
-    // ---- (2) 接管闸门：只在"真卡死"时才不 defer、落到下面的补登记执行。----
-    // 闸门一·无进展检测：本帧"推进签名"与上一帧相同 = 一整帧零推进 → 静止死等。
-    // 闸门二·N 帧封顶：无手后处理累计帧数超过阈值 → 兜底 0/1 震荡死循环。
-    // 二者满足任一即接管；只要还在推进且未到封顶，就照旧 defer（行为与改动前逐行一致）。
-    if (has_unresolved_state) {
+    // ---- (2) 接管/延迟闸门：决定这一帧是 defer 还是落到下面提交（含补登记执行）。----
+    // 需要 defer 的情形（受 N 帧封顶统一约束，绝不无限等）：
+    //   A. 有手期遗留未决(has_unresolved_state) 且 本帧仍在推进 → 照旧等（行为与改动前一致）；
+    //   B. 有手期已定论，但补 IN/补 OUT 候选正在稳定攒帧、还差几帧未达标 → 多等一两帧，
+    //      让整盒鸡蛋这类"主体先定论、剩余框还在攒帧"的候选能攒够 N 帧后一并补上。
+    // 两种情形都以 FLOW3_NOHAND_POSTPROCESS_MAX_FRAMES 封顶：到顶就不再等、直接提交+接管。
+    const bool correction_still_building = no_hand_correction_candidate_pending_();
+    if (has_unresolved_state || correction_still_building) {
         ++nohand_postprocess_frames_;
         const std::string sig = no_hand_postprocess_progress_signature_();
-        const bool progressing = (sig != nohand_postprocess_progress_sig_);
+        // "还在推进" = 有手期签名在变(A)，或补登记候选还在攒帧(B)。
+        const bool progressing =
+            (has_unresolved_state && sig != nohand_postprocess_progress_sig_) ||
+            correction_still_building;
         nohand_postprocess_progress_sig_ = sig;
         const bool cap_reached =
             nohand_postprocess_frames_ > fridge::FLOW3_NOHAND_POSTPROCESS_MAX_FRAMES;
         if (progressing && !cap_reached) {
             trace_("SETTLE",
                    "defer-commit inventory=%zu tracks=%zu pending-in=%zu pending-out=%zu "
-                   "postproc-frames=%d progressing=1",
+                   "postproc-frames=%d unresolved=%d correction-building=%d",
                    final_items.size(), track_buffer_.size(), pending_in_ids_.size(),
-                   pending_out_ids_.size(), nohand_postprocess_frames_);
+                   pending_out_ids_.size(), nohand_postprocess_frames_,
+                   has_unresolved_state ? 1 : 0, correction_still_building ? 1 : 0);
             return result;
         }
         // 静止死等 或 已达封顶 → 接管：不 return，落到下面的补登记执行 + 提交。
@@ -1882,6 +1889,21 @@ void SessionManager::update_no_hand_correction_streaks_(
         next_out[it->first] = frames;
     }
     nohand_correct_out_streak_.swap(next_out);
+}
+
+bool SessionManager::no_hand_correction_candidate_pending_() const {
+    if (!fridge::FLOW3_NOHAND_CORRECTION_ENABLED) return false;
+    // 有补 IN 候选正在攒帧、但还没到 FLOW3_NOHAND_CORRECT_FRAMES → 值得再等一帧。
+    for (size_t s = 0; s < nohand_correct_in_streak_.size(); ++s) {
+        const int f = nohand_correct_in_streak_[s].frames;
+        if (f >= 1 && f < fridge::FLOW3_NOHAND_CORRECT_FRAMES) return true;
+    }
+    // 补 OUT 候选同理。
+    for (std::map<int, int>::const_iterator it = nohand_correct_out_streak_.begin();
+         it != nohand_correct_out_streak_.end(); ++it) {
+        if (it->second >= 1 && it->second < fridge::FLOW3_NOHAND_CORRECT_FRAMES) return true;
+    }
+    return false;
 }
 
 void SessionManager::apply_no_hand_correction_(
