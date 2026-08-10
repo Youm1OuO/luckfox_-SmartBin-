@@ -107,6 +107,23 @@ bool is_bogus_milk_box(const Detection& det) {
     return true;  // 又小又分数不高 → 判为鸡蛋孔误判，删框
 }
 
+// 假 milk_box 过滤（附近有 egg，演示专用）：dets[idx] 是 milk_box 时，若它附近有任一 egg 框
+// （中心距 < 两框半宽之和 * 系数），判为鸡蛋盒场景的误判 → 删。egg 用最终类别（转换之后）。
+bool is_milk_box_near_egg(size_t idx, const std::vector<Detection>& dets) {
+    if (!RECLS_MILK_BOX_NEAR_EGG_FILTER_ENABLED) return false;
+    if (dets[idx].cls_id != MILK_BOX_CLS_ID) return false;
+    const BBox& mb = dets[idx].box;
+    for (size_t j = 0; j < dets.size(); ++j) {
+        if (j == idx) continue;
+        if (dets[j].cls_id != CLS_EGG) continue;
+        const BBox& eg = dets[j].box;
+        const float near_th =
+            (mb.w() * 0.5f + eg.w() * 0.5f) * RECLS_MILK_BOX_EGG_DIST_FACTOR;
+        if (center_distance(mb, eg) < near_th) return true;  // 附近有 egg → 删
+    }
+    return false;
+}
+
 // bitter_gourd -> cabbage：单向，按框长宽比。苦瓜长条(长宽比偏离1:1)，卷心菜圆球(接近1:1)。
 // 一个 bitter_gourd 框若“接近正方形”，判它其实是圆的 cabbage。只单向、不反向。
 bool apply_bitter_gourd_cabbage(Detection& det) {
@@ -244,7 +261,8 @@ void reclassify_detections(std::vector<Detection>& dets, const cv::Mat& frame) {
         kept0.reserve(dets.size());
         for (size_t i = 0; i < dets.size(); ++i) {
             if (is_bogus_orange(dets[i], frame)) continue;    // 假 orange → 丢弃
-            if (is_bogus_milk_box(dets[i])) continue;         // 假 milk_box → 丢弃
+            if (is_bogus_milk_box(dets[i])) continue;         // 假 milk_box(又小又低分) → 丢弃
+            if (is_milk_box_near_egg(i, dets)) continue;      // 假 milk_box(附近有egg) → 丢弃
             kept0.push_back(dets[i]);
         }
         dets.swap(kept0);

@@ -491,9 +491,20 @@ constexpr float RECLS_ORANGE_H_MAX = 25.0f;  // 橙色色相上界；落在区�
 //  用面积【比例】(相对 FRAME_W*FRAME_H)而非绝对像素，物体远近都稳。
 //  调阈值方法（用户建议）：先把 MIN_AREA_RATIO 调大到“所有 milk_box 都消失”，再慢慢调小，
 //  直到所有真 milk_box 都能显示、而鸡蛋孔误判仍被挡住的那个点。
-constexpr bool  RECLS_MILK_BOX_FILTER_ENABLED   = true;   // 开/关这个假 milk_box 过滤
-constexpr float RECLS_MILK_BOX_MIN_AREA_RATIO   = 0.045f; // 面积比 < 此值 才可能被过滤(约画面3%)
+constexpr bool  RECLS_MILK_BOX_FILTER_ENABLED   = true;   // 开/关“又小又分数不高”的假 milk_box 过滤
+constexpr float RECLS_MILK_BOX_MIN_AREA_RATIO   = 0.045f; // 面积比 < 此值 才可能被过滤(实测真盒≈0.04)
 constexpr float RECLS_MILK_BOX_FILTER_SCORE_MAX = 0.77f;  // 且分数 < 此值 才过滤(高分不动)
+
+// ---- 假 milk_box 过滤（附近有 egg）：演示专用兜底 ----
+//  鸡蛋盒场景里，误判成 milk_box 的“鸡蛋孔”必然和一堆 egg 挤在一起；而演示时把真 milk_box
+//  故意放远离 egg。所以“一个 milk_box 附近有 egg”高度可疑 → 直接删掉这个 milk_box。
+//  判据：milk_box 中心与【任一最终类别为 egg 的框】中心的距离 <
+//        (两框半宽之和) * RECLS_MILK_BOX_EGG_DIST_FACTOR，即算“附近”。
+//  用“两框尺寸相关的量”而非固定像素/画面比例，物体远近自适应。
+//  ⚠️ 演示导向：它会把“牛奶和鸡蛋正常放一起”的真实场景也删掉牛奶——演示时把 milk_box 放远
+//  即可。不需要此行为时置 false 关闭。与上面“又小又分数不高”是 OR 关系（任一命中即删）。
+constexpr bool  RECLS_MILK_BOX_NEAR_EGG_FILTER_ENABLED = true;   // 开/关“附近有egg就删milk_box”
+constexpr float RECLS_MILK_BOX_EGG_DIST_FACTOR         = 1.5f;   // 中心距 < 两框半宽和*此系数 算附近
 
 // ---- 类别归一化(合并难区分的类) ----
 //  把某个类统一记成另一个代表类。下面是一张“合并表”，你可以【只改这张表】随意增删合并
