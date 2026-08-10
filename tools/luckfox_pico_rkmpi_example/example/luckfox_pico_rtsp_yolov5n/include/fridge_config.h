@@ -287,7 +287,7 @@ constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
 // 可开关的 3.0 状态机诊断追踪。开启后会按操作号、帧号记录状态转换、
 // C->B 仲裁、D 防线和无手结算依据；它只输出日志，不参与任何业务判断。
-constexpr bool FLOW3_DEBUG_TRACE_LOG = true;
+constexpr bool FLOW3_DEBUG_TRACE_LOG = false;
 
 // 当前尚未对接后台，允许首张无手直接检测建立本地测试库存。
 // 接入可信后台后建议改为 false：此时冷启动画面只做只读校验，不负责建库。
@@ -459,9 +459,9 @@ constexpr float RECLS_SQUARE_ASPECT_MIN = 0.75f;  // 短边/长边 >= 此值算�
 //  "偏暗"：V < RECLS_DARK_V_MAX。"偏亮"：V > RECLS_BRIGHT_V_MIN。
 //  "偏紫"：H 落在 [PURPLE_H_MIN, PURPLE_H_MAX]（品红/紫，约 135~170）。
 //  "偏红"：H 落在红区间（约 <=10 或 >=170，红在 HSV 环两端）。
-constexpr float RECLS_DARK_V_MAX    = 55.0f;    // 平均亮度低于此 → 判为"暗"
-constexpr float RECLS_BRIGHT_V_MIN  = 60.0f;   // 平均亮度高于此 → 判为"亮"
-constexpr float RECLS_PURPLE_H_MIN  = 130.0f;   // 紫/品红色相下界
+constexpr float RECLS_DARK_V_MAX    = 60.0f;    // 平均亮度低于此 → 判为"暗"
+constexpr float RECLS_BRIGHT_V_MIN  = 45.0f;   // 平均亮度高于此 → 判为"亮"
+constexpr float RECLS_PURPLE_H_MIN  = 140.0f;   // 紫/品红色相下界
 constexpr float RECLS_PURPLE_H_MAX  = 170.0f;   // 紫/品红色相上界
 constexpr float RECLS_RED_H_LOW_MAX = 12.0f;    // 红色相下段上界 (H<=此值算红)
 constexpr float RECLS_RED_H_HIGH_MIN= 168.0f;   // 红色相高段下界 (H>=此值算红)
