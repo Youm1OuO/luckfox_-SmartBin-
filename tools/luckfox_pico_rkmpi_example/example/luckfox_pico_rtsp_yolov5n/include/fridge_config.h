@@ -437,7 +437,7 @@ constexpr float RECLS_ORANGE_TO_EGG_AREA_RATIO = 0.015f;  // orange 面积比 < 
 //  "偏紫"：H 落在 [PURPLE_H_MIN, PURPLE_H_MAX]（品红/紫，约 135~170）。
 //  "偏红"：H 落在红区间（约 <=10 或 >=170，红在 HSV 环两端）。
 constexpr float RECLS_DARK_V_MAX    = 90.0f;    // 平均亮度低于此 → 判为"暗"
-constexpr float RECLS_BRIGHT_V_MIN  = 80.0f;   // 平均亮度高于此 → 判为"亮"
+constexpr float RECLS_BRIGHT_V_MIN  = 60.0f;   // 平均亮度高于此 → 判为"亮"
 constexpr float RECLS_PURPLE_H_MIN  = 130.0f;   // 紫/品红色相下界
 constexpr float RECLS_PURPLE_H_MAX  = 170.0f;   // 紫/品红色相上界
 constexpr float RECLS_RED_H_LOW_MAX = 12.0f;    // 红色相下段上界 (H<=此值算红)
@@ -486,6 +486,11 @@ constexpr float FLOW3_NOHAND_CORRECT_HAND_MARGIN_RATIO = 0.20f;
 // 候选框与"手活动区域"的重叠判据(IoM)。>= 此值算"大部分落在手动过的地方"。
 // 补 IN 和补 OUT 用同一把尺。
 constexpr float FLOW3_NOHAND_CORRECT_REGION_IOM = 0.50f;
+// 手离开后无手后处理的封顶帧数（细节31 v3 闸门二，防 0/1 震荡死循环）。has_unresolved
+// 持续为真、累计超过此帧数就强制让无手纠正接管。默认 3：手离开 3 帧还给不出结果，后续也
+// 不会有；正好与无手纠正的 3 帧确认重叠。调大=给正常收敛更多余地；调小=更快接管但可能
+// 打断需要多帧的正常场景。
+constexpr int   FLOW3_NOHAND_POSTPROCESS_MAX_FRAMES = 3;
 
 }  // namespace fridge
 

@@ -1681,21 +1681,36 @@ SettlementResult SessionManager::settle_no_hand_frame_(
         final_items.erase(*out);
     }
 
-    // 细节31：无手期后手矫正（补登记）第 (1) 步——更新补 IN/补 OUT 的连续计数。
-    // 它只统计"落在本轮手活动区域内 + 严格准入"的残余候选；若有候选仍在攒证据
-    // （连续帧数还没到 FLOW3_NOHAND_CORRECT_FRAMES），返回 true 要求再等一帧。
-    // 这样"整盒鸡蛋"的未绑定框能攒够 3 帧后一起补 IN，而不涉及补登记的场景由于
-    // 没有任何合法候选，此函数不产生任何 defer，既有提交时机完全不变。
-    const bool correction_wants_more_frames = update_no_hand_correction_streaks_(
-        detections, observation_owner, observed_ids, final_items, transition_plans);
+    // 细节31 v3：无手期后手矫正。分"累积（每帧跑，无副作用）"与"执行（仅接管时）"。
+    // ---- (1) 累积：每张无手帧（含仍在 defer 的帧）都更新补 IN/OUT 的连续帧计数。----
+    // 手一离开就并行攒帧，不等有手期收尾。此步纯读、不改库存、不发事件。
+    update_no_hand_correction_streaks_(detections, observation_owner, observed_ids,
+                                       final_items, transition_plans);
 
-    if (has_unresolved_state || correction_wants_more_frames) {
+    // ---- (2) 接管闸门：只在"真卡死"时才不 defer、落到下面的补登记执行。----
+    // 闸门一·无进展检测：本帧"推进签名"与上一帧相同 = 一整帧零推进 → 静止死等。
+    // 闸门二·N 帧封顶：无手后处理累计帧数超过阈值 → 兜底 0/1 震荡死循环。
+    // 二者满足任一即接管；只要还在推进且未到封顶，就照旧 defer（行为与改动前逐行一致）。
+    if (has_unresolved_state) {
+        ++nohand_postprocess_frames_;
+        const std::string sig = no_hand_postprocess_progress_signature_();
+        const bool progressing = (sig != nohand_postprocess_progress_sig_);
+        nohand_postprocess_progress_sig_ = sig;
+        const bool cap_reached =
+            nohand_postprocess_frames_ > fridge::FLOW3_NOHAND_POSTPROCESS_MAX_FRAMES;
+        if (progressing && !cap_reached) {
+            trace_("SETTLE",
+                   "defer-commit inventory=%zu tracks=%zu pending-in=%zu pending-out=%zu "
+                   "postproc-frames=%d progressing=1",
+                   final_items.size(), track_buffer_.size(), pending_in_ids_.size(),
+                   pending_out_ids_.size(), nohand_postprocess_frames_);
+            return result;
+        }
+        // 静止死等 或 已达封顶 → 接管：不 return，落到下面的补登记执行 + 提交。
         trace_("SETTLE",
-               "defer-commit inventory=%zu tracks=%zu pending-in=%zu pending-out=%zu "
-               "correction-pending=%d",
-               final_items.size(), track_buffer_.size(), pending_in_ids_.size(),
-               pending_out_ids_.size(), correction_wants_more_frames ? 1 : 0);
-        return result;
+               "no-hand-correction-takeover reason=%s postproc-frames=%d",
+               cap_reached ? "postprocess-cap" : "no-progress-stall",
+               nohand_postprocess_frames_);
     }
 
     // 最后才生成正式事件。既有路径不产生任何“未绑定无手框自动 IN”；补登记在下面
@@ -1799,7 +1814,7 @@ SettlementResult SessionManager::settle_no_hand_frame_(
 //  细节31：无手期后手矫正（补登记）
 // ===========================================================================
 
-bool SessionManager::update_no_hand_correction_streaks_(
+void SessionManager::update_no_hand_correction_streaks_(
         const std::vector<Detection>& detections,
         const std::vector<int>& observation_owner,
         const std::set<int>& observed_ids,
@@ -1809,10 +1824,8 @@ bool SessionManager::update_no_hand_correction_streaks_(
     if (!fridge::FLOW3_NOHAND_CORRECTION_ENABLED) {
         nohand_correct_in_streak_.clear();
         nohand_correct_out_streak_.clear();
-        return false;
+        return;
     }
-
-    bool wants_more_frames = false;
 
     // ---- 补 IN 候选连续计数 ----
     // 本帧所有合法补 IN 候选框。
@@ -1848,9 +1861,6 @@ bool SessionManager::update_no_hand_correction_streaks_(
         } else {
             entry.frames = 1;
         }
-        if (entry.frames < fridge::FLOW3_NOHAND_CORRECT_FRAMES) {
-            wants_more_frames = true;  // 还在攒证据，需再等一帧
-        }
         next_streaks.push_back(entry);
     }
     nohand_correct_in_streak_.swap(next_streaks);
@@ -1870,13 +1880,8 @@ bool SessionManager::update_no_hand_correction_streaks_(
         const int frames = (prev == nohand_correct_out_streak_.end())
             ? 1 : prev->second + 1;
         next_out[it->first] = frames;
-        if (frames < fridge::FLOW3_NOHAND_CORRECT_FRAMES) {
-            wants_more_frames = true;
-        }
     }
     nohand_correct_out_streak_.swap(next_out);
-
-    return wants_more_frames;
 }
 
 void SessionManager::apply_no_hand_correction_(
@@ -1941,6 +1946,32 @@ void SessionManager::apply_no_hand_correction_(
                item_id, now->second.cls_id);
         final_items->erase(now);
     }
+}
+
+std::string SessionManager::no_hand_postprocess_progress_signature_() const {
+    // 细节31 v3 闸门一：把所有 track 里"仍在朝阈值推进的计数"拼成一个签名。
+    // 两帧签名相同 = 一整帧零推进（静止死等）。这些计数每有正常确认在走都会变化：
+    //   no_hand_missing_count（OUT 缺失计数）、no_hand_self_match_count（D 确认计数）、
+    //   reappear_candidate_match_count（reappear 确认）、alias_no_hand_match_count、
+    //   stable_near_original_no_hand_count。
+    // 另计入 DISAPPEARANCE_SUPPORTED 的连续证据计数（pending_occlusion_missing_counts_），
+    // 它在遮挡证据仍在累积时每帧推进——那属于"还在推进"，不应被当成静止死等。
+    std::ostringstream sig;
+    for (std::map<int, OperationTrack>::const_iterator it = track_buffer_.begin();
+         it != track_buffer_.end(); ++it) {
+        const OperationTrack& t = it->second;
+        sig << it->first << ':'
+            << t.no_hand_missing_count << ','
+            << t.no_hand_self_match_count << ','
+            << t.reappear_candidate_match_count << ','
+            << t.alias_no_hand_match_count << ','
+            << t.stable_near_original_no_hand_count << ';';
+    }
+    for (std::map<int, int>::const_iterator it = pending_occlusion_missing_counts_.begin();
+         it != pending_occlusion_missing_counts_.end(); ++it) {
+        sig << 'o' << it->first << ':' << it->second << ';';
+    }
+    return sig.str();
 }
 
 bool SessionManager::box_in_hand_activity_region_(const BBox& box) const {
@@ -2030,34 +2061,26 @@ bool SessionManager::is_correction_out_candidate_(
         ? now->second.base_box : now->second.box;
     if (!box_in_hand_activity_region_(gone)) return false;
 
-    // 细节31 §2.4 第3条：遮挡判定三分派。绝大多数读现成状态（快），只有悬而未决的
-    // HOLD 才额外看一眼"老位置在快照里空不空"。
+    // 细节31 §2.4 第3条（用户洞察）：遮挡与否优先读现成状态；但"看得见就不该 OUT、
+    // 老位置被别的框压着=被挡住=不该 OUT"这条几何守卫，对【所有】补 OUT 候选都适用——
+    // 不只 HOLD。否则一个被前景框覆盖、却因证据不足卡成普通未决（非 OCCLUDED/非 HOLD）
+    // 的物品，会被误 OUT（cover-union 场景实测暴露过此漏洞）。
     // (a) 已确认遮挡 → 不 OUT（直接读现成状态，不重算）。
     if (now->second.status == ItemStatus::OCCLUDED) return false;
-    // (b) 遮挡待确认（HOLD_FOR_PENDING_OCCLUSION，status 仍为 VISIBLE，且到无手期不会
-    //     再有新信息、会一直挂着）→ 看 base_box 老位置是否被"未匹配上库存的快照框"覆盖：
-    //     被覆盖=真被挡住→不 OUT；老位置空了=其实被拿走→放行（解决 HOLD 永远卡住）。
-    std::map<int, session_internal::BlockerTransitionPlan>::const_iterator plan =
-        transition_plans.find(item_id);
-    const bool pending_hold =
-        (plan != transition_plans.end() &&
-         (plan->second.allow_occluded_transition ||
-          plan->second.out ==
-              session_internal::OutDisposition::HOLD_FOR_PENDING_OCCLUSION)) ||
-        pending_occlusion_missing_counts_.count(item_id) ||
-        pending_occlusion_witness_ids_.count(item_id);
-    if (pending_hold) {
-        for (size_t si = 0; si < detections.size(); ++si) {
-            // 只看"没匹配上任何库存"的快照框（未绑定者），它们才可能是遮挡 C 的前景物。
-            if (si < observation_owner.size() && observation_owner[si] >= 0) continue;
-            if (shadow_detection_indices_.count(static_cast<int>(si))) continue;
-            if (intersection_area(gone, detections[si].box) > BLOCK_OVERLAP_AREA_EPS) {
-                return false;  // 老位置被压着 → 真被挡住，不 OUT
-            }
+    // (b) 通用几何守卫：base_box 老位置若被"任何其它物品/前景框"覆盖 → 判为被挡住，不 OUT。
+    //     被覆盖=真被挡住（可能是别的物品挡住了它）；老位置空了=确实被拿走→放行。
+    //     注意：覆盖框既可能是"未匹配上库存的前景物"，也可能是"已匹配给别的 item 的框"
+    //     （如整理进来、挡住旧 C 的其它物品）——两者都算遮挡，只要不是 item 自己的观察框。
+    for (size_t si = 0; si < detections.size(); ++si) {
+        if (shadow_detection_indices_.count(static_cast<int>(si))) continue;
+        // 跳过"匹配给本 item 自己"的框（它自己就没消失了，不会走到这）。
+        if (si < observation_owner.size() && observation_owner[si] == item_id) continue;
+        if (intersection_area(gone, detections[si].box) > BLOCK_OVERLAP_AREA_EPS) {
+            return false;  // 老位置被别的框压着 → 真被挡住，不 OUT
         }
-        // 老位置空了 → HOLD 其实是被拿走，放行补 OUT。
     }
-    // (c) 普通 VISIBLE（非 OCCLUDED、非 HOLD）→ 放行。
+    // 老位置在快照里是空的 → 确实不见了 → 放行补 OUT。
+    (void)transition_plans;
     return true;
 }
 

@@ -513,15 +513,15 @@ private:
         std::set<int>* claimed_detection_indices);
     SettlementResult settle_no_hand_frame_(const std::vector<Detection>& detections,
                                            int frame_id);
-    // 细节31：无手期后手矫正（补登记）。分两步，都只在 settle_no_hand_frame_ 里调用，
+    // 细节31 v3：无手期后手矫正（补登记）。分两步，都只在 settle_no_hand_frame_ 里调用，
     // 有手期逻辑完全不变，纯增量兜底：
-    //  (1) update：每张无手帧更新补 IN/补 OUT 的连续计数（落在手活动区域内 + 严格准入
-    //      的候选才计数）。若存在"已在累积、但还没到 FLOW3_NOHAND_CORRECT_FRAMES"的候选，
-    //      返回 true，表示应再等一帧（defer-commit）让它攒够证据。
-    //  (2) apply：在最终提交那一帧，对连续计数已达标的候选执行补 IN / 补 OUT，
+    //  (1) update：每张无手帧（含仍在 defer 的帧）累积补 IN/补 OUT 的连续计数（落在手活动
+    //      区域内 + 严格准入的候选才计数）。纯累积、无副作用；是否 defer 由接管闸门
+    //      （无进展检测 + N 帧封顶）决定，不再由本函数的计数是否达标决定。
+    //  (2) apply：在接管那一帧，对连续计数已达标的候选执行补 IN / 补 OUT，
     //      事件追加进 *events、库存改动写进 *final_items。
     // 判定候选是否"落在本轮手活动区域内"复用 box_in_hand_activity_region_。
-    bool update_no_hand_correction_streaks_(
+    void update_no_hand_correction_streaks_(
         const std::vector<Detection>& detections,
         const std::vector<int>& observation_owner,
         const std::set<int>& observed_ids,
@@ -538,6 +538,9 @@ private:
     // 候选框/物品框是否落在"本轮手活动区域"内：hand_track_ 里任一手框按比例外扩后，
     // 与 box 的 IoM >= FLOW3_NOHAND_CORRECT_REGION_IOM 即算命中。
     bool box_in_hand_activity_region_(const BBox& box) const;
+    // 细节31 v3 闸门一：把本帧所有 track 的"仍在推进的计数"拼成一个签名。两帧签名相同
+    // 说明一整帧零推进（静止死等）。只读 track_buffer_，无副作用。
+    std::string no_hand_postprocess_progress_signature_() const;
     // 一个未绑定的无手框是否是"补 IN 的合法候选"（不含帧数条件）：落在手活动区域内、
     // 高分、无法归属任何已有物品/D、不与任何已登记框或更优候选高度重叠。
     bool is_correction_in_candidate_(
@@ -725,6 +728,14 @@ private:
     };
     std::vector<NoHandCorrectInStreak> nohand_correct_in_streak_;
     std::map<int, int> nohand_correct_out_streak_;  // key=item_id, value=连续缺失帧数
+    // 细节31 v3 接管闸门：无进展检测 + N 帧封顶（reset_operation_runtime_ 清零）。
+    // progress_sig：上一无手帧的"推进签名"（各 track 的 no_hand_missing_count /
+    //   no_hand_self_match_count / reappear_candidate_match_count 拼成，字符串化）。
+    //   本帧签名与它相同 = 一整帧零推进 → 静止死等，可接管。
+    // frames：手离开后进入无手后处理、has_unresolved_state 为 true 的累计帧数；
+    //   超过 FLOW3_NOHAND_POSTPROCESS_MAX_FRAMES 强制接管（兜底 0/1 震荡死循环）。
+    std::string nohand_postprocess_progress_sig_;
+    int nohand_postprocess_frames_ = 0;
 
     bool hand_present_ = false;
     bool session_active_ = false;

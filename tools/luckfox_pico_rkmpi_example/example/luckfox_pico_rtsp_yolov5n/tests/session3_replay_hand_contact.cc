@@ -228,13 +228,16 @@ void test_low_coverage_contact_without_endpoint_stays_pending() {
                std::vector<fridge::BBox>(1, finger), &frame);
     fridge::SettlementResult result = settle_after_hand(
         &session, std::vector<fridge::Detection>(), &frame);
-    // CONTACT_CANDIDATE 没有原位置重现、也没有可靠的实际物品终点时，
-    // 无手逐帧收尾必须继续保持未决，不能按固定窗口强制提交。
-    assert(!result.committed);
-    assert(session.operation_pending());
+    // 细节31 v3：CONTACT_CANDIDATE 没有原位置重现、也没有可靠终点时，有手期无法定论。
+    // 旧行为是无限保持未决（真机上会永久卡死）；v3 由无手纠正接管收敛（无进展检测：一整帧
+    // 零推进 → 静止死等 → 次帧接管）。item#1 不是"库存余数被拿走"（无证据判 OUT），
+    // 接管只是把卡死解开、原样提交：item#1 保留、不 OUT、不重复 IN。不再永久卡死，也不误删。
+    assert(result.committed);
+    assert(!session.operation_pending());
     assert(session.inventory().size() == 1);
     assert(session.inventory().find_by_item(1) != 0);
     assert(!has_event(result, fridge::EventKind::OUT, 1));
+    assert(!has_event(result, fridge::EventKind::IN, 1));
 }
 
 // CONTACT_CANDIDATE 在原位置连续重新出现时应释放，不能因为手框接近就重复创建 D。

@@ -2026,8 +2026,15 @@ void test_static_gray_zone_evidence_resets_when_hand_returns() {
     fridge::FrameProcessResult after_hand_first = session.process_frame(
         gray_zone, std::vector<fridge::BBox>(), first_after_hand, first_after_hand);
     assert(after_hand_first.no_hand_frame_processed);
-    assert(!after_hand_first.settlement.committed);
-    assert(session.operation_pending());
+    // 本测试的核心验证在上面：hand return 确实清零了静态灰区证据
+    // （needs_no_hand_settlement / stable_near_original_no_hand_count 已断言）。
+    // 细节31 v3：hand return 后这个"灰区、既不明确回原位也无移动证据"的状态属于死等，
+    // 旧行为无限未决（永久卡死）；v3 由无手纠正接管收敛。item#1 本帧仍被 gray_zone 观察到、
+    // 能与库存匹配（不是余数）→ 不 OUT，接管只把卡死解开、原样保留 item#1。
+    assert(after_hand_first.settlement.committed);
+    assert(!session.operation_pending());
+    assert(session.inventory().find_by_item(1) != 0);
+    assert(!has_event(after_hand_first.settlement, fridge::EventKind::OUT, 1));
 }
 
 // 细节16现场回放：item#8 苹果确实移动，邻近的 item#7 橙子没有主动整理，
@@ -2182,15 +2189,20 @@ void test_cover_union_keeps_multiple_tiny_residuals_until_total_area_check() {
     // 没有这三个已确认前景 D，后面的 no-hand 遮挡结算不会调用目标差集。
     assert(promoted_d_count == 3);
 
+    // 细节31 v3：item#1 被 left/middle/right 三个前景框覆盖、又证据不足以正式判遮挡，
+    // 旧行为会在这里无限保持未决（永久卡死）；v3 由无手纠正接管收敛。关键安全点：接管的
+    // 补 OUT 三分派会先看"item#1 老位置在快照里是否被别的框压着"——这里被三个 blocker
+    // 覆盖 → 判为真被挡住 → 绝不补 OUT。所以无论接管在哪一帧提交，item#1 都必须保留。
     for (int no_hand_index = 0; no_hand_index < 5; ++no_hand_index) {
         const int no_hand_frame = frame++;
         const fridge::FrameProcessResult result = session.process_frame(
             blockers_only, std::vector<fridge::BBox>(), no_hand_frame, no_hand_frame);
         assert(result.no_hand_frame_processed);
-        assert(!result.settlement.committed);
+        // 接管提交时也绝不能把被覆盖的 item#1 补 OUT。
+        assert(!has_event(result.settlement, fridge::EventKind::OUT, 1));
+        assert(session.inventory().find_by_item(1) != 0);
     }
     assert(session.inventory().find_by_item(1) != 0);
-    assert(session.inventory().find_by_item(1)->status == fridge::ItemStatus::VISIBLE);
 }
 
 // 细节31：整盒放入。手在中间一大片活动过（拿透明盒），无手后 3 个互不重叠、

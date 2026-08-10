@@ -219,6 +219,8 @@ void SessionManager::reset_operation_runtime_() {
     pending_occlusion_witness_boxes_.clear();
     nohand_correct_in_streak_.clear();
     nohand_correct_out_streak_.clear();
+    nohand_postprocess_progress_sig_.clear();
+    nohand_postprocess_frames_ = 0;
     hand_track_.clear();
     old_hands_.clear();
     current_hand_boxes_.clear();
