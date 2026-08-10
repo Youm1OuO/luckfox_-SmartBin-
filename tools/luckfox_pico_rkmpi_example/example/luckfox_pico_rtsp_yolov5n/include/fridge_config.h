@@ -446,12 +446,25 @@ constexpr float RECLS_RED_H_HIGH_MIN= 168.0f;   // 红色相高段下界 (H>=此
 constexpr float RECLS_COLOR_INSET_RATIO = 0.20f;
 
 // ---- 类别归一化(合并难区分的类) ----
-//  例：把生菜(lettuce)统一记成白菜(chinese_cabbage)。
-//  要保留 lettuce、改并 chinese_cabbage，就把这两个常量对调；
-//  要新增其它合并关系，仿照 reclassify.cc 里 apply_class_merge() 再加一行。
-constexpr bool RECLS_MERGE_LETTUCE_CABBAGE = true;   // 是否启用该合并
-constexpr int  RECLS_MERGE_FROM = CLS_LETTUCE;          // 被替换掉的类
-constexpr int  RECLS_MERGE_TO   = CLS_CHINESE_CABBAGE;  // 替换成的类
+//  把某个类统一记成另一个代表类。下面是一张“合并表”，你可以【只改这张表】随意增删合并
+//  关系，不用改任何代码：
+//    · 每行 { from, to } 表示“把 from 类改记成 to 类”（from 被替换掉、统一成 to）。
+//      例：{ CLS_CHINESE_CABBAGE, CLS_LETTUCE } = 把白菜并入生菜。
+//    · 要新增合并：加一行即可。要停用某条：把那行注释掉即可。
+//    · from / to 必须是已定义的 CLS_xxx 常量。
+//  ⚠️ 填表规则(照做即安全，避免误合并)：
+//    1) from 不要等于 to（自己并自己没意义）。
+//    2) 同一个 from 只写一行（别让一个类有两个去向）。
+//    3) 不要写“链式”：例如别同时写 A→B 和 B→C。合并只做一轮、不连锁，
+//       写成链式不会连续替换，只会按各自那行独立套用，容易与预期不符。
+struct ClassMerge { int from; int to; };
+constexpr ClassMerge RECLS_CLASS_MERGES[] = {
+    { CLS_CHINESE_CABBAGE, CLS_LETTUCE },   // 白菜 → 生菜（把白菜统一记成生菜）
+    // 以后想加就照上面加行(使用前先自己在本文将开头声明对应的变量并对其他的索引)，例如：
+    // { CLS_XXX, CLS_YYY },
+};
+constexpr int RECLS_CLASS_MERGES_COUNT =
+    static_cast<int>(sizeof(RECLS_CLASS_MERGES) / sizeof(RECLS_CLASS_MERGES[0]));
 
 // ---- 纠正后的同类去重(补做一次 NMS) ----
 //  背景：YOLO 的 NMS 是"逐类"进行的，只压制同类重叠框。所以 YOLO 会对同一个

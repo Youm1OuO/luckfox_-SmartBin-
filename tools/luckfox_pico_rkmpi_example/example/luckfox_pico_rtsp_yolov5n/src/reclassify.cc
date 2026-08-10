@@ -118,15 +118,17 @@ bool apply_apple_onion(Detection& det, const cv::Mat& frame) {
     return false;
 }
 
-// 类别归一化：把难区分的类合并到一个代表类（如 lettuce -> chinese_cabbage）。
-// 要新增合并关系，在此仿照再加一段判断即可。
+// 类别归一化：遍历 fridge_config.h 里的合并表 RECLS_CLASS_MERGES，把 from 类改记成 to 类。
+// 要增删合并关系，只改那张表即可，无需改本函数。合并只做一轮、不连锁（找到第一条匹配
+// 的 from 就替换并返回），因此表里“同一个 from 只写一行、不要写链式”即可得到预期结果。
 bool apply_class_merge(Detection& det) {
-    bool changed = false;
-    if (RECLS_MERGE_LETTUCE_CABBAGE && det.cls_id == RECLS_MERGE_FROM) {
-        det.cls_id = RECLS_MERGE_TO;
-        changed = true;
+    for (int i = 0; i < RECLS_CLASS_MERGES_COUNT; ++i) {
+        if (det.cls_id == RECLS_CLASS_MERGES[i].from) {
+            det.cls_id = RECLS_CLASS_MERGES[i].to;
+            return true;
+        }
     }
-    return changed;
+    return false;
 }
 
 }  // namespace
