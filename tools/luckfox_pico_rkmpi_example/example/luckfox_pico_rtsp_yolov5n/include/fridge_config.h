@@ -426,8 +426,11 @@ constexpr int CLS_APPLE           = 0;
 constexpr int CLS_ORANGE          = 2;
 constexpr int CLS_ONION           = 15;
 constexpr int CLS_EGG             = 18;
-constexpr int CLS_CHINESE_CABBAGE = 43;
-constexpr int CLS_LETTUCE         = 45;
+constexpr int CLS_CHINESE_CABBAGE = 43;   // 白菜
+constexpr int CLS_LETTUCE         = 45;   // 生菜
+constexpr int CLS_CABBAGE         = 46;   // 卷心菜(圆球状)
+constexpr int CLS_BITTER_GOURD    = 47;   // 苦瓜(长条状)
+constexpr int CLS_HAIRY_GOURD     = 48;   // 节瓜(不再使用，可经合并表映射走)
 
 // ---- egg <-> orange：按"框面积占整幅画面比例"判断 ----
 //  逻辑：egg 框够大 → 其实是 orange；orange 框够小 → 其实是 egg。
@@ -437,6 +440,16 @@ constexpr int CLS_LETTUCE         = 45;
 //  ORANGE->EGG，留一段"谁都不改"的缓冲区。
 constexpr float RECLS_EGG_TO_ORANGE_AREA_RATIO = 0.020f;  // egg 面积比 > 此值 → 改 orange
 constexpr float RECLS_ORANGE_TO_EGG_AREA_RATIO = 0.015f;  // orange 面积比 < 此值 → 改 egg
+
+// ---- bitter_gourd -> cabbage：按框长宽比判断（单向）----
+//  逻辑：苦瓜(bitter_gourd)是长条形，长宽比明显偏离 1:1；卷心菜(cabbage)是圆球，接近 1:1。
+//  所以一个被识别成 bitter_gourd 的框若“接近正方形”，它其实更可能是圆的 cabbage → 改过来。
+//  单向：只做 bitter_gourd → cabbage，不反向（cabbage 不会因为形状被改成苦瓜）。
+//  判据：min(w,h)/max(w,h) >= RECLS_SQUARE_ASPECT_MIN 视为“接近正方形”。
+//  取值 1.0=完全正方形；0.75 表示允许到 3:4 仍算方。调大=更严格(只非常方才转)，
+//  调小=更宽松(略长也转，但可能误伤真的稍长的 cabbage/误转本就该是苦瓜的)。
+constexpr bool  RECLS_BITTER_GOURD_TO_CABBAGE_ENABLED = true;
+constexpr float RECLS_SQUARE_ASPECT_MIN = 0.75f;  // 短边/长边 >= 此值算“接近正方形”
 
 // ---- apple <-> onion：按框内区域的平均颜色(HSV)判断 ----
 //  逻辑：apple 偏红偏亮 → 保持；若偏紫偏暗 → 改 onion。
@@ -481,7 +494,8 @@ constexpr float RECLS_ORANGE_H_MAX = 25.0f;  // 橙色色相上界；落在区�
 //       写成链式不会连续替换，只会按各自那行独立套用，容易与预期不符。
 struct ClassMerge { int from; int to; };
 constexpr ClassMerge RECLS_CLASS_MERGES[] = {
-    { CLS_CHINESE_CABBAGE, CLS_LETTUCE },   // 白菜 → 生菜（把白菜统一记成生菜）
+    { CLS_CHINESE_CABBAGE, CLS_LETTUCE },    // 白菜 → 生菜（把白菜统一记成生菜）
+    { CLS_HAIRY_GOURD, CLS_BITTER_GOURD },   // 节瓜 → 苦瓜
     // 以后想加就照上面加行(使用前先自己在本文将开头声明对应的变量并对其他的索引)，例如：
     // { CLS_XXX, CLS_YYY },
 };

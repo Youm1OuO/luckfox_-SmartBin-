@@ -93,6 +93,24 @@ bool is_bogus_orange(const Detection& det, const cv::Mat& frame) {
     return true;  // 低分 + 不橙 → 判为假 orange，删框
 }
 
+// bitter_gourd -> cabbage：单向，按框长宽比。苦瓜长条(长宽比偏离1:1)，卷心菜圆球(接近1:1)。
+// 一个 bitter_gourd 框若“接近正方形”，判它其实是圆的 cabbage。只单向、不反向。
+bool apply_bitter_gourd_cabbage(Detection& det) {
+    if (!RECLS_BITTER_GOURD_TO_CABBAGE_ENABLED) return false;
+    if (det.cls_id != CLS_BITTER_GOURD) return false;
+    const float w = det.box.w();
+    const float h = det.box.h();
+    if (w <= 1.0f || h <= 1.0f) return false;
+    const float shorter = std::min(w, h);
+    const float longer  = std::max(w, h);
+    const float aspect = shorter / longer;   // 1.0=正方形，越小越长条
+    if (aspect >= RECLS_SQUARE_ASPECT_MIN) {  // 接近正方形 → 其实是圆的 cabbage
+        det.cls_id = CLS_CABBAGE;
+        return true;
+    }
+    return false;
+}
+
 // egg <-> orange：按框面积纠正。返回是否改动。
 bool apply_egg_orange(Detection& det) {
     const float ratio = box_area_ratio(det.box);
@@ -155,10 +173,12 @@ bool reclassify_detection(Detection& det, const cv::Mat& frame) {
     if (!RECLASSIFY_ENABLED) return false;
 
     bool changed = false;
-    // 先做形状/颜色纠正，再做类别合并：例如 egg->orange 后不涉及合并，
-    // 而合并只影响 lettuce/cabbage，互不干扰。
+    // 先做形状/颜色纠正，再做类别合并。各转换作用于不同类别对，互不干扰：
+    //   egg<->orange(面积)、apple<->onion(颜色)、bitter_gourd->cabbage(长宽比,单向)。
+    // 类别合并(apply_class_merge)放最后，使合并结果不再被上述转换二次加工(避免链式)。
     changed |= apply_egg_orange(det);
     changed |= apply_apple_onion(det, frame);
+    changed |= apply_bitter_gourd_cabbage(det);
     changed |= apply_class_merge(det);
     return changed;
 }

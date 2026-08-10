@@ -31,6 +31,22 @@
 - 橙子通常更偏橙红、饱和度更高、框面积偏大
 - 如果颜色接近，再用面积和长宽比辅助判断
 
+## 苦瓜 / 卷心菜（bitter_gourd → cabbage，单向，按长宽比）
+
+**问题：** 卷心菜(cabbage)有时被误判成苦瓜(bitter_gourd)。这两者形状差异大：
+苦瓜是**长条形**、卷心菜是**圆球状**，正好可以用长宽比区分。
+
+**判据（单向）：** 一个被识别成 `bitter_gourd` 的框，若其**短边/长边 ≥ RECLS_SQUARE_ASPECT_MIN
+（默认 0.75，即接近正方形）**，说明它其实是圆的 → 改成 `cabbage`。
+只做 bitter_gourd → cabbage，**不反向**（cabbage 不会因形状被改成苦瓜）。
+
+**为什么这里长宽比有效、而 lettuce/cabbage 不行：** 苦瓜(长条) vs 卷心菜(圆)形状差异明显，
+长宽比能分开；而生菜/卷心菜**都是圆团状、长宽比都接近 1:1**，长宽比分不开——所以
+lettuce↔cabbage 的区分暂不做，若业务必须精确区分，应补数据重训模型（后处理无可靠特征）。
+
+**实现与阈值：** `reclassify.cc` 的 `apply_bitter_gourd_cabbage()`，开关/阈值
+`RECLS_BITTER_GOURD_TO_CABBAGE_ENABLED`、`RECLS_SQUARE_ASPECT_MIN`。
+
 ## 假 orange 过滤（两个鸡蛋拼成的长框被误判成 orange）
 
 **问题：** 两个 egg 挨在一起，YOLO 有时把这个长矩形整体误判成一个 orange（分数多在 60 左右）。
