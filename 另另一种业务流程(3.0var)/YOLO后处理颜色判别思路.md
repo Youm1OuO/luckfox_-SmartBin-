@@ -31,6 +31,35 @@
 - 橙子通常更偏橙红、饱和度更高、框面积偏大
 - 如果颜色接近，再用面积和长宽比辅助判断
 
+## 假 orange 过滤（两个鸡蛋拼成的长框被误判成 orange）
+
+**问题：** 两个 egg 挨在一起，YOLO 有时把这个长矩形整体误判成一个 orange（分数多在 60 左右）。
+这个错误没法靠「egg/orange 颜色转换」解决——即便按颜色把它从 orange 改回 egg，**那个错误的
+框依然存在**（只是换了类别）。所以关键是让这个框**根本不出现（直接删掉）**。
+
+**判据（三条同时满足才删框，宁可漏过、不可误删真 orange）：**
+
+1. 是 **YOLO 原生 orange**（`cls_id == CLS_ORANGE`）；
+2. 分数 **< `RECLS_ORANGE_FILTER_SCORE_MAX`（默认 0.63）**——高分的真橙子直接保留；
+3. 框内中心区域平均色相**不在橙色区间** `[RECLS_ORANGE_H_MIN, RECLS_ORANGE_H_MAX]`（默认 8~25）。
+   两个 egg 拼的框是蛋壳色（偏白/黄），不橙；真橙子橙色，会落在区间内被保留。
+   采样失败（拿不到颜色）时**保守不删**。
+
+**为什么只过滤 orange、不给 egg 加过滤：** egg 的置信度时高时低，若给 egg 也加分数/颜色门槛，
+很容易把真 egg 误删（漏入库比多一个假 orange 更糟）。所以只对 orange 这一个方向下手。
+
+**顺序（关键）：这个过滤必须在 `egg<->orange` 面积互转【之前】执行。** 因为判据看的是
+`cls_id==orange`；若先转换，一个面积偏大的真 egg 可能先被转成 orange，再撞上这个过滤而被
+误删（等于间接过滤了 egg）。先过滤、只作用于 YOLO 原生 orange，就绝不会误伤 egg。
+也因此，`egg<->orange` 转换本身**保持纯面积、不加颜色**，避免给不稳定的 egg 引入颜色风险。
+
+**实现与阈值：** 逻辑在 `reclassify.cc` 的 `is_bogus_orange()`，在 `reclassify_detections()`
+最前面（转换之前）逐框判断并从检测列表移除。开关/阈值在 `fridge_config.h`：
+`RECLS_ORANGE_FILTER_ENABLED`、`RECLS_ORANGE_FILTER_SCORE_MAX`、`RECLS_ORANGE_H_MIN/MAX`。
+
+**局限（如实说明）：** 若某次假 orange 分数恰好 ≥0.63，仍会漏过（阈值法固有局限）；配合
+「不橙」双条件已能滤掉绝大部分，真漏的高分误判只能靠后续去重/数量逻辑兜。
+
 ## 纠正后的同类去重（补一次 NMS）
 
 **为什么需要：** YOLO 的 NMS 是「逐类」进行的，只压制同一 cls_id 的重叠框。所以 YOLO 会

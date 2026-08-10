@@ -75,6 +75,24 @@ bool hue_is_purple(float h) {
     return h >= RECLS_PURPLE_H_MIN && h <= RECLS_PURPLE_H_MAX;
 }
 
+// 色相是否落在"橙"区间（用于识别真 orange）。
+bool hue_is_orange(float h) {
+    return h >= RECLS_ORANGE_H_MIN && h <= RECLS_ORANGE_H_MAX;
+}
+
+// 假 orange 过滤判据：只针对【YOLO 原生 orange】。三条同时满足才判为"假 orange，应删"：
+//   cls_id==CLS_ORANGE 且 分数<RECLS_ORANGE_FILTER_SCORE_MAX 且 框内平均色相不橙。
+// 采样失败(拿不到颜色)时保守【不删】，避免误伤。
+bool is_bogus_orange(const Detection& det, const cv::Mat& frame) {
+    if (!RECLS_ORANGE_FILTER_ENABLED) return false;
+    if (det.cls_id != CLS_ORANGE) return false;
+    if (det.score >= RECLS_ORANGE_FILTER_SCORE_MAX) return false;  // 高分真橙子，保留
+    float mean_h = 0.0f;
+    if (!sample_box_hsv(det.box, frame, &mean_h, NULL)) return false;  // 采样失败→保守保留
+    if (hue_is_orange(mean_h)) return false;  // 确实是橙色→保留
+    return true;  // 低分 + 不橙 → 判为假 orange，删框
+}
+
 // egg <-> orange：按框面积纠正。返回是否改动。
 bool apply_egg_orange(Detection& det) {
     const float ratio = box_area_ratio(det.box);
@@ -178,6 +196,19 @@ void dedup_after_reclassify(const std::vector<Detection>& dets,
 
 void reclassify_detections(std::vector<Detection>& dets, const cv::Mat& frame) {
     if (!RECLASSIFY_ENABLED) return;
+
+    // 第零步：假 orange 过滤——【必须在 egg<->orange 面积互转之前】执行，只作用于
+    // YOLO 原生 orange 框（此时还没有任何框被转换成 orange），因此绝不会误删由 egg 转来
+    // 的 orange，也就不会间接误删 egg。删框直接从 dets 移除，不进入后续任何处理。
+    if (RECLS_ORANGE_FILTER_ENABLED && !dets.empty()) {
+        std::vector<Detection> kept0;
+        kept0.reserve(dets.size());
+        for (size_t i = 0; i < dets.size(); ++i) {
+            if (is_bogus_orange(dets[i], frame)) continue;  // 假 orange → 丢弃
+            kept0.push_back(dets[i]);
+        }
+        dets.swap(kept0);
+    }
 
     // 第一步：逐框类别纠正，同时记录哪些框被改过（供做法 A 去重）。
     std::vector<char> changed(dets.size(), 0);

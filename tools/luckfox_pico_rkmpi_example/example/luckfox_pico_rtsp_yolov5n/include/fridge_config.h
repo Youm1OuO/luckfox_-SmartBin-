@@ -42,11 +42,21 @@ inline bool is_food(int cls_id) {
 //    3. 业务层手阈值：HAND_CONTEXT_SCORE_THRESH；检测到就停止无手收尾。
 // =========================================================================
 constexpr float YOLO_CANDIDATE_SCORE_THRESH = 0.01f;
-constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.40f;    // 物品的阈值
+constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.40f;    // 物品的通用阈值
 constexpr float YOLO_HAND_SCORE_THRESH      = 0.30f;    // 手的阈值
 
+// ---- 单类特殊阈值（比通用物品阈值更高，用于压掉特定误判）----
+//  背景：透明鸡蛋盒空出来后会被误判成 milk_box(cls_id=21)，误判分数多在 60~76；而真实
+//  milk_box 正立摆放时通常 80+。所以给 milk_box 单独订一个更高的入库门槛 0.77，把空盒的
+//  误判(≤0.76)挡在业务层之外。代价：真 milk_box 若“躺放”分数可能跌到 60 而被挡——演示时
+//  正立摆放 milk_box 即可（已与用户确认）。想调回通用阈值，把此值改成 0.40 即可。
+constexpr int   MILK_BOX_CLS_ID          = 21;      // milk_box 的 cls_id（与训练 label 对齐）
+constexpr float MILK_BOX_SCORE_THRESH    = 0.77f;   // milk_box 专用入库门槛（高于通用 0.40）
+
 inline float yolo_output_score_threshold(int cls_id) {
-    return is_hand(cls_id) ? YOLO_HAND_SCORE_THRESH : YOLO_OBJECT_SCORE_THRESH;
+    if (is_hand(cls_id)) return YOLO_HAND_SCORE_THRESH;
+    if (cls_id == MILK_BOX_CLS_ID) return MILK_BOX_SCORE_THRESH;
+    return YOLO_OBJECT_SCORE_THRESH;
 }
 
 // =========================================================================
@@ -444,6 +454,18 @@ constexpr float RECLS_RED_H_LOW_MAX = 12.0f;    // 红色相下段上界 (H<=此
 constexpr float RECLS_RED_H_HIGH_MIN= 168.0f;   // 红色相高段下界 (H>=此值算红)
 // 颜色采样时框向内收缩的比例(各边)，避免采到背景。0.2 表示每边缩 20%。
 constexpr float RECLS_COLOR_INSET_RATIO = 0.20f;
+
+// ---- 假 orange 过滤（细节：两个 egg 拼成的长框会被误判成 orange，分数多在 60 左右）----
+//  判据（三条同时满足才【删框】，宁可漏过、不可误删真 orange）：
+//    1) 是 YOLO 原生 orange（cls_id==CLS_ORANGE）；
+//    2) 分数 < ORANGE_FILTER_SCORE_THRESH；
+//    3) 框内平均色相【不在橙色区间】(不橙)。
+//  必须在 egg<->orange 面积互转【之前】执行，只作用于 YOLO 原生 orange，绝不碰
+//  由 egg 转来的 orange，从而不会间接误删 egg。egg<->orange 转换本身保持纯面积、不加颜色。
+constexpr bool  RECLS_ORANGE_FILTER_ENABLED   = true;   // 开/关这个假 orange 过滤
+constexpr float RECLS_ORANGE_FILTER_SCORE_MAX = 0.63f;  // 分数 < 此值 才可能被过滤
+constexpr float RECLS_ORANGE_H_MIN = 8.0f;   // 橙色色相下界(HSV,0~179)；H 在 [MIN,MAX] 算“橙”
+constexpr float RECLS_ORANGE_H_MAX = 25.0f;  // 橙色色相上界；落在区间内=橙(真橙子)，区间外=不橙
 
 // ---- 类别归一化(合并难区分的类) ----
 //  把某个类统一记成另一个代表类。下面是一张“合并表”，你可以【只改这张表】随意增删合并
