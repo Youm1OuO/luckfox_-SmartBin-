@@ -80,8 +80,10 @@ bool hue_is_orange(float h) {
     return h >= RECLS_ORANGE_H_MIN && h <= RECLS_ORANGE_H_MAX;
 }
 
-// 假 orange 过滤判据：只针对【YOLO 原生 orange】。三条同时满足才判为"假 orange，应删"：
+// 假 orange 过滤判据。三条同时满足才判为"假 orange，应删"：
 //   cls_id==CLS_ORANGE 且 分数<RECLS_ORANGE_FILTER_SCORE_MAX 且 框内平均色相不橙。
+// 在所有逐框转换【之后】调用，因此这里的 orange 既可能是 YOLO 原生的，也可能是
+// egg->orange 面积规则转出来的（两个 egg 拼成的大框）——两者都能被这道过滤扫到。
 // 采样失败(拿不到颜色)时保守【不删】，避免误伤。
 bool is_bogus_orange(const Detection& det, const cv::Mat& frame) {
     if (!RECLS_ORANGE_FILTER_ENABLED) return false;
@@ -217,26 +219,31 @@ void dedup_after_reclassify(const std::vector<Detection>& dets,
 void reclassify_detections(std::vector<Detection>& dets, const cv::Mat& frame) {
     if (!RECLASSIFY_ENABLED) return;
 
-    // 第零步：假 orange 过滤——【必须在 egg<->orange 面积互转之前】执行，只作用于
-    // YOLO 原生 orange 框（此时还没有任何框被转换成 orange），因此绝不会误删由 egg 转来
-    // 的 orange，也就不会间接误删 egg。删框直接从 dets 移除，不进入后续任何处理。
-    if (RECLS_ORANGE_FILTER_ENABLED && !dets.empty()) {
-        std::vector<Detection> kept0;
-        kept0.reserve(dets.size());
-        for (size_t i = 0; i < dets.size(); ++i) {
-            if (is_bogus_orange(dets[i], frame)) continue;  // 假 orange → 丢弃
-            kept0.push_back(dets[i]);
-        }
-        dets.swap(kept0);
-    }
-
-    // 第一步：逐框类别纠正，同时记录哪些框被改过（供做法 A 去重）。
+    // 第一步：逐框类别纠正（含 egg<->orange 面积互转），记录哪些框被改过（供去重）。
     std::vector<char> changed(dets.size(), 0);
     for (size_t i = 0; i < dets.size(); ++i) {
         changed[i] = reclassify_detection(dets[i], frame) ? 1 : 0;
     }
 
-    // 第二步：紧跟其后补做一次同类去重，清理纠正制造出的重叠同类框。
+    // 第二步：假 orange 过滤。【放在所有逐框转换之后】，因此对“最终是 orange 的框”都生效——
+    // 无论它是 YOLO 原生 orange，还是两个 egg 拼成的大框被 egg->orange 面积规则转出来的假
+    // orange，都能被扫到并删除。判据(三条同时满足才删)：cls_id==orange + 分数<阈值 + 颜色不橙；
+    // 真橙子(颜色橙)与高分 orange 会被保住，不会误删。删框后同步移除其 changed 标记。
+    if (RECLS_ORANGE_FILTER_ENABLED && !dets.empty()) {
+        std::vector<Detection> kept0;
+        std::vector<char> changed0;
+        kept0.reserve(dets.size());
+        changed0.reserve(dets.size());
+        for (size_t i = 0; i < dets.size(); ++i) {
+            if (is_bogus_orange(dets[i], frame)) continue;  // 假 orange → 丢弃
+            kept0.push_back(dets[i]);
+            changed0.push_back(changed[i]);
+        }
+        dets.swap(kept0);
+        changed.swap(changed0);
+    }
+
+    // 第三步：补做一次同类去重，清理纠正制造出的重叠同类框。
     if (!RECLS_DEDUP_ENABLED || dets.size() < 2) return;
     std::vector<char> suppressed(dets.size(), 0);
     dedup_after_reclassify(dets, changed, &suppressed);

@@ -69,8 +69,15 @@ lettuce↔cabbage 的区分暂不做，若业务必须精确区分，应补数�
 误删（等于间接过滤了 egg）。先过滤、只作用于 YOLO 原生 orange，就绝不会误伤 egg。
 也因此，`egg<->orange` 转换本身**保持纯面积、不加颜色**，避免给不稳定的 egg 引入颜色风险。
 
+**顺序（重要）：** 过滤放在【所有逐框转换之后、去重之前】。因为这个假 orange 往往不是 YOLO
+原生输出的，而是**两个 egg 拼成的大框被 egg->orange 面积规则转出来的**——所以必须等
+egg->orange 转换跑完，再对“最终是 orange 的框”统一过滤，才能把这种转换产生的假 orange 也
+删掉。流程：逐框转换(含 egg->orange) → 假 orange 过滤(删框) → 同类去重。
+（早期版本把过滤放在转换之前、只拦原生 orange，导致 egg 转来的假 orange 漏网，已修正。）
+
 **实现与阈值：** 逻辑在 `reclassify.cc` 的 `is_bogus_orange()`，在 `reclassify_detections()`
-最前面（转换之前）逐框判断并从检测列表移除。开关/阈值在 `fridge_config.h`：
+的逐框转换之后逐框判断并从检测列表移除（同步移除其 changed 标记，保持与去重对齐）。
+开关/阈值在 `fridge_config.h`：
 `RECLS_ORANGE_FILTER_ENABLED`、`RECLS_ORANGE_FILTER_SCORE_MAX`、`RECLS_ORANGE_H_MIN/MAX`。
 
 **局限（如实说明）：** 若某次假 orange 分数恰好 ≥0.63，仍会漏过（阈值法固有局限）；配合
