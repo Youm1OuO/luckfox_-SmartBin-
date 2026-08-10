@@ -45,13 +45,16 @@ constexpr float YOLO_CANDIDATE_SCORE_THRESH = 0.01f;
 constexpr float YOLO_OBJECT_SCORE_THRESH    = 0.40f;    // 物品的通用阈值
 constexpr float YOLO_HAND_SCORE_THRESH      = 0.30f;    // 手的阈值
 
-// ---- 单类特殊阈值（比通用物品阈值更高，用于压掉特定误判）----
-//  背景：透明鸡蛋盒空出来后会被误判成 milk_box(cls_id=21)，误判分数多在 60~76；而真实
-//  milk_box 正立摆放时通常 80+。所以给 milk_box 单独订一个更高的入库门槛 0.77，把空盒的
-//  误判(≤0.76)挡在业务层之外。代价：真 milk_box 若“躺放”分数可能跌到 60 而被挡——演示时
-//  正立摆放 milk_box 即可（已与用户确认）。想调回通用阈值，把此值改成 0.40 即可。
+// ---- 单类特殊阈值（用于压掉特定误判）----
+//  背景：透明鸡蛋盒的“鸡蛋孔”空出来后偶尔被误判成 milk_box(cls_id=21)。用两条一起挡：
+//   (1) 置信度门槛 MILK_BOX_SCORE_THRESH：milk_box 分数低于此值直接不进业务（在 postprocess
+//       层逐框过滤）。原来订 0.77 太高、容易误伤躺放的真 milk_box；现降到 0.60，主要交给
+//       下面的“最小尺寸”判据挑大梁。
+//   (2) 最小尺寸 MILK_BOX_MIN_AREA_RATIO（见 reclassify 那一节的 milk_box 尺寸过滤）：
+//       真 milk_box 是大物件，不可能只有鸡蛋孔那么小；框面积比例过小的 milk_box 判为误判。
+//  两条“分数不高 且 尺寸过小”一起满足才删，宁可漏过不误伤真 milk_box（见 reclassify.cc）。
 constexpr int   MILK_BOX_CLS_ID          = 21;      // milk_box 的 cls_id（与训练 label 对齐）
-constexpr float MILK_BOX_SCORE_THRESH    = 0.77f;   // milk_box 专用入库门槛（高于通用 0.40）
+constexpr float MILK_BOX_SCORE_THRESH    = 0.60f;   // milk_box 置信度门槛（低于此在 postprocess 丢弃）
 
 inline float yolo_output_score_threshold(int cls_id) {
     if (is_hand(cls_id)) return YOLO_HAND_SCORE_THRESH;
@@ -287,7 +290,7 @@ constexpr float FLOW3_D_PARTIAL_COVER_RATIO = 0.30f;
 
 // 可开关的 3.0 状态机诊断追踪。开启后会按操作号、帧号记录状态转换、
 // C->B 仲裁、D 防线和无手结算依据；它只输出日志，不参与任何业务判断。
-constexpr bool FLOW3_DEBUG_TRACE_LOG = false;
+constexpr bool FLOW3_DEBUG_TRACE_LOG = true;
 
 // 当前尚未对接后台，允许首张无手直接检测建立本地测试库存。
 // 接入可信后台后建议改为 false：此时冷启动画面只做只读校验，不负责建库。
@@ -479,6 +482,18 @@ constexpr bool  RECLS_ORANGE_FILTER_ENABLED   = true;   // 开/关这个假 oran
 constexpr float RECLS_ORANGE_FILTER_SCORE_MAX = 0.63f;  // 分数 < 此值 才可能被过滤
 constexpr float RECLS_ORANGE_H_MIN = 8.0f;   // 橙色色相下界(HSV,0~179)；H 在 [MIN,MAX] 算“橙”
 constexpr float RECLS_ORANGE_H_MAX = 25.0f;  // 橙色色相上界；落在区间内=橙(真橙子)，区间外=不橙
+
+// ---- 假 milk_box 过滤（透明鸡蛋盒的“鸡蛋孔”空出来偶尔被误判成 milk_box）----
+//  判据（两条同时满足才【删框】，宁可漏过、不可误删真 milk_box）：
+//    1) 是 milk_box（cls_id==MILK_BOX_CLS_ID）；
+//    2) 框面积占画面比例 < RECLS_MILK_BOX_MIN_AREA_RATIO（真 milk_box 是大物件，不可能这么小）；
+//    3) 分数 < RECLS_MILK_BOX_FILTER_SCORE_MAX（分数不高；很确定的高分即使小也保留）。
+//  用面积【比例】(相对 FRAME_W*FRAME_H)而非绝对像素，物体远近都稳。
+//  调阈值方法（用户建议）：先把 MIN_AREA_RATIO 调大到“所有 milk_box 都消失”，再慢慢调小，
+//  直到所有真 milk_box 都能显示、而鸡蛋孔误判仍被挡住的那个点。
+constexpr bool  RECLS_MILK_BOX_FILTER_ENABLED   = true;   // 开/关这个假 milk_box 过滤
+constexpr float RECLS_MILK_BOX_MIN_AREA_RATIO   = 0.045f; // 面积比 < 此值 才可能被过滤(约画面3%)
+constexpr float RECLS_MILK_BOX_FILTER_SCORE_MAX = 0.77f;  // 且分数 < 此值 才过滤(高分不动)
 
 // ---- 类别归一化(合并难区分的类) ----
 //  把某个类统一记成另一个代表类。下面是一张“合并表”，你可以【只改这张表】随意增删合并

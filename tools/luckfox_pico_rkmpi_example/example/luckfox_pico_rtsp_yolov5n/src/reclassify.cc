@@ -95,6 +95,18 @@ bool is_bogus_orange(const Detection& det, const cv::Mat& frame) {
     return true;  // 低分 + 不橙 → 判为假 orange，删框
 }
 
+// 假 milk_box 过滤判据：透明鸡蛋盒的“鸡蛋孔”偶尔被误判成 milk_box。两条同时满足才删：
+//   cls_id==milk_box 且 框面积比例过小(真 milk_box 是大物件) 且 分数不高。
+// 宁可漏过、不可误删真 milk_box（它够大/够高分就会被保住）。
+bool is_bogus_milk_box(const Detection& det) {
+    if (!RECLS_MILK_BOX_FILTER_ENABLED) return false;
+    if (det.cls_id != MILK_BOX_CLS_ID) return false;
+    if (det.score >= RECLS_MILK_BOX_FILTER_SCORE_MAX) return false;  // 高分 milk_box，保留
+    const float area_ratio = box_area_ratio(det.box);
+    if (area_ratio >= RECLS_MILK_BOX_MIN_AREA_RATIO) return false;    // 够大，是真 milk_box
+    return true;  // 又小又分数不高 → 判为鸡蛋孔误判，删框
+}
+
 // bitter_gourd -> cabbage：单向，按框长宽比。苦瓜长条(长宽比偏离1:1)，卷心菜圆球(接近1:1)。
 // 一个 bitter_gourd 框若“接近正方形”，判它其实是圆的 cabbage。只单向、不反向。
 bool apply_bitter_gourd_cabbage(Detection& det) {
@@ -223,14 +235,16 @@ void reclassify_detections(std::vector<Detection>& dets, const cv::Mat& frame) {
         reclassify_detection(dets[i], frame);
     }
 
-    // 第二步：假 orange 过滤。【放在所有逐框转换之后】，因此对“最终是 orange 的框”都生效——
-    // 无论它是 YOLO 原生 orange，还是两个 egg 拼成的大框被 egg->orange 面积规则转出来的假
-    // orange，都能被扫到并删除。判据(三条同时满足才删)：cls_id==orange + 分数<阈值 + 颜色不橙。
-    if (RECLS_ORANGE_FILTER_ENABLED && !dets.empty()) {
+    // 第二步：误判框过滤（删框）。【放在所有逐框转换之后】。
+    //   - 假 orange：cls_id==orange + 分数<阈值 + 颜色不橙（两个 egg 拼成的大框被转成的假橙子）；
+    //   - 假 milk_box：cls_id==milk_box + 面积过小 + 分数不高（透明蛋盒的鸡蛋孔误判）。
+    // 都是“宁可漏过不可误删真物品”，命中即从检测列表移除。
+    if (!dets.empty()) {
         std::vector<Detection> kept0;
         kept0.reserve(dets.size());
         for (size_t i = 0; i < dets.size(); ++i) {
-            if (is_bogus_orange(dets[i], frame)) continue;  // 假 orange → 丢弃
+            if (is_bogus_orange(dets[i], frame)) continue;    // 假 orange → 丢弃
+            if (is_bogus_milk_box(dets[i])) continue;         // 假 milk_box → 丢弃
             kept0.push_back(dets[i]);
         }
         dets.swap(kept0);
