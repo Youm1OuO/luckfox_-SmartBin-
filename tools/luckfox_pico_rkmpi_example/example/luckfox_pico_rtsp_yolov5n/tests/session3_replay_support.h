@@ -124,6 +124,8 @@ void test_confirmed_reappear_owner_beats_wide_path_but_keeps_equal_tie();
 void test_no_hand_correction_box_in_hand_region_gets_in();
 void test_no_hand_correction_box_out_hand_region_gets_out();
 void test_no_hand_correction_box_outside_hand_region_not_in();
+void test_no_hand_correction_fills_boxes_near_existing_tracks();
+void test_no_hand_correction_covered_old_position_not_out();
 
 }  // namespace session3_replay
 

@@ -545,10 +545,15 @@ private:
         const std::vector<int>& observation_owner,
         const std::map<int, InventoryItem>& final_items) const;
     // 一个旧 C 是否是"补 OUT 的合法候选"（不含帧数条件）：本帧未被观察到、消失位置在
-    // 手活动区域内、无遮挡解释、不在既有 OUT/MOVED 流程内。
+    // 手活动区域内、不在既有 OUT/MOVED 流程内，且遮挡判定三分派通过（细节31 §2.4 第3条）：
+    // OCCLUDED→否；普通 VISIBLE→是；HOLD_FOR_PENDING_OCCLUSION→额外看"老位置在快照里是否
+    // 被未匹配库存的框覆盖"（被覆盖→否，空了→是）。detections/observation_owner 供 HOLD
+    // 分支查"未匹配框"用。
     bool is_correction_out_candidate_(
         int item_id, const std::map<int, InventoryItem>& final_items,
         const std::set<int>& observed_ids,
+        const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
         const std::map<int, session_internal::BlockerTransitionPlan>&
             transition_plans) const;
     // 只在无手阶段全局一对一归属完成后使用。它不是普通 MOVED 门槛的替代，

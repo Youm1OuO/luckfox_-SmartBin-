@@ -102,5 +102,7 @@ int main() {
     test_no_hand_correction_box_in_hand_region_gets_in();
     test_no_hand_correction_box_out_hand_region_gets_out();
     test_no_hand_correction_box_outside_hand_region_not_in();
+    test_no_hand_correction_fills_boxes_near_existing_tracks();
+    test_no_hand_correction_covered_old_position_not_out();
     return 0;
 }

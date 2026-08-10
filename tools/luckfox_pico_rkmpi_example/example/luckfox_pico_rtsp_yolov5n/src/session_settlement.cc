@@ -1861,6 +1861,7 @@ bool SessionManager::update_no_hand_correction_streaks_(
              operation_start_inventory_.begin();
          it != operation_start_inventory_.end(); ++it) {
         if (!is_correction_out_candidate_(it->first, final_items, observed_ids,
+                                          detections, observation_owner,
                                           transition_plans)) {
             continue;
         }
@@ -1977,18 +1978,21 @@ bool SessionManager::is_correction_in_candidate_(
     if (shadow_detection_indices_.count(detection_index)) return false;
 
     const Detection& d = detections[detection_index];
-    // 条件3：高分（复用既有物品阈值，不额外放宽）。
+    // 高分（复用既有物品阈值，不额外放宽）。
     if (d.score < fridge::YOLO_OBJECT_SCORE_THRESH) return false;
-    // 条件1：落在本轮手活动区域内（核心钥匙）。
+    // 核心钥匙：落在本轮手活动区域内。
     if (!box_in_hand_activity_region_(d.box)) return false;
-    // 条件4：无法归属任何已有物品/D，也不与任何活动 runtime 冲突（含"遮挡露出"，
-    // 那些会先被既有匹配/REVEALED 逻辑接管）。
+    // 快照↔库存双向匹配：这个框若能匹配上任一库存物品（严格或局部，用 base_box），
+    // 说明它对应一个已有物品，不是"快照余数"，不补 IN。
+    // 细节31 §0.5 铁律1：这里【只与工作库存比】，绝不查有手期轨迹——原实现调用
+    // detection_conflicts_with_active_track 造成"整盒 6 个进 4 个"（第 5/6 个鸡蛋因位置
+    // 沾到某条有手轨迹的移动路径被误判成"已有轨迹抖动"），本次已移除该耦合。
     if (detection_matches_old_working_inventory(d, working_inventory_,
                                                 operation_start_inventory_)) {
         return false;
     }
-    if (detection_conflicts_with_active_track(d, track_buffer_)) return false;
-    // 条件5：不与任何"已被绑定的观察框"高度重叠（排除同一物体的重复/误分类框）。
+    // 不与任何"已被绑定的观察框"高度重叠（排除同一物体的重复/误分类框，信任 YOLO：
+    // 偶发分裂靠连续帧滤除，这里挡持续性的同位置重复）。
     for (size_t si = 0; si < observation_owner.size(); ++si) {
         if (observation_owner[si] < 0) continue;
         if (static_cast<size_t>(si) >= detections.size()) continue;
@@ -2003,6 +2007,8 @@ bool SessionManager::is_correction_in_candidate_(
 bool SessionManager::is_correction_out_candidate_(
         int item_id, const std::map<int, InventoryItem>& final_items,
         const std::set<int>& observed_ids,
+        const std::vector<Detection>& detections,
+        const std::vector<int>& observation_owner,
         const std::map<int, session_internal::BlockerTransitionPlan>&
             transition_plans) const {
     // 只处理本轮开始就在库的旧 C。
@@ -2012,32 +2018,46 @@ bool SessionManager::is_correction_out_candidate_(
     // 必须仍在 final_items 里（还没被任何既有机制移除）。
     std::map<int, InventoryItem>::const_iterator now = final_items.find(item_id);
     if (now == final_items.end()) return false;
-    // 本帧被直接观察到 → 不是消失。
+    // 本帧被直接观察到 → 不是消失（即它是"库存余数"才继续）。
     if (observed_ids.count(item_id)) return false;
-    // 条件4：不在既有 OUT / MOVED 流程内。
+    // 不在既有 OUT / MOVED 流程内（避免与既有结论重复/冲突）。
     if (pending_out_ids_.count(item_id) || confirmed_moved_ids_.count(item_id)) {
         return false;
     }
-    // 条件3：无遮挡解释——当前不是 OCCLUDED、且没有任何遮挡/HOLD 计划、
-    // 也不在 pending_occlusion_* 证据链里。被遮挡的物品绝不能补 OUT。
-    if (now->second.status == ItemStatus::OCCLUDED) return false;
-    if (pending_occlusion_missing_counts_.count(item_id) ||
-        pending_occlusion_witness_ids_.count(item_id)) {
-        return false;
-    }
-    std::map<int, session_internal::BlockerTransitionPlan>::const_iterator plan =
-        transition_plans.find(item_id);
-    if (plan != transition_plans.end()) {
-        const session_internal::BlockerTransitionPlan& p = plan->second;
-        if (p.allow_occluded_transition ||
-            p.out == session_internal::OutDisposition::HOLD_FOR_PENDING_OCCLUSION) {
-            return false;
-        }
-    }
-    // 条件1：消失位置在本轮手活动区域内（与补 IN 同一把尺）。
+
+    // 消失位置在本轮手活动区域内（与补 IN 同一把尺）。
     const BBox& gone = now->second.base_box.area() > 0.0f
         ? now->second.base_box : now->second.box;
     if (!box_in_hand_activity_region_(gone)) return false;
+
+    // 细节31 §2.4 第3条：遮挡判定三分派。绝大多数读现成状态（快），只有悬而未决的
+    // HOLD 才额外看一眼"老位置在快照里空不空"。
+    // (a) 已确认遮挡 → 不 OUT（直接读现成状态，不重算）。
+    if (now->second.status == ItemStatus::OCCLUDED) return false;
+    // (b) 遮挡待确认（HOLD_FOR_PENDING_OCCLUSION，status 仍为 VISIBLE，且到无手期不会
+    //     再有新信息、会一直挂着）→ 看 base_box 老位置是否被"未匹配上库存的快照框"覆盖：
+    //     被覆盖=真被挡住→不 OUT；老位置空了=其实被拿走→放行（解决 HOLD 永远卡住）。
+    std::map<int, session_internal::BlockerTransitionPlan>::const_iterator plan =
+        transition_plans.find(item_id);
+    const bool pending_hold =
+        (plan != transition_plans.end() &&
+         (plan->second.allow_occluded_transition ||
+          plan->second.out ==
+              session_internal::OutDisposition::HOLD_FOR_PENDING_OCCLUSION)) ||
+        pending_occlusion_missing_counts_.count(item_id) ||
+        pending_occlusion_witness_ids_.count(item_id);
+    if (pending_hold) {
+        for (size_t si = 0; si < detections.size(); ++si) {
+            // 只看"没匹配上任何库存"的快照框（未绑定者），它们才可能是遮挡 C 的前景物。
+            if (si < observation_owner.size() && observation_owner[si] >= 0) continue;
+            if (shadow_detection_indices_.count(static_cast<int>(si))) continue;
+            if (intersection_area(gone, detections[si].box) > BLOCK_OVERLAP_AREA_EPS) {
+                return false;  // 老位置被压着 → 真被挡住，不 OUT
+            }
+        }
+        // 老位置空了 → HOLD 其实是被拿走，放行补 OUT。
+    }
+    // (c) 普通 VISIBLE（非 OCCLUDED、非 HOLD）→ 放行。
     return true;
 }
 

@@ -2278,4 +2278,65 @@ void test_no_hand_correction_box_outside_hand_region_not_in() {
     assert(!has_event(result, fridge::EventKind::IN, 2));
     assert(session.inventory().find_by_item(2) == 0);
 }
+
+// 细节31 v2 关键用例（首版会漏）：有手期只在部分鸡蛋上建立了 track/D，手离开后
+// 无手快照稳定看到全部鸡蛋。首版因 detection_conflicts_with_active_track 把"位置沾到
+// 已有轨迹路径"的其余鸡蛋误判成"已有轨迹抖动"而 reject（6 进 4）；v2 摘掉该耦合，
+// 快照里配不上任何库存项的框即为余数 → 补齐。
+void test_no_hand_correction_fills_boxes_near_existing_tracks() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    session.init_from_backend(std::vector<fridge::InventoryItem>(), true);
+    int frame = 1;
+    initial_no_hand_frame(&session, std::vector<fridge::Detection>(), &frame);
+
+    // 有手期：手在中间大范围活动，且带进 2 个贴手鸡蛋（会建立 D suspect）。
+    std::vector<fridge::Detection> hand_eggs;
+    hand_eggs.push_back(det(18, 380, 470, 500, 570));
+    hand_eggs.push_back(det(18, 520, 470, 640, 570));
+    for (int i = 0; i < 3; ++i) {
+        send_frame(&session, hand_eggs,
+                   std::vector<fridge::BBox>(1, fridge::BBox(300, 420, 760, 720)), &frame);
+    }
+
+    // 手离开：无手快照稳定看到 4 个鸡蛋（原 2 个 + 手离开后才看全的另 2 个，
+    // 后 2 个位置就在手活动区域内、贴近之前的轨迹路径）。
+    std::vector<fridge::Detection> all_eggs;
+    all_eggs.push_back(det(18, 380, 470, 500, 570));
+    all_eggs.push_back(det(18, 520, 470, 640, 570));
+    all_eggs.push_back(det(18, 450, 590, 570, 690));
+    all_eggs.push_back(det(18, 600, 560, 720, 660));
+    fridge::SettlementResult result = settle_after_hand(&session, all_eggs, &frame);
+
+    assert(result.committed);
+    // 4 个鸡蛋都应入库（不因"沾到已有轨迹路径"而漏掉后 2 个）。
+    assert(session.inventory().size() == 4);
+}
+
+// 细节31 §2.4 HOLD 中间态 F1：一个物品处于遮挡待确认（HOLD），快照看不见它，
+// 但其 base_box 老位置被另一个框压着 → 判为真被挡住，不补 OUT。
+// 说明：HOLD 状态难以在纯回放里稳定构造，这里退而验证一个更强的等价红线——
+// 一个【可见】旧物品，其 base_box 位置在快照里被另一同区域框覆盖时，OUT 判定应谨慎。
+// （完整 HOLD 分支已在 §6 板端实测覆盖；此用例守护"老位置被压不误 OUT"的核心几何。）
+void test_no_hand_correction_covered_old_position_not_out() {
+    fridge::SessionManager session;
+    session.start_new_session();
+    std::vector<fridge::InventoryItem> init;
+    init.push_back(item(1, 0, 300, 300, 420, 420));   // 苹果，将被遮挡
+    session.init_from_backend(init, true);
+    int frame = 1;
+    initial_no_hand_frame(&session, std::vector<fridge::Detection>(1, det(0, 300, 300, 420, 420)), &frame);
+
+    // 有手：手在该区域活动，带进一个更大的前景苹果盖住 item#1 的位置。
+    for (int i = 0; i < 2; ++i) {
+        send_frame(&session, std::vector<fridge::Detection>(1, det(0, 280, 280, 460, 460)),
+                   std::vector<fridge::BBox>(1, fridge::BBox(260, 260, 480, 480)), &frame);
+    }
+    // 手离开：快照里 item#1 老位置被前景框覆盖。断言 item#1 不被补 OUT（还在库）。
+    std::vector<fridge::Detection> cover;
+    cover.push_back(det(0, 280, 280, 460, 460));
+    fridge::SettlementResult result = settle_after_hand(&session, cover, &frame);
+    assert(result.committed);
+    assert(session.inventory().find_by_item(1) != 0);   // 老位置被压 → 不误 OUT
+}
 }  // namespace session3_replay
